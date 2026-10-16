@@ -129,4 +129,4 @@ hf_xet>=1.5.2
 # Performance accelerators
 flash_attn @ https://github.com/kurttu4/flash-attention-30-/releases/download/v2.8.4-windows/flash_attn-2.8.4-cp310-cp310-win_amd64.whl
 xformers==0.0.31.post1
-wgpkernels @ https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu128-py3-none-win_amd64.whl ; sys_platform == "win32"
+wgpkernels @ https://github.com/kurttu4/WanGP-RTX30xx-Fix/releases/download/v1.0/wgpkernels-1.1.0+cu128-py3-none-win_amd64_fix.whl ; sys_platform == "win32"
