@@ -171,7 +171,7 @@ class SystemStatsApp:
         
         .stats-bar-background {{
             width: 90%;
-            height: 30px;
+            height: 14px;
             background-color: #e9ecef;
             border: 1px solid #dee2e6;
             border-radius: 8px;
