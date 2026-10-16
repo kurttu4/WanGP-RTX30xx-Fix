@@ -129,3 +129,6 @@ keyring==25.7.0
 # rembg==2.0.65         # non-GPU fallback
 huggingface_hub[hf_xet]
 hf_xet>=1.5.2  # Required for cancellable Xet downloads
+
+#flash atn 2.2 for RTX30**
+flash_attn @ https://github.com/kurttu4/flash-attention-30-/releases/download/v2.8.4-windows/flash_attn-2.8.4-cp310-cp310-win_amd64.whl
