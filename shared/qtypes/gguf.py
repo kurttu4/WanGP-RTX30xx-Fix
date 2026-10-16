@@ -877,9 +877,13 @@ def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
     gguf_llamacpp_cuda = _gguf_cuda_module()
     if gguf_llamacpp_cuda is None or not gguf_llamacpp_cuda.may_support_linear_qtype_name(qtype_name):
         return None
-    fast_out = _llamacpp_cuda_linear(gguf_llamacpp_cuda, raw, qtype_name, tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape)), input_tensor, bias, target_dtype)
-    _gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
-    return fast_out
+    try:
+        fast_out = _llamacpp_cuda_linear(gguf_llamacpp_cuda, raw, qtype_name, tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape)), input_tensor, bias, target_dtype)
+        _gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
+        return fast_out
+    except Exception as exc:
+        _gguf_log_once(f"llamacpp_cuda_linear_fallback_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fallback to PyTorch ({exc}).")
+        return None
 
 
 def _try_llamacpp_cuda_embedding(weight_tensor, index_tensor, target_dtype):
