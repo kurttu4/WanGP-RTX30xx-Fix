@@ -1,5 +1,6 @@
 ############# WanGP Copyright DeepBeepMeep 2025-2026 #############
 import os, sys
+os.environ["XFORMERS_IGNORE_FLASH_VERSION_CHECK"] = "1"
 os.environ["GRADIO_LANG"] = "en"
 # ROCm: without it, SDPA silently falls back to the math kernel on GPUs where AOTriton is still marked experimental
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
