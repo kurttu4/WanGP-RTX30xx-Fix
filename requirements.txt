@@ -80,7 +80,7 @@ vector_quantize_pytorch==1.27.19
 # 3D meshes (UV unwrapping, decimation, marching cubes)
 xatlas>=0.0.11
 fast-simplification>=0.2.0
-scikit-image>=0.26.0
+scikit-image>=0.25.2
 
 # Deepy Draw SVG (resvg rasterizer, MIT)
 resvg-py==0.5.0
