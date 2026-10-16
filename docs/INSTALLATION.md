@@ -213,6 +213,11 @@ pip install https://github.com/deepbeepmeep/kernels/releases/download/Flash2/fla
 ```
 pip install https://github.com/Redtash1/Flash_Attention_2_Windows/releases/download/v2.7.0-v2.7.4/flash_attn-2.7.4.post1+cu128torch2.7.0cxx11abiFALSE-cp310-cp310-win_amd64.whl
 ```
+#### Windows Pytorch 2.7.1 / Python 3.10 for RTX30**
+```
+pip install https://github.com/kurttu4/flash-attention-30-/releases/download/v2.8.4-windows/flash_attn-2.8.4-cp310-cp310-win_amd64.whl
+```
+And fix Xformer version support in flash.py ,line 76 , set last version suport 2.9.0
 
 #### Linux
 ```
