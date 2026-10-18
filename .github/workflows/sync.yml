@@ -2,7 +2,7 @@ name: Auto Sync Fork
 
 on:
   schedule:
-   - cron: '0 0 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
@@ -12,7 +12,16 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync with upstream
-        run: gh repo sync $GITHUB_REPOSITORY -b main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/deepbeepmeep/WanGP.git
+          git fetch upstream main
+          git merge upstream/main --no-edit
+          git push origin main
