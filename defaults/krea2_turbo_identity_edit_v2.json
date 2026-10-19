@@ -1,6 +1,6 @@
 {
     "model": {
-        "name": "Krea 2 Turbo Identity Edit v2",
+        "name": "Krea 2 Turbo Edit Identity v2",
         "architecture": "krea2_turbo_edit",
         "description": "Identity-preserving restaging using Krea 2 Turbo and the full-rank Identity Edit v2 LoRA. Change a person's scene, pose, outfit or lighting while preserving their likeness. Up to two Reference Images can be provided. For recoloring and general edits, use General Edit v2.",
         "URLs": "krea2_turbo",

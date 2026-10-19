@@ -745,6 +745,8 @@ def _generate_messages_vllm(
     stream_callback=None,
     enhancement_progress=None,
 ):
+    from .qwen35_prompt_decode import generate_prompt
+
     reset_context()
     tokenizer = self._prompt_enhancer_tokenizer
     if len(messages) == 0:
@@ -811,30 +813,42 @@ def _generate_messages_vllm(
             }, prompt_number=idx + 1)
 
         try:
-            batch_outputs = engine._llm.generate(
-                prompts=[prompt],
+            response = generate_prompt(
+                engine._llm,
+                prompt,
                 sampling_params=sampling_params,
-                use_tqdm=True,
-                unconditional_prompts=None,
+                stop_token_ids=self._prompt_enhancer_stop_token_ids,
+                close_think_token_id=self._prompt_enhancer_close_think_token_id if thinking_enabled else None,
+                max_thinking_tokens=self._prompt_enhancer_thinking_max_tokens,
                 stop_requested=stop_requested,
                 stream_callback=stream_callback,
             )
+            raw_text = response["text"]
+            log_llm_io("IN", "local-prompt-enhancer", "qwen-generation", response, prompt_number=idx + 1)
+            # The template supplies the opening <think>; generated text starts
+            # inside reasoning even when it contains no explicit opening tag.
+            thinking_open = thinking_enabled
+            for marker in re.finditer(r"</?think>", raw_text, flags=re.IGNORECASE):
+                thinking_open = marker.group().lower() == "<think>"
+            if thinking_open:
+                raise RuntimeError("Prompt Enhancement Ended With Unfinished Thinking. Please Try Again.")
+            if response["stop_reason"] != "stop_token":
+                raise RuntimeError(f"Prompt Enhancement Did Not Finish ({response['stop_reason']}). Please Try Again.")
+            thinking_text, answer_text = _split_generated_text(raw_text)
+            if not answer_text.strip():
+                raise RuntimeError("Prompt Enhancement Returned No Final Prompt. Please Try Again.")
             engine._last_failure_reason = ""
-        except Exception as exc:
+        except BaseException as exc:
             engine._last_failure_reason = str(exc)
+            # Discard failed/cancelled runtime state before another enhancement.
+            try:
+                _unload_prompt_enhancer_text_runtime(self)
+            except Exception as cleanup_error:
+                tqdm.write(f"Prompt Enhancer Cleanup Failed: {cleanup_error}")
             raise
         finally:
             reset_context()
 
-        text, token_ids = engine._extract_text_and_tokens(batch_outputs[0] if batch_outputs else None)
-        raw_text = text
-        if token_ids:
-            try:
-                raw_text = tokenizer.decode(token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-            except Exception:
-                raw_text = text
-        thinking_text, answer_text = _split_generated_text(raw_text)
-        log_llm_io("IN", "local-prompt-enhancer", "qwen-generation", {"text": raw_text, "output_token_ids": [int(token_id) for token_id in token_ids], "answer": answer_text}, prompt_number=idx + 1)
         if thinking_enabled:
             _print_thinking_process(idx, len(messages), thinking_text)
         outputs.append(answer_text)

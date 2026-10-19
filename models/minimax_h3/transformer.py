@@ -60,6 +60,17 @@ def unpatchify_video(rows, t, h, w, c=24, patch_size=(1, 2, 2)):
     return unpatchify_video_tokens(rows, t, h * patch_size[1], w * patch_size[2], c, patch_size)
 
 
+def _keyframe_timesteps(keyframes, rows_per_frame):
+    """Condition-row spans of keyframes with their own noise level (softened end images / injected frames); keyframe rows come first."""
+    spans, offset = [], 0
+    for keyframe in keyframes or ():
+        rows = keyframe["latent_frame_count"] * rows_per_frame
+        if "timestep" in keyframe:
+            spans.append((offset, offset + rows, keyframe["timestep"]))
+        offset += rows
+    return spans
+
+
 def _grouped_video_timestep_rows(timestep, timestep_indices, video_start, target_video_rows, fixed_rows, active):
     current_row = int(timestep_indices[video_start])
     if not active or not fixed_rows:
@@ -790,6 +801,7 @@ class MiniMaxH3Model(nn.Module):
                 float(1.0 - sigma_audio.flatten()[0]),
                 max(float(1.0 - base_video_sigma), VISUAL_COND_TIMESTEP),
                 AUDIO_COND_TIMESTEP,
+                keyframe_timesteps=_keyframe_timesteps(payload.get("keyframes"), latent_h // self.patch_size[1] * (latent_w // self.patch_size[2])),
             )
             timestep, timestep_indices = timestep.to(device), timestep_indices.to(device)
             target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])
@@ -854,6 +866,7 @@ class MiniMaxH3Model(nn.Module):
             float(1.0 - sigma_audio.flatten()[0]),
             max(float(1.0 - base_video_sigma), VISUAL_COND_TIMESTEP),
             AUDIO_COND_TIMESTEP,
+            keyframe_timesteps=_keyframe_timesteps(payload.get("keyframes"), latent_h // self.patch_size[1] * (latent_w // self.patch_size[2])),
         )
         timestep, timestep_indices = timestep.to(device), timestep_indices.to(device)
         target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])

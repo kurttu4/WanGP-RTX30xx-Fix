@@ -6,6 +6,7 @@ import dataclasses
 import threading
 
 import torch
+from tqdm import tqdm
 
 from . import allocator, cuda_graphs, memory_pressure
 
@@ -189,8 +190,6 @@ class AutoPreload:
             return False
         plan.pending.discard(block_name)
         m.preloaded_blocks_per_model[model_id][block_name] = plan.sizes[block_name]
-        if m.read_ahead is not None:
-            m._cancel_read_ahead(entry)
         self._link(plan)
         self._complete_loras(model_id, entry)
         plan.grew = True
@@ -228,7 +227,7 @@ class AutoPreload:
             plan.pending = set(missing)
         if self.verbose >= 1 and (dropped or plan.pending):
             measured = "the budget's preload until measured" if peak is None else f"{peak / ONE_MB:0.0f} MB of activations measured"
-            print(f"Automatic VRAM preload of '{model_id}': {len(current) + len(plan.pending)} of its {len(plan.sizes)} blocks to keep in VRAM ({measured})")
+            tqdm.write(f"Automatic VRAM preload of '{model_id}': {len(current) + len(plan.pending)} of its {len(plan.sizes)} blocks to keep in VRAM ({measured})")
         if len(current) + len(plan.pending) == len(plan.sizes):
             self._free_slots(plan)
         if experts is not None:
@@ -280,8 +279,6 @@ class AutoPreload:
                     break
                 m.gpu_unload_blocks(model_id, name)
                 del preloaded[name]
-                if m.read_ahead is not None:
-                    m._cancel_read_ahead(model_id + "/" + name)
                 released += plan.sizes[name]
             freed += released
             plan.min_weights = min(plan.min_weights, self._weights(plan, preloaded))
@@ -292,7 +289,7 @@ class AutoPreload:
             if freed >= need:
                 break
         if freed:
-            print(f"Automatic VRAM preload: VRAM short, {freed / ONE_MB:0.0f} MB of preloaded blocks released")
+            tqdm.write(f"Automatic VRAM preload: VRAM short, {freed / ONE_MB:0.0f} MB of preloaded blocks released")
         return freed
 
     def _end_cycle(self, plan):
@@ -382,11 +379,6 @@ class AutoPreload:
         preloaded = m.preloaded_blocks_per_model[model_id]
         self.dropping = True
         try:
-            if m.read_ahead is not None:
-                # Eviction inserts blocks into the copy order. Discard old predictions before rebuilding it.
-                for entry in m.read_plans:
-                    if entry.startswith(model_id + "/"):
-                        m._cancel_read_ahead(entry)
             if model_id in m.active_models_ids:
                 if m.ring is not None:  # the staging ring follows the chain of the streamed blocks: emptied before the chain changes
                     m.wait_prefetch()

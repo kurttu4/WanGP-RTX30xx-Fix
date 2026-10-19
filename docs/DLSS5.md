@@ -10,7 +10,42 @@ DLSS 5 support is optional and is not installed by the normal WanGP installer. I
 - the optional legacy no-depth worker from the MIT-licensed Merserk [dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer);
 - separately obtained NVIDIA DLSS runtimes, ReShade with full add-on support, and the RenoDX DLSS 5 add-on.
 
-## Automatic installation
+## WSL Neural Rendering through the Windows worker
+
+WanGP running in WSL can use **DLSS 5 Neural Rendering** through the existing Windows worker. Python preprocessing runs in WSL, while the Windows worker performs Neural Rendering on the NVIDIA GPU using the Windows driver. This does not require an NVIDIA Vulkan driver inside WSL and does not validate the native Linux Frame Generation worker.
+
+Keep the WanGP checkout and its `dlss5` runtime folder on a Windows drive accessible from WSL, for example under `/mnt/e/`. Install the Windows runtime with `scripts\install_dlss5.bat` from Windows, as described below, then restart WanGP in WSL. Windows executable interoperability must be enabled in WSL, and the Windows NVIDIA driver and GPU must meet the normal Neural Rendering requirements. The same x1 refinement, upscaling modes, intensity, depth, and motion controls are available.
+
+If the mode is disabled, check the reported missing runtime file, WSL interoperability, and `/usr/lib/wsl/lib/nvidia-smi`. Diagnostics from the Windows worker are still written to `dlss5/host/ReShade.log`. Native Linux without WSL cannot use this Windows-worker path.
+
+On systems with integrated graphics plus an NVIDIA GPU, open **Windows Settings > System > Display > Graphics**, add `dlss5\host\nr-depth-worker.exe`, and select **High performance** with the NVIDIA GPU. Otherwise the worker may select integrated graphics and fail NGX initialization even though CUDA sees the NVIDIA GPU. The same Windows preference applies to `dlss5\dlssg\dlssg-worker.exe` when using that Windows executable.
+
+## Linux Frame Generation x2 (experimental)
+
+Linux has an experimental **DLSS Frame Generation x2** path for NVIDIA RTX GPUs with a compatible NVIDIA driver and Vulkan support. It doubles the video frame rate using the same `Original` or `RAFT` motion estimation choices as Windows. Higher multipliers and native Linux DLSS 5 Neural Rendering are not available; the WSL Windows-worker option above is separate.
+
+This path has passed build, Vulkan transfer, and pipeline/protocol checks. **Actual DLSS generation and visual quality still require validation on native Linux with a supported NVIDIA GPU.** CUDA working in WSL is not sufficient: the worker must see the NVIDIA GPU through Vulkan, not a software renderer such as llvmpipe.
+
+Build on Linux x86_64 with a C++17 compiler, Vulkan development headers and loader. On Debian/Ubuntu, install the build dependencies with `sudo apt install g++ libvulkan-dev git`. Obtain the pinned official NVIDIA SDK and review its `LICENSE.txt`:
+
+```bash
+git clone --filter=blob:none --no-checkout https://github.com/NVIDIA/DLSS.git NVIDIA-DLSS
+git -C NVIDIA-DLSS sparse-checkout set include lib/Linux_x86_64
+git -C NVIDIA-DLSS checkout 9981c6350dc58c0ce21f024fd65e31e851c31689
+```
+
+From the WanGP root, build and install the worker and official Frame Generation runtime:
+
+```bash
+bash native/dlss5/build_linux.sh /path/to/NVIDIA-DLSS
+./dlss5/dlssg/dlssg-worker --probe
+```
+
+The build places `dlssg-worker`, `libnvidia-ngx-dlssg.so.310.9.16`, and the NVIDIA license in `dlss5/dlssg`. It does not install the Windows Neural Rendering dependencies. Restart WanGP after installation, then select **DLSS Frame Generation x2** in temporal postprocessing. A failed capability probe keeps the option disabled and reports the missing requirement.
+
+For a transfer-only diagnostic, run `./dlss5/dlssg/dlssg-worker --self-test`. This checks Vulkan uploads and readbacks; a pass does **not** establish DLSS support or quality. On supported NVIDIA hardware, check a short clip with motion and scene cuts before processing longer videos. Frame Generation uses estimated motion and a constant depth guide, so fast motion, occlusions and fine details can produce artifacts.
+
+## Automatic installation (Windows)
 
 Close WanGP, then double-click `scripts\install_dlss5.bat`. From a command prompt, the equivalent command is:
 
@@ -139,4 +174,4 @@ Because these guides are estimated from the video, results can differ from DLSS 
 
 ---
 
-> Applies to: Installation and diagnostics for the optional DLSS 5 runtime on supported Windows hardware. Available processors and generation options depend on the installed runtime.
+> Applies to: Installation and diagnostics for optional DLSS 5 on Windows, Neural Rendering from WSL using the Windows worker, and experimental DLSS Frame Generation x2 on Linux. Available processors and generation options depend on the installed runtime and compatible NVIDIA hardware.

@@ -188,6 +188,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.request_global("attention_mode")
         self.request_global("compile")
         self.request_global("compile_choices")
+        self.request_global("transformer_quantization_choices")
+        self.request_global("text_encoder_quantization_choices")
         self.request_global("default_profile_video")
         self.request_global("default_profile_image")
         self.request_global("default_profile_audio")
@@ -230,8 +232,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         self.request_component("model_description")
         self.request_component("header")
-        self.request_component("override_attention")
-        self.request_component("override_compile")
+        self.request_component("overrides")
         self.request_component("model_family")
         self.request_component("model_base_type_choice")
         self.request_component("model_choice")
@@ -375,10 +376,10 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         choices=self.attention_modes_choices,
                         value=self.attention_mode, label="Attention Type", interactive=not self.args.lock_config
                     )
-                    self.quantization_choice = gr.Dropdown(choices=[("Scaled Int8 (recommended)", "int8"), ("Scaled Fp8", "fp8"), ("16-bit (no quantization)", "bf16")], value=self.transformer_quantization, label="Transformer Model Quantization (if available otherwise get the closest available)")
+                    self.quantization_choice = gr.Dropdown(choices=self.transformer_quantization_choices, value=self.transformer_quantization, label="Transformer Model Quantization (if available otherwise get the closest available)")
                     self.transformer_dtype_policy_choice = gr.Dropdown(choices=[("Auto (Best for Hardware)", ""), ("FP16", "fp16"), ("BF16", "bf16")], value=self.transformer_dtype_policy, label="Transformer Data Type (if available)")
                     self.mixed_precision_choice = gr.Dropdown(choices=[("16-bit only (less VRAM)", "0"), ("Mixed 16/32-bit (better quality)", "1")], value=self.server_config.get("mixed_precision", "0"), label="Transformer Engine Precision")
-                    self.text_encoder_quantization_choice = gr.Dropdown(choices=[("16-bit (more RAM, better quality)", "bf16"), ("8-bit (less RAM, slightly lower quality)", "int8")], value=self.text_encoder_quantization, label="Text Encoder Quantization")
+                    self.text_encoder_quantization_choice = gr.Dropdown(choices=self.text_encoder_quantization_choices, value=self.text_encoder_quantization, label="Text Encoder Quantization")
                     self.lm_decoder_engine_choice = gr.Dropdown(
                         choices=[
                             ("Auto", ""),
@@ -461,10 +462,6 @@ class ConfigTabPlugin(WAN2GPPlugin):
                             label="Reserved RAM for Pinning (% of RAM, 0 = Auto)",
                             info="Auto: 40% on Windows, 60% on Linux. Same as the command line --perc-reserved-mem-max (a fraction, e.g. 0.4), which takes precedence, and as the environment variable perc_reserved_mem_max, which this setting overrides.",
                         )
-                    self.read_ahead_choice = gr.Checkbox(
-                        value=self.server_config.get("read_ahead", False), label="Read Ahead (Windows)",
-                        info="Reads the model files ahead of their use: faster loading when they are not already in RAM, such as the first load after a restart or with Profile 5. Windows may then keep more file data in its cache, shown as used RAM. Applies when models reload.",
-                    )
                     def update_preload_visibility(profile, mode):
                         streamed = profile not in IMPLICIT_DYNAMIC_PROFILES
                         return gr.update(visible=streamed), gr.update(visible=streamed and mode == "manual")
@@ -751,7 +748,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                             ("AAC 256 kbps (High Quality, Recommended)", "aac_256"),
                             ("AAC 320 kbps (Very High Quality)", "aac_320"),
                             ("ALAC Lossless (preview/playback compatibility may be limited)", "alac"),
-                            ("FLAC Lossless (MP4/MKV only, playback compatibility may be limited)", "flac"),
+                            ("FLAC 16-bit (MP4 / MKV)", "flac"),
                         ],
                         value=self.server_config.get("audio_output_codec", "aac_128"),
                         visible=True,
@@ -763,7 +760,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.audio_stand_alone_output_codec_choice = gr.Dropdown(
                         choices=[
                             ("WAV (Lossless)", "wav"),
-                            ("FLAC (Lossless)", "flac"),
+                            ("FLAC 16-bit (Lossless)", "flac"),
                             ("MP3 128 kbps", "mp3_128"),
                             ("MP3 192 kbps", "mp3_192"),
                             ("MP3 320 kbps", "mp3_320"),
@@ -931,7 +928,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.vae_config_choice, self.boost_choice, self.int8_kernels_choice, self.fp8_kernels_choice, self.kernel_precision_choice, self.attention_head_split_choice,
             self.video_profile_choice, self.image_profile_choice, self.audio_profile_choice, self.video_preload_choice, self.image_preload_choice, self.audio_preload_choice,
             self.video_preload_mode_choice, self.image_preload_mode_choice, self.audio_preload_mode_choice,
-            self.smart_memory_pinning_choice, self.perc_reserved_mem_max_choice, self.read_ahead_choice, self.vram_allocator_choice, self.ram_allocator_choice, self.max_reserved_loras_choice,
+            self.smart_memory_pinning_choice, self.perc_reserved_mem_max_choice, self.vram_allocator_choice, self.ram_allocator_choice, self.max_reserved_loras_choice,
             self.deepy_llm_engine_choice,
             *self.codex_config_ui.save_components,
             *self.claude_config_ui.save_components,
@@ -956,8 +953,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
         view_events = [event for index, event in gr.context.get_blocks_context().fns.items() if index >= first_event and event.fn and event.outputs and all(kind in ('input', 'change') for _, kind in event.targets)]
         self.synced_form = GradioForm(self.state.value.service.forms, 'configuration', inputs[1:-1], view_events=view_events)
         self.synced_form.bind_save(
-            self.apply_btn.click, lambda *values: self._save_changes(*values[:-2], override_attention=values[-2], override_compile=values[-1]),
-            inputs=[*inputs, self.override_attention, self.override_compile],
+            self.apply_btn.click, lambda *values: self._save_changes(*values[:-1], overrides=values[-1]),
+            inputs=[*inputs, self.overrides],
             outputs=[
                 self.msg,
                 self.model_description,
@@ -993,7 +990,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.release_RAM_btn.click(fn=release_ram_and_notify, inputs=[self.state])
         return [self.release_RAM_btn]
 
-    def _save_changes(self, state, *args, override_attention="", override_compile=""):
+    def _save_changes(self, state, *args, overrides=""):
         gen_in_progress = self.is_generation_in_progress()
         # return "<div style='color:red; text-align:center;'>Unable to change config when a generation is in progress.</div>", *[gr.update()]*5
 
@@ -1028,7 +1025,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             vae_config_choice, boost_choice, int8_kernels_choice, fp8_kernels_choice, kernel_precision_choice, attention_head_split_choice,
             video_profile_choice, image_profile_choice, audio_profile_choice, video_preload_choice, image_preload_choice, audio_preload_choice,
             video_preload_mode_choice, image_preload_mode_choice, audio_preload_mode_choice,
-            smart_memory_pinning_choice, perc_reserved_mem_max_choice, read_ahead_choice, vram_allocator_choice, ram_allocator_choice, max_reserved_loras_choice,
+            smart_memory_pinning_choice, perc_reserved_mem_max_choice, vram_allocator_choice, ram_allocator_choice, max_reserved_loras_choice,
             deepy_llm_engine_choice,
             codex_executable_choice, codex_model_choice, codex_reasoning_effort_choice,
             claude_executable_choice, claude_model_choice, claude_reasoning_effort_choice,
@@ -1159,7 +1156,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "video_profile": video_profile_choice, "image_profile": image_profile_choice, "audio_profile": audio_profile_choice,
             "video_preload_in_VRAM": video_preload_choice, "image_preload_in_VRAM": image_preload_choice, "audio_preload_in_VRAM": audio_preload_choice,
             "video_preload_mode": video_preload_mode_choice, "image_preload_mode": image_preload_mode_choice, "audio_preload_mode": audio_preload_mode_choice,
-            "smart_memory_pinning": smart_memory_pinning_choice, "perc_reserved_mem_max": perc_reserved_mem_max_choice, "read_ahead": read_ahead_choice, "vram_allocator": vram_allocator_choice, RAM_ALLOCATOR_KEY: ram_allocator_choice,
+            "smart_memory_pinning": smart_memory_pinning_choice, "perc_reserved_mem_max": perc_reserved_mem_max_choice, "vram_allocator": vram_allocator_choice, RAM_ALLOCATOR_KEY: ram_allocator_choice,
             "vae_config": vae_config_choice,
             "mixed_precision": mixed_precision_choice, "metadata_type": metadata_choice,
             "transformer_quantization": quantization_choice, "transformer_dtype_policy": transformer_dtype_policy_choice,
@@ -1360,7 +1357,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         model_type = state["model_type"]
         
         model_family_update, model_base_type_update, model_choice_update = self.generate_dropdown_model_list(model_type)
-        description_update, header_update = self.generate_header(model_type, compile=new_server_config["compile"], attention_mode=new_server_config["attention_mode"], override_attention=override_attention, override_compile=override_compile)
+        description_update, header_update = self.generate_header(model_type, compile=new_server_config["compile"], attention_mode=new_server_config["attention_mode"], overrides=overrides)
 
         if gen_in_progress:
             msg = "<div style='color:green; text-align:center;'>The new configuration has been succesfully applied. Some of the Settings will be only effective when you will start another Generation</div>"

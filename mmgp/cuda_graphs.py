@@ -34,6 +34,7 @@ import traceback
 import weakref
 
 import torch
+from tqdm import tqdm
 from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 from . import runtime
@@ -88,7 +89,7 @@ def scope(enabled=True):
         _blocked = next((reason for reason in (gate() for gate in _gates) if reason), None)
         if _blocked is not None and _blocked not in _reported:
             _reported.add(_blocked)
-            print(f"[MMGP] CUDA graphs are off: {_blocked}.")
+            tqdm.write(f"[MMGP] CUDA graphs are off: {_blocked}.")
     _depth += bool(enabled)
     try:
         yield
@@ -766,7 +767,7 @@ class BlockGraphs:
             self.checked.add(checked_key)
         entry.mutated = [index for index, (static, version) in enumerate(zip(entry.static, versions)) if static._version != version]
         if not self.reported:
-            print(f"[MMGP] CUDA graphs of the blocks of '{self.name}' are being captured.")
+            tqdm.write(f"[MMGP] CUDA graphs of the blocks of '{self.name}' are being captured.")
             self.reported = True
         return entry
 

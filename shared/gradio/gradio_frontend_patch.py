@@ -169,9 +169,18 @@ function wangpGalleryVideoPoster(video) {
     }, "image/jpeg", 0.9));
 }
 function wangpGalleryVideoMount(video) {
+    if (video.dataset.testid?.startsWith("thumbnail ")) wangpGalleryThumbnailPoster(video, video.src);
     if (video.dataset.testid === "detailed-video") queueMicrotask(() => {
         if (video.isConnected) wangpGalleryVideoSource(video, video.src);
     });
+}
+function wangpGalleryThumbnailPoster(video, src) {
+    const url = new URL(src, document.baseURI);
+    if (url.origin !== location.origin || !url.pathname.includes('/file=')) return;
+    // Set this during mount, before the browser starts resource selection.
+    video.preload = 'none';
+    url.searchParams.set('__wangp_gallery_preview', 'video');
+    video.poster = url.href;
 }
 function wangpGalleryPosterEntry(video, src) {
     const entry = {src, value: null};
@@ -191,6 +200,7 @@ function wangpGalleryVideoError(event) {
     event.currentTarget.removeAttribute("poster");
 }
 function wangpGalleryVideoSource(video, src) {
+    if (video.dataset.testid?.startsWith("thumbnail ")) wangpGalleryThumbnailPoster(video, src);
     if (video.dataset.testid !== "detailed-video" || !video.closest(".gallery-container")) {
         j(video, "src", src);
         return;
@@ -300,6 +310,31 @@ _PATCHES = {
         ('d(e,"svelte-1pijsyv",!0)},i:m', 'd(e,"svelte-1pijsyv",!0),window.WanGPImageZoom.mount(e)},i:m'),
         ('d(t){t&&b(e),i=!1', 'd(t){window.WanGPImageZoom.destroy(e);t&&b(e),i=!1'),
     ],
+    'Upload-B_zkKtR-.js': [
+        ('function it(){', r'''async function wangpGalleryDropFiles(event) {
+            const files = Array.from(event.dataTransfer.files);
+            const media = event.dataTransfer.getData('application/x-wangp-gallery-media');
+            const source = media || event.dataTransfer.getData('text/uri-list').split(/\r?\n/).find(line => line && !line.startsWith('#'));
+            if (!source || !URL.canParse(source)) return files;
+            const url = new URL(source);
+            if (url.origin !== location.origin || !url.pathname.includes('/file=') || (!media && !url.searchParams.has('__wangp_gallery_preview'))) return files;
+            // Keep previews lightweight. Read the original only after a drop,
+            // replacing the browser's reduced-resolution image File entirely.
+            url.searchParams.delete('__wangp_gallery_preview');
+            const response = await fetch(url);
+            if (!response.ok) throw new Error('Could Not Load Original Gallery Media.');
+            const blob = await response.blob();
+            const name = decodeURIComponent(url.pathname.split('/file=')[1]).split(/[\\/]/).pop();
+            return [new File([blob], name, {type: blob.type})];
+        }
+        function it(){'''),
+        ('function s(f){if(f.preventDefault(),f.stopPropagation(),e.on_drag_change?.(!1),!f.dataTransfer?.files)return;const c=Array.from(f.dataTransfer.files);c.length>0&&e.on_files?.(c)}',
+         'async function s(f){if(f.preventDefault(),f.stopPropagation(),e.on_drag_change?.(!1),!f.dataTransfer?.files)return;try{const c=await wangpGalleryDropFiles(f);c.length>0&&e.on_files?.(c)}catch(error){e.on_error?.(error.message)}}'),
+        ('on_files:t[31],accepted_types:', 'on_files:t[31],on_error:t[32],accepted_types:'),
+        ('on_files:a[31],accepted_types:', 'on_files:a[31],on_error:a[32],accepted_types:'),
+        ('l,o,i,qe]}class Pt', 'l,o,i,qe,message=>A("error",message)]}class Pt'),
+        ('const h=Array.from(r.dataTransfer.files).filter(ae);', 'let h;try{h=(await wangpGalleryDropFiles(r)).filter(ae)}catch(error){A("error",error.message);return;}'),
+    ],
     'Gallery-D7vc32lN.js': [
         ('function Ve(s){', '''function wangpGalleryGap(event) {
             const container = event.target.closest('.thumbnails, .grid-container');
@@ -314,9 +349,26 @@ _PATCHES = {
             }
             if (closest) {event.preventDefault(); event.stopPropagation(); closest.click();}
         }
+        function wangpGalleryDrag(event) {
+            const thumbnail = event.target.closest('.thumbnail-item[data-wangp-video-url]');
+            if (!thumbnail || !this.contains(thumbnail)) return;
+            const source = new URL(thumbnail.dataset.wangpVideoUrl, location.href).href;
+            event.dataTransfer.effectAllowed = 'copy';
+            event.dataTransfer.setData('application/x-wangp-gallery-media', source);
+            event.dataTransfer.setData('text/uri-list', source);
+            event.dataTransfer.setData('text/plain', source);
+        }
         function Ve(s){'''),
-        ('V=s,l(18,V)', 'V?.removeEventListener("click",wangpGalleryGap),V=s,V?.addEventListener("click",wangpGalleryGap),l(18,V)'),
-        ('function dt(n){', '''function wangpGalleryImage(src, edge) {
+        ('V=s,l(18,V)', 'V?.removeEventListener("click",wangpGalleryGap),V?.removeEventListener("dragstart",wangpGalleryDrag),V=s,V?.addEventListener("click",wangpGalleryGap),V?.addEventListener("dragstart",wangpGalleryDrag),l(18,V)'),
+        ('B(e,"class","thumbnail-item thumbnail-small svelte-842rpi")', 'B(e,"class","thumbnail-item thumbnail-small svelte-842rpi"),wangpGalleryVideoThumbnail(e,n[50])'),
+        ('B(e,"class","thumbnail-item thumbnail-lg svelte-842rpi")', 'B(e,"class","thumbnail-item thumbnail-lg svelte-842rpi"),wangpGalleryVideoThumbnail(e,n[47])'),
+        ('n=w;let m=l;', 'n=w;y[0]&65536&&wangpGalleryVideoThumbnail(e,n[50]);let m=l;'),
+        ('n=$;let y=l;', 'n=$;w[0]&65536&&wangpGalleryVideoThumbnail(e,n[47]);let y=l;'),
+        ('function dt(n){', '''function wangpGalleryVideoThumbnail(button, item) {
+            B(button, 'draggable', item.video ? 'true' : null);
+            B(button, 'data-wangp-video-url', item.video?.url);
+        }
+        function wangpGalleryImage(src, edge) {
             if (!src || !edge) return src;
             const url = new URL(src, window.location.href);
             if (url.origin !== window.location.origin || !url.pathname.includes('/file=') || !/\\.(png|jpe?g|webp|bmp|tiff?|gif)$/i.test(url.pathname)) return src;

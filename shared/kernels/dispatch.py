@@ -7,6 +7,7 @@ layout contract; the existing user policy orders those implementations.
 """
 import functools
 import torch
+from tqdm import tqdm
 from mmgp import cuda_graphs
 from . import kernel_policy
 
@@ -40,7 +41,7 @@ def choose(operation=None, *, wgpkernels=False, kitchen=False, triton=False, own
         key = operation, implementation, kernel_policy.precision
         if key not in _announced:
             _announced.add(key)
-            print(f"[Kernels] {operation}: {implementation} ({kernel_policy.precision}).")
+            tqdm.write(f"[Kernels] {operation}: {implementation} ({kernel_policy.precision}).")
     return family
 
 

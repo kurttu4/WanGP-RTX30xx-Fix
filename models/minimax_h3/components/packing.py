@@ -312,10 +312,12 @@ def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames,
 
 
 def build_row_timesteps(layout, video_timestep, audio_timestep, condition_video_timestep,
-                        condition_audio_timestep, target_condition_timestep=1.0):
+                        condition_audio_timestep, target_condition_timestep=1.0, keyframe_timesteps=()):
     timesteps = torch.full((layout.sequence_length,), video_timestep, dtype=torch.float32,
                            device=layout.token_tags.device)
     timesteps[layout.video_indices[:layout.num_condition_video_rows]] = condition_video_timestep
+    for start, stop, timestep in keyframe_timesteps:  # softened keyframes keep their own noise level
+        timesteps[layout.video_indices[start:stop]] = timestep
     if layout.num_target_condition_video_rows:
         timesteps[layout.video_indices[-layout.num_target_condition_video_rows:]] = target_condition_timestep
     timesteps[layout.audio_indices[layout.num_condition_audio_rows:]] = audio_timestep

@@ -393,24 +393,8 @@ class Qwen3TTSPipeline:
 
     @staticmethod
     def _parse_two_speaker_dialogue(text: str, speaker_count: int = 2) -> list[tuple[int, str]]:
-        speaker_matches = list(re.finditer(r"Speaker\s*(\d+)\s*:\s*", text, flags=re.IGNORECASE))
-        if not speaker_matches:
-            raise ValueError(f"{speaker_count}-speaker mode requires prompt lines using Speaker 1: to Speaker {speaker_count}: (or any {speaker_count} numeric speaker IDs).")
-        speaker_ids = sorted({int(match.group(1)) for match in speaker_matches})
-        if len(speaker_ids) != speaker_count:
-            raise ValueError(f"{speaker_count}-speaker mode requires exactly {speaker_count} speaker IDs. Use Speaker 1: to Speaker {speaker_count}:.")
-        speaker_id_to_internal = {speaker_id: index for index, speaker_id in enumerate(speaker_ids)}
-
-        segments: list[tuple[int, str]] = []
-        for index, match in enumerate(speaker_matches):
-            start = match.end()
-            end = speaker_matches[index + 1].start() if index + 1 < len(speaker_matches) else len(text)
-            segment_text = text[start:end].strip()
-            if segment_text:
-                segments.append((speaker_id_to_internal[int(match.group(1))], segment_text))
-        if not segments:
-            raise ValueError("No dialogue text found after Speaker tags.")
-        return segments
+        from shared.utils.speech_dialogue import parse_dialogue
+        return parse_dialogue(text, speaker_count)
 
     @staticmethod
     def _resolve_two_speaker_ref_scripts(raw_ref_text: str, speaker_count: int = 2) -> tuple[list[Optional[str]], list[bool]]:

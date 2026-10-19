@@ -107,7 +107,9 @@ class FrameKDAAlpha(nn.Module):
 
     def forward(self, x):
         with torch.autocast(device_type=x.device.type, enabled=False):
-            delta = F.linear(F.linear(x.float(), self.down.weight.float()), self.up.weight.float())
+            # Run the modules so quantization transforms and offload hooks apply.
+            delta = self.down(x.to(self.down.weight.dtype))
+            delta = self.up(delta.to(self.up.weight.dtype)).float()
             delta = delta.view(-1, self.heads, self.head_dim) + self.dt_bias.float().view(1, self.heads, self.head_dim)
             return torch.exp(-torch.exp(self.A_log.float())[None, :, None] * F.softplus(delta))
 

@@ -1,6 +1,6 @@
 {
     "model": {
-        "name": "Krea 2 Turbo General Edit v2",
+        "name": "Krea 2 Turbo Edit General v2",
         "architecture": "krea2_turbo_edit",
         "description": "Instruction-based image editing using Krea 2 Turbo and the full-rank General Edit v2 LoRA. Recolor, relight, change backgrounds, add objects, edit text or restyle while preserving unchanged content. Up to two Reference Images can be provided. For identity-preserving restaging, use Identity Edit v2.",
         "URLs": "krea2_turbo",

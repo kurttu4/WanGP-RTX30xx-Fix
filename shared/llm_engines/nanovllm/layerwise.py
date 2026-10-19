@@ -9,7 +9,7 @@ import torch
 from shared.attention import pay_attention
 
 
-def cached_attention(qkv, group, cache, positions, kv_len, engine):
+def cached_attention(qkv, group, cache, positions, kv_len, engine, *, triton_cache=False):
     query, key, value = qkv
     qkv.clear()
     key_cache, value_cache = cache
@@ -17,8 +17,14 @@ def cached_attention(qkv, group, cache, positions, kv_len, engine):
     heads = stop - start
     groups = query.shape[2] // heads
     key, value = key[:, :, ::groups], value[:, :, ::groups]
-    key_cache[:, :, start:stop].index_copy_(1, positions, key)
-    value_cache[:, :, start:stop].index_copy_(1, positions, value)
+    if engine == "vllm" and triton_cache and start == 0 and stop == key_cache.shape[2]:
+        from .layers.attention import store_kvcache
+        slots = positions[None, :] + torch.arange(query.shape[0], device=positions.device)[:, None] * key_cache.shape[1]
+        store_kvcache(key.contiguous().flatten(0, 1), value.contiguous().flatten(0, 1), key_cache, value_cache,
+                      slots.flatten(), use_triton_kv_cache=True)
+    else:
+        key_cache[:, :, start:stop].index_copy_(1, positions, key)
+        value_cache[:, :, start:stop].index_copy_(1, positions, value)
     if engine == "vllm":
         from .layers.attention import _DEFAULT_FLASH_ATTN_WITH_KVCACHE
         if _DEFAULT_FLASH_ATTN_WITH_KVCACHE is None:

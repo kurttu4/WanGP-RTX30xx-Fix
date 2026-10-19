@@ -18,8 +18,10 @@ from optimum.quanto import QModuleMixin, register_qmodule
 from optimum.quanto.tensor.qtensor import QTensor
 from optimum.quanto.tensor.qtype import qtype as _quanto_qtype, qtypes as _quanto_qtypes
 from collections import OrderedDict
-from mmgp import cuda_graphs as _cuda_graphs
+from tqdm import tqdm
+from mmgp import allocator as _allocator, cuda_graphs as _cuda_graphs
 from mmgp.offload import QEmbedding as BaseQEmbedding
+from shared.kernels.triton_tuner import LaunchTuner
 
 
 HANDLER_NAME = "gguf"
@@ -845,34 +847,68 @@ def _gguf_qtype_name(qtype_obj):
     return getattr(qtype_obj, "name", None) or str(qtype_obj)
 
 
-_LLAMACPP_SLICE_BYTES = 64 << 20  # scratch of the packed kernels for one slice of rows: q8_1 input and FP32 product
-GGUF_CUDA_CHUNKING = False  # Set True to opt into the new native CUDA row loop.
+_LLAMACPP_SLICE_BYTES = 64 << 20  # scratch of one slice of rows: q8_1 input and FP32 product (the row loop's Q8 ring stays within it)
+GGUF_CUDA_CHUNKING = True  # native row loop (GGUF 1.0.27+) where a one-time timing on this GPU shows it beats the slices
 
 # Switching implementations must select a fresh graph instead of replaying the old one.
 _cuda_graphs.register_key(lambda: GGUF_CUDA_CHUNKING)
+_ROW_LOOP_TUNER = LaunchTuner("gguf_row_loop", 1, "GGUF")
+
+
+def _sliced_cuda_linear(module, raw, qtype_name, shape, x, bias, target_dtype, step):
+    # Legacy MMQ needs a Q8 input copy and an FP32 product: bound that scratch with 128-row-aligned slices.
+    out = torch.empty((x.shape[0], shape[0]), dtype=target_dtype, device=x.device)
+    for start in range(0, x.shape[0], step):
+        out[start:start + step].copy_(module.linear(raw, qtype_name, shape, x[start:start + step], None, torch.float32))
+    if bias is not None:
+        out.add_(bias.to(out.device, out.dtype))
+    return out
+
+
+def _row_loop_selected(module, raw, qtype_name, shape, x, bias, target_dtype, step, scratch):
+    # One cooperative launch per linear (one CUDA graph node, no FP32 product) where the GPU and shape are structurally supported,
+    # unless the slices measured faster on this GPU. The winner depends on the row count (few long tiles favour the slices' stream-K):
+    # timed once per power-of-two range of rows, on the leading rows (read only, capped), cached across sessions.
+    if not (GGUF_CUDA_CHUNKING and hasattr(module, "linear_chunked") and x.dtype == target_dtype and x.is_contiguous()
+            and module.linear_chunked_supported(qtype_name, shape, target_dtype, bias is not None, x.device.index)):
+        return False
+    rows = min(x.shape[0], max(4 * step, 16384))
+    tuned = []
+
+    def prepare_scratch():
+        tuned.append(True)
+        sample = x[:rows]
+
+        def launch(config):
+            if config[0] == "row_loop":
+                module.linear_chunked(raw, qtype_name, shape, sample, bias, target_dtype, scratch)
+            else:
+                _sliced_cuda_linear(module, raw, qtype_name, shape, sample, bias, target_dtype, step)
+        return launch
+
+    bucket = 1 << (rows.bit_length() - 1)
+    identity = f"{module.__version__}|{qtype_name}|{shape[1]}->{shape[0]}|{str(target_dtype)[6:]}|bias={bias is not None}|rows>={bucket}"
+    with _allocator.normal_allocations():  # timing outputs must not grow a CUDA graph's pool
+        choice = _ROW_LOOP_TUNER.config("linear", identity, x.device, (("row_loop",), ("slices",)), prepare_scratch, True)[0]
+    if tuned:
+        tqdm.write(f"[GGUF][llama.cpp CUDA] {qtype_name} {shape[1]}->{shape[0]} linear, {bucket}+ rows: {choice.replace('_', ' ')} selected after timing on this GPU.")
+    return choice == "row_loop"
 
 
 def _llamacpp_cuda_linear(module, raw, qtype_name, shape, input_tensor, bias, target_dtype):
-    # Legacy MMQ needs a Q8 input copy and an FP32 product. Bound that scratch with
-    # 128-row-aligned slices; newer kernels can process the same slices in one GPU loop.
     out_features, in_features = shape
     rows = input_tensor.numel() // in_features
     step = max(128, _LLAMACPP_SLICE_BYTES // (4 * out_features + in_features * 9 // 8) // 128 * 128)
     if rows < 2 * step or module._linear_mode() != "mmq":
         return module.linear(raw, qtype_name, shape, input_tensor, bias, target_dtype)
     step = -(-rows // (-(-rows // step) * 128)) * 128  # slices of even size
-    native_chunked = getattr(module, "linear_chunked", None) if GGUF_CUDA_CHUNKING else None
-    if callable(native_chunked):
-        out = native_chunked(raw, qtype_name, shape, input_tensor, bias, target_dtype, step)
-        if out is not None:
-            return out
-    # Older wheels and layouts outside the cooperative kernel keep bounded PyTorch slices.
+    # The row loop's Q8 ring stays one 2 MiB allocator page below a slice (here at least 32 MiB): its peak is never above the slices'.
+    scratch = step * (4 * out_features + in_features * 9 // 8) - (2 << 20)
     x = input_tensor.reshape(rows, in_features)
-    out = torch.empty((rows, out_features), dtype=target_dtype, device=x.device)
-    for start in range(0, rows, step):
-        out[start:start + step].copy_(module.linear(raw, qtype_name, shape, x[start:start + step], None, torch.float32))
-    if bias is not None:
-        out.add_(bias.to(out.device, out.dtype))
+    if _row_loop_selected(module, raw, qtype_name, shape, x, bias, target_dtype, step, scratch):
+        out = module.linear_chunked(raw, qtype_name, shape, x, bias, target_dtype, scratch)
+    else:
+        out = _sliced_cuda_linear(module, raw, qtype_name, shape, x, bias, target_dtype, step)
     return out.reshape(*input_tensor.shape[:-1], out_features)
 
 
@@ -2166,13 +2202,14 @@ def convert_to_quanto(state_dict, default_dtype, verboseLevel=1, detection=None)
 
 
 def _prepare_runtime_buffers(device):
+    # Packages before 1.0.12 have no explicit runtime buffers: they allocate their scratch lazily.
     module = _gguf_cuda_module()
-    if module is not None:
+    if hasattr(module, "prepare_runtime_buffers"):
         module.prepare_runtime_buffers(device)
 
 
 def _release_runtime_buffers():
-    if _GGUF_CUDA_MODULE is not None:
+    if hasattr(_GGUF_CUDA_MODULE, "release_runtime_buffers"):
         _GGUF_CUDA_MODULE.release_runtime_buffers()
 
 

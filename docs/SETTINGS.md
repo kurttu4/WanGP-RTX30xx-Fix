@@ -140,8 +140,7 @@ A start image or reference image can set the canvas shape. With a start image, o
 | `film_grain_intensity` | number | Film grain amount. `0` disables. |
 | `film_grain_saturation` | number | Saturation of generated film grain. |
 | `RIFLEx_setting` | integer | RIFLEx long-video policy. `0` auto, `1` always on, `2` always off. |
-| `override_profile` | number | Per-task MMGP memory/offload profile override. Allowed values are `-1`, `1`, `2`, `3`, `3.5`, `4`, `4.5`, and `5`; `-1` uses the normal Video, Image, or Audio memory profile selected in WanGP configuration. This controls RAM/VRAM placement and speed only. It is not a saved settings/accelerator profile and does not accept a `setting_id`. |
-| `override_attention` | string | Per-task attention backend override. Empty uses global auto/default selection. |
+| `overrides` | string | Configuration choices replaced for this task, written as `name=value` pairs separated by commas, for example `attention_mode='sage2', memory_profile=4`. Empty uses the WanGP configuration for all of them. `memory_profile`: memory/offload profile `1`, `2`, `3`, `3.5`, `4`, `4.5` or `5` instead of the Video, Image or Audio profile of the configuration; it controls RAM/VRAM placement and speed only, is not a saved settings/accelerator profile and does not accept a `setting_id`. `compilation`: `'disabled'`, `'cudagraph'` or `'transformer'`. `attention_mode`: an attention backend such as `'sdpa'` or `'sage2'`, or a model-specific mode. `transformer_quantization`: `'int8'`, `'fp8'` or `'bf16'`; `text_encoder_quantization`: `'bf16'` or `'int8'`; when the model has no weights in that format, the closest available ones are used. A change of profile, compilation or quantization reloads the model. |
 
 ## Post-Processing Audio
 

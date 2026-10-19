@@ -64,7 +64,7 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 ## 🔥 Latest Updates : 
 
-## 15th of October 2026: WanGP v18.17 - More Drama per Gigabyte
+## 18h of October 2026: WanGP v18.19 - More Drama per Gigabyte
 
 - **Flux 3 Klein 5.6B**: text-to-image generation and editing with up to **10 reference images**. Choose the distilled model for **16-step generation**, or Base for **50 steps with guidance**. Both come in BF16, INT8 ConvRot and NVFP4. The new **Prompt Helper** lets you draw layout boxes, place elements from reference images, and mark objects for removal. Boxes guide the composition; they do not act as exact pixel masks.
 
@@ -80,7 +80,12 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 - **MOSS Image 5B**: a new text-to-image family from **OpenMOSS**, with **Base** and **SFT** variants. Describe a scene in plain language, use tags, or arrange text and objects with the **Prompt Helper** layout editor. SFT adds training on curated data; both start at **50 steps**. The optional layout enhancer follows your selected canvas size. Boxes guide the composition; text and placement can still vary.
 
-*Update v18.17*: added MOSS Image 
+- **MOSS-TTS v1.5**: **8B** and **Local 4B** multilingual speech models with cloning of up to **three voices**, dialogue, adjustable pauses and optional script writing. Both support **BF16 / INT8 ConvRot** and **PyTorch / CUDA Graphs / vLLM**; Local 4B outputs **48 kHz stereo**.
+
+- **Krea 2 Edit v2**: **General Edit** for changes to colors, lighting, objects and style; **Identity Edit** for changing poses, outfits and scenes while preserving likeness. Both use **Krea 2 Turbo**, support **two reference images** and start at **8 steps**.
+
+*Update v18.17*: added MOSS Image\
+*Update v18.19*: lots of bugs fixes, MOSS TTS, Krea Edit v2
 
 ## 11th of October 2026: WanGP v18.00 - Distortion of Space and Time
 
@@ -132,8 +137,6 @@ These VRAM savings should benefit everyone, especially at higher resolutions and
 To get the most out of this update, first make sure you use *Sage2/2+ Attention* as quite a few optimizations depends on it. Then open the new *Config → RAM/VRAM Management* tab, choose an *MMGP Optimized VRAM Allocator* option under *VRAM Allocator*, and turn on *Smart Memory Pinning*. Restart WanGP if you change the allocator.
 
 For an extra **20% VRAM saving**, with a speed penalty of up to 10%, go to *Config → Performance* and set *Attention Head Split* to *Medium (good balance)*. A pretty good trade-off when every gigabyte counts.
-
-For faster model checkpoint loading on Windows, enable *Read Ahead (Windows)* in *RAM/VRAM Management*.
 
 **Dynamic VRAM Preload** fills spare VRAM with model weights and frees space as needed. Set *VRAM Preload* to *Dynamic* for less waiting between layers, especially when generating images.
 

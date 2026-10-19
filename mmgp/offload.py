@@ -1,5 +1,5 @@
 # Copyright (c) 2024-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-# ------------------ Memory Management 4.1.0 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 4.2.0 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -76,13 +76,14 @@ import itertools
 import weakref
 import numpy
 from accelerate import init_empty_weights
+from tqdm import tqdm
 from functools import wraps
 import functools
 import types
 import inspect
 
 from mmgp import safetensors2, runtime
-from .read_ahead import ReadAhead, BATCH as READ_AHEAD_BATCH, WINDOW as READ_AHEAD_WINDOW, MAX_RANGES as READ_AHEAD_MAX_RANGES
+from .read_ahead import MAX_RANGES, COLD_PIECE, cold_ranges, prefetch_ranges
 from mmgp import profile_type
 from .quant_router import (
     apply_pre_quantization,
@@ -421,52 +422,41 @@ class _PinningCopier:
 
 
 class _ReadAheadPinningCopier(_PinningCopier):
-    # Prefetch mapped batches before submitting their copies. Background hints can lose the race to copy-thread page faults.
-    def __init__(self, read_ahead):
+    # Copies in batches of COLD_PIECE (small tensors included): the parts of a batch that a drive must read are read ahead in large requests
+    # before its copies are submitted, at most two batches ahead of the copy threads, which would fault them in 64 KiB reads. A batch found in
+    # RAM is submitted at once.
+    def __init__(self):
         super().__init__()
-        self.read_ahead = read_ahead
         self.buffered, self.outstanding = collections.deque(), collections.deque()
-        self.buffered_bytes = self.pending = 0
-
-    def _reap(self, required=0):
-        while self.outstanding:
-            size, futures = self.outstanding[0]
-            if self.pending + required <= READ_AHEAD_WINDOW and not builtins.all(future.done() for future in futures):
-                break
-            self.outstanding.popleft()
-            for future in futures:
-                future.result()
-            self.pending -= size
+        self.buffered_bytes = 0
 
     def _flush(self):
         if not self.buffered:
             return
-        size = self.buffered_bytes
-        self._reap(size)
-        self.pending += size
-        self.read_ahead.peak_outstanding = max(self.read_ahead.peak_outstanding, self.pending)
-        self.read_ahead.hint_copy([(source.data_ptr(), count) for _, source, count in self.buffered])
+        cold = cold_ranges([(source.data_ptr(), count) for _, source, count in self.buffered])
+        if cold:
+            while len(self.outstanding) > 1:
+                for future in self.outstanding.popleft():
+                    future.result()
+            prefetch_ranges(cold)
         futures = self.blocks[next(reversed(self.blocks))]
         first = len(futures)
         while self.buffered:
             dst, source, count = self.buffered.popleft()
             super().copy(dst, source, count)
             del source
-        self.outstanding.append((size, futures[first:]))
+        if cold:
+            self.outstanding.append(futures[first:])
         self.buffered_bytes = 0
 
     def copy(self, dst, source, length):
-        if not length or self.read_ahead.mappings.plan([(source.data_ptr(), length)]) is None:
-            return super().copy(dst, source, length)
         offset = 0
         while offset < length:
-            if not self.buffered and (self.read_ahead.error is not None or self.read_ahead._skip_cached(length - offset)):
-                return super().copy(dst + offset, source if offset == 0 else source[offset:], length - offset)
-            count = min(READ_AHEAD_BATCH - self.buffered_bytes, length - offset)
+            count = min(COLD_PIECE - self.buffered_bytes, length - offset)
             self.buffered.append((dst + offset, source[offset:offset + count], count))
             self.buffered_bytes += count
             offset += count
-            if self.buffered_bytes == READ_AHEAD_BATCH or len(self.buffered) >= READ_AHEAD_MAX_RANGES:
+            if self.buffered_bytes == COLD_PIECE or len(self.buffered) >= MAX_RANGES:
                 self._flush()
 
     def start_block(self, block_no):
@@ -476,14 +466,15 @@ class _ReadAheadPinningCopier(_PinningCopier):
     def wait(self, keep=0):
         self._flush()
         done = super().wait(keep)
-        self._reap()
+        while self.outstanding and builtins.all(future.done() for future in self.outstanding[0]):
+            self.outstanding.popleft()
         return done
 
     def close(self):
         try:
             super().close()
         finally:
-            self._reap(READ_AHEAD_WINDOW)
+            self.outstanding.clear()
 
 
 def _safetensors_load_file(file_path, writable_tensors = True):
@@ -748,13 +739,6 @@ def _same_moved_tensor(a, b):
     return same_meta and builtins.all(_same_moved_tensor(getattr(a, name), getattr(b, name)) for name in names)
 
 
-def _read_ahead_copy(job, position, source_start, dst, src, size):
-    for offset in range(0, size, STAGING_CHUNK_SIZE):
-        count = min(STAGING_CHUNK_SIZE, size - offset)
-        ctypes.memmove(dst + offset, src + offset, count)
-        job.complete(position + src - source_start + offset, count)
-
-
 class _PinnedStager:
     """Moves pageable weights to the GPU through two small reusable pinned slots.
     A CUDA copy from pageable RAM goes through a driver staging buffer on the calling thread and cannot overlap GPU work.
@@ -770,22 +754,31 @@ class _PinnedStager:
         self.slots, self.events, self.slot_no, self.checked_classes, self.enabled, self.helpers = [None, None], [None, None], 0, {}, True, None
         self.copy_threads = _staging_copy_threads()
 
-    def _memmove(self, dst, src, nbytes, parallel, read_job=None, read_position=0):
-        copy = ctypes.memmove if read_job is None else functools.partial(_read_ahead_copy, read_job, read_position, src)
+    def _memmove(self, dst, src, nbytes, parallel):
         offset = 0
         while offset < nbytes:
             remaining = nbytes - offset
             if self.copy_threads > 1 and remaining >= STAGING_PARALLEL_MIN_SIZE and parallel():
                 if self.helpers is None:
                     self.helpers = ThreadPoolExecutor(max_workers=self.copy_threads - 1, thread_name_prefix="mmgp_staging")
-                part = (remaining + self.copy_threads - 1) // self.copy_threads
-                futures = [self.helpers.submit(copy, dst + offset + start, src + offset + start, min(part, remaining - start)) for start in range(part, remaining, part)]
-                copy(dst + offset, src + offset, part)
-                for future in futures:
-                    future.result()
+                # what a drive must read is read ahead in pieces, the next one while the threads copy the current one (they would fault it in
+                # 64 KiB reads)
+                cold = cold_ranges([(src + offset, remaining)])
+                step = COLD_PIECE if cold else remaining
+                if cold:
+                    prefetch_ranges([(src + offset, src + offset + min(step, remaining))])
+                for piece in range(offset, nbytes, step):
+                    length = min(step, nbytes - piece)
+                    part = (length + self.copy_threads - 1) // self.copy_threads
+                    futures = [self.helpers.submit(ctypes.memmove, dst + piece + start, src + piece + start, min(part, length - start)) for start in range(part, length, part)]
+                    if cold and piece + length < nbytes:
+                        prefetch_ranges([(src + piece + length, src + min(nbytes, piece + length + step))])
+                    ctypes.memmove(dst + piece, src + piece, part)
+                    for future in futures:
+                        future.result()
                 return
             length = min(STAGING_CHUNK_SIZE, remaining)
-            copy(dst + offset, src + offset, length)
+            ctypes.memmove(dst + offset, src + offset, length)
             offset += length
 
     def release(self):
@@ -826,7 +819,7 @@ class _PinnedStager:
             inner[name], offset = self._pinned_copy(getattr(t, name), slot, offset, parallel)
         return type(t).__tensor_unflatten__(inner, meta, t.size(), t.stride()), offset
 
-    def to_gpu(self, p, parallel=lambda: True, read_job=None, read_position=0):
+    def to_gpu(self, p, parallel=lambda: True):
         t = p.data if type(p) is torch.nn.Parameter else p
         if not self.enabled:
             return p.to("cuda", non_blocking=True)
@@ -841,7 +834,7 @@ class _PinnedStager:
                 slot = self._acquire(length)
                 if slot is None:
                     return p.to("cuda", non_blocking=True)
-                self._memmove(slot.data_ptr(), t.data_ptr() + offset, length, parallel, read_job, read_position + offset)
+                self._memmove(slot.data_ptr(), t.data_ptr() + offset, length, parallel)
                 dst_bytes[offset:offset + length].copy_(slot[:length], non_blocking=True)
                 self._release()
             return dst
@@ -982,31 +975,40 @@ class _StagingRing:
                     finally:
                         self.cond.acquire()
 
-    def _stage(self, items, layout, read_job=None):
-        if read_job is not None:
-            read_job = read_job.owner.for_copy(read_job)
+    def _stage(self, items, layout):
         runs, _, nbytes = layout
-        try:
-            region = self._reserve(nbytes)
-            base, futures, position = self.buffer.data_ptr() + region[0], [], 0
-            for src, size, offset, _ in runs:
-                copy = ctypes.memmove if read_job is None else functools.partial(_read_ahead_copy, read_job, position, src)
-                if size < STAGING_PARALLEL_MIN_SIZE:
-                    copy(base + offset, src, size)
-                else: # a large run is split evenly across the copy threads
-                    part = (size + RING_COPY_THREADS - 1) // RING_COPY_THREADS
-                    futures += [self.helpers.submit(copy, base + offset + start, src + start, min(part, size - start)) for start in range(0, size, part)]
-                position += size
+        region = self._reserve(nbytes)
+        base, futures = self.buffer.data_ptr() + region[0], []
+        if cold_ranges([(src, size) for src, size, _, _ in runs if size >= STAGING_PARALLEL_MIN_SIZE]):
+            self._copy_cold(base, runs)
+            return region, items, layout
+        for src, size, offset, _ in runs:
+            if size < STAGING_PARALLEL_MIN_SIZE:
+                ctypes.memmove(base + offset, src, size)
+            else: # a large run is split evenly across the copy threads
+                part = (size + RING_COPY_THREADS - 1) // RING_COPY_THREADS
+                futures += [self.helpers.submit(ctypes.memmove, base + offset + start, src + start, min(part, size - start)) for start in range(0, size, part)]
+        for future in futures:
+            future.result()
+        return region, items, layout
+
+    def _copy_cold(self, base, runs):
+        # Weights of the block that a drive must read (RAM cannot keep the model): its runs are read ahead in pieces, the next piece while the
+        # threads copy the current one from RAM, instead of being faulted in 64 KiB reads by the three threads
+        pieces = [(base + offset + start, src + start, min(COLD_PIECE, size - start)) for src, size, offset, _ in runs for start in range(0, size, COLD_PIECE)]
+        prefetch_ranges([(pieces[0][1], pieces[0][1] + pieces[0][2])])
+        for index, (dst, src, size) in enumerate(pieces):
+            part = size if size < STAGING_PARALLEL_MIN_SIZE else (size + RING_COPY_THREADS - 1) // RING_COPY_THREADS
+            futures = [self.helpers.submit(ctypes.memmove, dst + start, src + start, min(part, size - start)) for start in range(0, size, part)]
+            if index + 1 < len(pieces):
+                _, next_src, next_size = pieces[index + 1]
+                prefetch_ranges([(next_src, next_src + next_size)])
             for future in futures:
                 future.result()
-            return region, items, layout
-        finally:
-            if read_job is not None:
-                read_job.finish()
 
-    def schedule(self, entry_name, items, layout, read_job=None):
+    def schedule(self, entry_name, items, layout):
         if entry_name not in self.jobs:
-            self.jobs[entry_name] = self.copier.submit(self._stage, items, layout, read_job)
+            self.jobs[entry_name] = self.copier.submit(self._stage, items, layout)
 
     def take(self, entry_name):
         # the region, parameters and layout of a block about to be transferred, None if it was not scheduled; the blocks scheduled before
@@ -1224,7 +1226,7 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
     return 
 
 
-def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = True, big_tensor_size = BIG_TENSOR_MAX_SIZE, perc_reserved_mem_max = 0,verboseLevel = 1, loading_callback=None, ranks = None, readAhead=False):
+def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = True, big_tensor_size = BIG_TENSOR_MAX_SIZE, perc_reserved_mem_max = 0,verboseLevel = 1, loading_callback=None, ranks = None):
     # ranks: id of each tensor to pin -> its priority (lowest first, pinning stops where the reserved RAM runs out); all of them if None
 
     global max_pinnable_bytes, total_pinned_bytes
@@ -1356,8 +1358,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
 
     last_allocated_big_tensor = -1        
     tensor_no = 0
-    read_ahead = ReadAhead.create(readAhead and pinning_total > 0)
-    copier = _PinningCopier() if read_ahead is None else _ReadAheadPinningCopier(read_ahead)
+    copier = _ReadAheadPinningCopier()
     owners = []
     def report_pinned(blocks):
         nonlocal total, registered
@@ -1443,8 +1444,6 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
             max_pinnable_bytes = total_pinned_bytes + total - registered
     finally:
         copier.close() # also on cancellation: no copy may still write into blocks being freed
-        if read_ahead is not None:
-            read_ahead.close()
     del dummy_pinned_tensor,tied_weights, ref_cache
     model._pinned_bytes = registered if PIN_LOCKS_RAM else total
     model._pinned_bytes_by_owner = PIN_LOCKS_RAM
@@ -1471,7 +1470,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 4.1.0) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 4.2.0) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -3343,10 +3342,6 @@ class offload:
         self.inflight = {}
         self.ring = None
         self.block_items = {}
-        self.read_ahead_enabled = False
-        self.read_ahead = None
-        self.read_jobs = {}
-        self.read_plans = {}
         self.block_slots = {} # model id -> [VRAM slot (None until used), entry name using it or None, slot size] for its swapped blocks
         self.slot_views = {} # (entry name, slot number) -> the parameters of the block as views of the slot
         self.towers_per_model = {} # model id -> names of its towers, the recurrent blocks for which the VRAM slots are sized
@@ -3596,50 +3591,8 @@ class offload:
                     budget -= layout[2]
                     if budget < 0:
                         break
-                    self.ring.schedule(entry, items, layout, self.read_jobs.pop(id(self.blocks_of_modules[entry]), None))
+                    self.ring.schedule(entry, items, layout)
             entry = self.next_blocks_names.get(entry, None)
-
-    def _cancel_read_ahead(self, entry_name):
-        job = self.read_jobs.pop(id(self.blocks_of_modules[entry_name]), None)
-        if job is not None:
-            job.finish()
-        # The staging ring may already own the job: cancel its remaining hints too, without waiting for its copy.
-        self.read_ahead.cancel(self.read_plans.get(entry_name))
-
-    def _schedule_read_ahead(self, entry_name, preload_entries=None):
-        if preload_entries is None:
-            entry, seen, entries = entry_name, set(), []
-            for _ in range(RING_DEFAULT_BLOCKS + 1):
-                if entry is None or entry in seen:
-                    break
-                seen.add(entry)
-                model_id, _, block_name = entry.partition("/")
-                if block_name not in self.preloaded_blocks_per_model[model_id]:
-                    entries.append(entry)
-                entry = self.next_blocks_names.get(entry, None)
-        else:
-            # Initial preload has its own copy order; these blocks are deliberately outside the runtime chain.
-            entries = preload_entries
-        seen = set(entries)
-        active = seen | self.inflight.keys() | (self.ring.jobs.keys() if self.ring is not None else set())
-        active_ids = {id(self.blocks_of_modules[name]) for name in active}
-        for key in list(self.read_jobs):
-            if key not in active_ids:
-                self.read_jobs.pop(key).finish() # a changed block order must not leave stale hints blocking new ones
-        for entry in entries:
-            params = self.blocks_of_modules[entry]
-            key = id(params)
-            if entry not in self.inflight and key not in self.read_jobs and (self.ring is None or entry not in self.ring.jobs):
-                if entry not in self.read_plans:
-                    if self.ring is not None:
-                        _, layout, _ = self._block_items(entry)
-                        sources = [(src, size) for src, size, _, _ in layout[0]]
-                    else:
-                        sources = [(leaf.data_ptr(), leaf.numel() * leaf.element_size()) for _, _, p, _, tied in params if tied is None for leaf in (_staging_leaves(p.data if type(p) is torch.nn.Parameter else p) or [])]
-                    self.read_plans[entry] = self.read_ahead.mappings.plan(sources)
-                job = self.read_ahead.schedule(self.read_plans[entry])
-                if job is not None:
-                    self.read_jobs[key] = job
 
     def _pin_models(self, listed, smart_pinning, partial_pinning, pinned_peft_lora, perc_reserved_mem_max, max_reservable_memory, verboseLevel, loading_callback):
         # Reserved RAM is shared by the models: the staging ring first if swapped blocks will not be pinned, then the models to pin in the order
@@ -3688,7 +3641,7 @@ class offload:
             if listed[model_id] and len(pinned_swapped) < len(swapped) and verboseLevel >= 1:
                 print(f"Reserved RAM is short for '{model_id}': {len(pinned_swapped)} of its {len(swapped)} blocks processed at each step are pinned, spread evenly, the staging ring takes the others. You may increase 'perc_reserved_mem_max' above {perc_reserved_mem_max:0.2f} to pin more.")
             partial = any(entry not in taken for entry in swapped + entries(model_id, "preloaded") + entries(model_id, "base"))
-            _pin_to_memory(self.models[model_id], model_id, partialPinning = partial, pinnedPEFTLora = pinned_peft_lora, perc_reserved_mem_max = perc_reserved_mem_max, verboseLevel = verboseLevel, loading_callback = loading_callback, ranks = ranks[model_id], readAhead=self.read_ahead_enabled)
+            _pin_to_memory(self.models[model_id], model_id, partialPinning = partial, pinnedPEFTLora = pinned_peft_lora, perc_reserved_mem_max = perc_reserved_mem_max, verboseLevel = verboseLevel, loading_callback = loading_callback, ranks = ranks[model_id])
 
     def _create_ring(self, largest, max_reservable_memory, verboseLevel):
         # the staging ring of the swapped blocks that are not pinned: RING_DEFAULT_BLOCKS of the largest of them, two in a shortage of reserved RAM
@@ -3827,13 +3780,13 @@ class offload:
             self._move_loras(loras_active_adapters, loras_modules, True, model, skip_idle=True)
             
     @torch.compiler.disable()
-    def gpu_load_blocks(self, model_id, blocks_name, preload = False, *, read_ahead_entries=None):
+    def gpu_load_blocks(self, model_id, blocks_name, preload = False):
         # cl = clock.start()
 
 
         entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
         
-        def copy_block(stream_to_use, blocks_params, parallel_staging, moved, read_job): # moved: parameters already on the GPU, by index
+        def copy_block(stream_to_use, blocks_params, parallel_staging, moved): # moved: parameters already on the GPU, by index
             model = self.models[model_id]
             loras_modules = {}
             loras_active_adapters =  getattr(model ,"_loras_active_adapters", None)
@@ -3843,10 +3796,8 @@ class offload:
                 loras_model_data =  getattr(model, "_loras_model_data", None)
 
             with torch.cuda.stream(stream_to_use):
-                read_position = 0
                 for i, param in enumerate(blocks_params):
                     parent_module, n, p, is_buffer, tied_param = param
-                    read_size = 0 if read_job is None or tied_param is not None else builtins.sum(leaf.numel() * leaf.element_size() for leaf in (_staging_leaves(p.data if type(p) is torch.nn.Parameter else p) or []))
 
                     if tied_param != None:
                         tied_p = getattr( tied_param[0], tied_param[1]) 
@@ -3863,10 +3814,7 @@ class offload:
                     if moved is not None and i in moved:
                         q = self.stager.checked(p, moved[i])
                     else:
-                        q = self.stager.to_gpu(p, parallel_staging, read_job, read_position) if read_job is not None else self.stager.to_gpu(p, parallel_staging)
-                    if read_job is not None:
-                        read_job.complete(read_position, read_size)
-                        read_position += read_size
+                        q = self.stager.to_gpu(p, parallel_staging)
                     if not is_buffer:
                         q._is_param = True # parameter-ness without a wrapper, as nn.Parameter does for tensor subclasses: the cpu parameter is reinstalled on unload
                     _install_tensor(parent_module, n , q)
@@ -3882,14 +3830,7 @@ class offload:
                     self._move_loras(loras_active_adapters, loras_modules, True, model, skip_idle=not preload)
 
         def cpu_to_gpu(stream_to_use, blocks_params, parallel_staging=lambda: True, moved=None):
-            job = self.read_jobs.pop(id(blocks_params), None) if self.read_ahead is not None else None
-            if job is not None:
-                job = self.read_ahead.for_copy(job)
-            try:
-                return copy_block(stream_to_use, blocks_params, parallel_staging, moved, job)
-            finally:
-                if job is not None:
-                    job.finish()
+            return copy_block(stream_to_use, blocks_params, parallel_staging, moved)
 
         pipelined = self.async_transfers and blocks_name != None and self.model_prefetch_window(model_id) > 0
         self.wait_prefetch() # the staging thread must not allocate memory freed below while it may still be read
@@ -3897,10 +3838,6 @@ class offload:
 
         if not preload and loaded_block != None and self.auto_preload is not None and self.auto_preload.keep(model_id, loaded_block):
             loaded_block = self.loaded_blocks[model_id] = None # transferred into a buffer of its own, it stays in VRAM: preloaded from now on
-        if self.read_ahead is not None:
-            if preload and read_ahead_entries is None:
-                read_ahead_entries = [entry_name]
-            self._schedule_read_ahead(entry_name, read_ahead_entries if preload else None)
         if not preload and loaded_block != None:
             if self.async_transfers:
                 # The block may still be read by queued compute. Its memory, mostly allocated on the transfer stream, is then reused or
@@ -3931,9 +3868,9 @@ class offload:
             if first:
                 if self.verboseLevel >=2:
                     if preload:
-                        print(f"Preloading model {entry_name} ({model_name}) in GPU")
+                        tqdm.write(f"Preloading model {entry_name} ({model_name}) in GPU")
                     else:
-                        print(f"Loading model {entry_name} ({model_name}) in GPU")
+                        tqdm.write(f"Loading model {entry_name} ({model_name}) in GPU")
                 cpu_to_gpu(torch.cuda.current_stream(), self.blocks_of_modules[entry_name])
 
             torch.cuda.synchronize()
@@ -3942,7 +3879,7 @@ class offload:
 
             if next_blocks_entry != None:
                 if self.verboseLevel >=2:
-                    print(f"Prefetching model {next_blocks_entry} ({model_name}) in GPU")
+                    tqdm.write(f"Prefetching model {next_blocks_entry} ({model_name}) in GPU")
                 if self.needs_staging(next_blocks_entry):
                     self.submit_prefetch(next_blocks_entry, cpu_to_gpu, self.transfer_stream, self.blocks_of_modules[next_blocks_entry], self.is_main_waiting)
                 else:
@@ -3950,7 +3887,7 @@ class offload:
 
         else:
             if self.verboseLevel >=2:
-                print(f"Loading model {entry_name} ({model_name}) in GPU")
+                tqdm.write(f"Loading model {entry_name} ({model_name}) in GPU")
             cpu_to_gpu(self.default_stream, self.blocks_of_modules[entry_name])
             torch.cuda.synchronize()
         if not preload:
@@ -3974,7 +3911,7 @@ class offload:
         if self.verboseLevel >=2:
             model = self.models[model_id]
             model_name = model._get_name()
-            print(f"Unloading model {blocks_name} ({model_name}) from GPU")
+            tqdm.write(f"Unloading model {blocks_name} ({model_name}) from GPU")
  
         blocks_params = self.blocks_of_modules[blocks_name]
         model = self.models[model_id]
@@ -4004,34 +3941,14 @@ class offload:
         self.active_models.append(model)
         self.active_models_ids.append(model_id)
         runtime._load_resources(self, model_id)
-        blocks = [None, *self.preloaded_blocks_per_model[model_id]]
-        entries = [model_id if name is None else model_id + "/" + name for name in blocks] if self.read_ahead is not None else None
-        try:
-            for index, block_name in enumerate(blocks):
-                # Allocation pressure can shrink the automatic preload even while this loop is copying it.
-                preloaded = self.preloaded_blocks_per_model[model_id]
-                if block_name is not None and block_name not in preloaded:
-                    continue
-                look_ahead = None
-                if entries is not None:
-                    look_ahead = []
-                    for pos in range(index, len(blocks)):
-                        if blocks[pos] is None or blocks[pos] in preloaded:
-                            look_ahead.append(entries[pos])
-                            if len(look_ahead) == RING_DEFAULT_BLOCKS + 1:
-                                break
-                self.gpu_load_blocks(model_id, block_name, True, read_ahead_entries=look_ahead)
-        finally:
-            if entries is not None:
-                for entry in entries:
-                    self._cancel_read_ahead(entry)
+        for block_name in [None, *self.preloaded_blocks_per_model[model_id]]:
+            # Allocation pressure can shrink the automatic preload even while this loop is copying it.
+            if block_name is not None and block_name not in self.preloaded_blocks_per_model[model_id]:
+                continue
+            self.gpu_load_blocks(model_id, block_name, True)
 
     def unload_all(self, *, keep=()):
         self.wait_prefetch()
-        if self.read_ahead is not None:
-            self.read_ahead.reset()
-            self.read_jobs.clear()
-            self.read_plans.clear()
         torch.cuda.synchronize() # blocks may still be read or written by queued work
         for model_id, residency in self.expert_residency.items():
             if model_id not in keep:
@@ -4115,7 +4032,7 @@ class offload:
                 torch.cuda.empty_cache()
                 tm= time.time()
                 if self.verboseLevel >=2:
-                    print(f"Empty Cuda cache at {tm}")
+                    tqdm.write(f"Empty Cuda cache at {tm}")
                 # print(f"New cached memory after purge is {torch.cuda.memory_reserved()/1024000:0f} MB)  ")
 
 
@@ -4712,10 +4629,6 @@ def {fname}(module, *args, **kwargs):
         if self.auto_preload is not None:
             self.auto_preload.close()
             self.auto_preload = None
-        if self.read_ahead is not None:
-            self.read_ahead.close()
-            self.read_ahead = None
-        self.read_plans.clear()
         if self.prefetch_executor is not None:
             self.prefetch_executor.shutdown(wait=True)
             self.prefetch_executor = None
@@ -4804,7 +4717,7 @@ class LoadingCallback:
         self.check_abort()
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, readAhead = False, autoPreload = False, cudaGraphs = False, preloadExperts = True):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True):
     """Configure offloading, optionally reporting phases and accepting cancellation."""
     global total_pinned_bytes, max_pinnable_bytes, last_offload_obj
     kwargs = locals().copy()
@@ -4825,7 +4738,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
         raise error from None
 
 
-def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, readAhead = False, autoPreload = False, cudaGraphs = False, preloadExperts = True):
+def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -4846,7 +4759,6 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         compute of the blocks whose memory they reuse: the shuttle holds window + 1 blocks, taken from the budget of the model. Windows
         beyond 1 fall back to 1 when their extra blocks exceed PREFETCH_VRAM_SHARE of the VRAM. 0 keeps the shuttle synchronized by the host
         at every block. Windows apply to models whose blocks are pinned or go through the staging ring.
-    readAhead: False by default. On Windows, bounded read-ahead of read-only mmap weights before pinning copies and in the background for GPU transfers.
         Hints never block copies; other platforms keep their existing path.
     autoPreload: False by default. With the MMGP VRAM allocator (mmgp.allocator), the models processed block by block (with a budget, async
         transfers, not compiled) keep in VRAM as many of their blocks as the VRAM left by the activations of each workload allows, measured
@@ -4892,7 +4804,6 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
 
     self.async_transfers = asyncTransfers
     self.prefetch_window = prefetchWindow
-    self.read_ahead_enabled = readAhead
     from . import allocator as vram_allocator
     self.shared_weight_stream = vram_allocator.active == "vmm"
     auto_measures = autoPreload if isinstance(autoPreload, dict) else None
@@ -4922,8 +4833,6 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
     verboseLevel = _compute_verbose_level(verboseLevel)
 
     _welcome()        
-    if readAhead and windows_os and verboseLevel >= 1:
-        print("Read Ahead enabled for mmap pinning and GPU transfers (Windows)")
     if coTenantsMap != None:
         self.cotenants_map = coTenantsMap 
     if loras != None and isinstance(loras, str):
@@ -5222,10 +5131,9 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
     if pinAllModels: # after the models' own pinning, which has priority for the reserved RAM
         for model_id, residency in self.expert_residency.items():
             residency.pin(lambda module, name: _pin_to_memory(module, name, perc_reserved_mem_max=perc_reserved_mem_max, verboseLevel=verboseLevel,
-                                                              loading_callback=loading_callback, readAhead=self.read_ahead_enabled))
+                                                              loading_callback=loading_callback))
     if self.auto_preload is not None:
         self.auto_preload.after_pinning() # the blocks left unpinned are the first to keep in VRAM
-    self.read_ahead = ReadAhead.create(readAhead)
     if asyncTransfers:
         # once pinned: the ring goes if every swapped block got pinned, and a pinned model that ran out of reserved RAM gets one
         swapped_entries = [entry for entry in self.prev_blocks_names if entry.split("/", 1)[1] not in self.preloaded_blocks_per_model[entry.split("/", 1)[0]]]

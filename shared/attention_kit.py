@@ -16,6 +16,7 @@ projecting q/k/v and calling pay_attention.
 from collections import namedtuple
 
 import torch
+from tqdm import tqdm
 from mmgp import offload
 
 from shared.attention import pay_attention, sage_staged, sage_attention_mask
@@ -94,7 +95,7 @@ def cross_qkv_attention(x_list, context_list, q_proj, k_proj, v_proj, heads, hea
 
 @torch.compiler.disable()
 def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm_spans_heads=False, split_heads=True, kv_prefix=None,
-                        attention_mask=None, force_attention=None, attention_fn=None, norm_stats=None, _cross=False):
+                        attention_mask=None, force_attention=None, attention_fn=None, norm_stats=None, _cross=False, norm_v=None, softmax_scale=None):
     """Attention of the q/k/v projections of several streams joined along the tokens in their order: streams is a list of
     (x_list, (q_proj, k_proj, v_proj)), each x handed off in its list, of shape (batch, tokens, features) or (tokens, features).
     Returns (batch, all tokens, heads, head_dim).
@@ -107,8 +108,13 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
     kv_prefix: (key, value) of shape (batch, prefix tokens, kv_heads, head_dim), already normalized and rotated, put before the
     projected keys and values. attention_mask: pay_attention's mask. kv_heads < heads: grouped query attention.
     norm_stats(project): optional model-native mean-square calculation, used only when splitting a norm spanning all heads;
-    project(which, head_range) supplies disposable projections. Otherwise statistics are accumulated by groups below."""
+    project(which, head_range) supplies disposable projections. Otherwise statistics are accumulated by groups below.
+    norm_v(value, group): optional in-place value normalization, before prefix concatenation or quantization.
+    When every K/V stream shares its k and v module, reuse its projection with independent tensors for normalization.
+    softmax_scale: explicit SDPA scale; requires force_attention="sdpa"."""
     global _unsplit_notice
+    if softmax_scale is not None and (force_attention != "sdpa" or attention_fn is not None):
+        raise ValueError("An explicit softmax_scale requires force_attention='sdpa' and no attention_fn")
     inputs, projections = [], []
     for x_list, stream_projections in streams:
         x = x_list[0]
@@ -116,6 +122,7 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
         inputs.append(x if x.dim() > 2 else x.unsqueeze(0))
         projections.append(stream_projections)
     streams = x = None
+    shared_kv = projections[1][1] is projections[1][2] if _cross else all(k is v for _, k, v in projections)
     batch, lengths, dtype = inputs[0].shape[0], [x.shape[1] for x in inputs], inputs[0].dtype
     tokens = lengths[0] if _cross else sum(lengths)
     kv_heads = kv_heads or heads
@@ -125,13 +132,15 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
     for index, modules in enumerate(projections):
         if _cross:
             modules = tuple(module for module in modules if module is not None)
+        if shared_kv:
+            modules = tuple(dict.fromkeys(modules))
         if offload.linear_rows_supported(modules, inputs[index]):
             x_holder, inputs[index] = [inputs[index]], None
             linear_inputs[index] = offload.prepare_linear_input(x_holder, modules)
     # a stream whose projections cannot be computed by groups of heads is projected whole once and sliced, if it is too short to be split
     if groups > 1 and batch * sum(length for length, prepared in zip(lengths, linear_inputs) if prepared is None) >= MIN_SPLIT_TOKENS:
         if not _unsplit_notice:
-            print("[Attention] Head Split is not applied: these q/k/v projections cannot be computed by groups of heads (weight format or LoRA type).")
+            tqdm.write("[Attention] Head Split is not applied: these q/k/v projections cannot be computed by groups of heads (weight format or LoRA type).")
             _unsplit_notice = True
         groups = 1
     whole = {}
@@ -196,14 +205,17 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
         group = HeadGroup(range(index * q_heads, (index + 1) * q_heads), range(index * kv_group_heads, (index + 1) * kv_group_heads), mean_squares)
         last = index == groups - 1
         if staged is None:
-            qkv_list = [project(0, group.q), project(1, group.kv), project(2, group.kv)]
+            qkv_list = [project(0, group.q), project(1, group.kv)]
+            qkv_list.append(qkv_list[1].clone() if shared_kv else project(2, group.kv))
             if last:
                 release()
+            if norm_v is not None:
+                norm_v(qkv_list[2], group)
             norm_rope(qkv_list[0], qkv_list[1], group)
             qkv_list[1:] = [with_prefix(qkv_list[which], which, group.kv) for which in (1, 2)]
             if q_heads != kv_group_heads:  # pay_attention's backends do not all take fewer key/value heads
                 qkv_list[1:] = [tensor.repeat_interleave(q_heads // kv_group_heads, dim=2) for tensor in qkv_list[1:]]
-            attention = attention_fn(qkv_list, group) if attention_fn is not None else pay_attention(qkv_list, attention_mask=_head_slice(attention_mask, 2, group.q), force_attention=force_attention, recycle_q=True)
+            attention = attention_fn(qkv_list, group) if attention_fn is not None else pay_attention(qkv_list, attention_mask=_head_slice(attention_mask, 2, group.q), force_attention=force_attention, recycle_q=True, softmax_scale=softmax_scale)
             if groups == 1:
                 return attention
             if output is None:
@@ -211,9 +223,16 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
             output[..., group.q.start:group.q.stop, :].copy_(attention)
             del attention
             continue
-        quantized = [None, None, core.staged_quantize_v([with_prefix(project(2, group.kv), 2, group.kv)], settings)]
+        key = project(1, group.kv) if shared_kv else None
+        value = key.clone() if shared_kv else project(2, group.kv)
+        if norm_v is not None:
+            norm_v(value, group)
+        value_list = [with_prefix(value, 2, group.kv)]
+        del value
+        quantized = [None, None, core.staged_quantize_v(value_list, settings)]
         if groups == 1:  # all heads: k is quantized and released before q is projected
-            key = project(1, group.kv)
+            if not shared_kv:
+                key = project(1, group.kv)
             norm_rope(None, key, group)
             quantized[1] = core.staged_quantize_k([with_prefix(key, 1, group.kv)], settings)
             del key
@@ -222,7 +241,9 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
             norm_rope(query, None, group)
             quantized[0] = core.staged_quantize_q(query, settings)
             return core.staged_attention(query, quantized, settings, attention_mask)
-        query, key = project(0, group.q), project(1, group.kv)
+        query = project(0, group.q)
+        if not shared_kv:
+            key = project(1, group.kv)
         if last:
             release()
         norm_rope(query, key, group)

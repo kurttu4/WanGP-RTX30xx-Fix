@@ -255,12 +255,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if not perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):
                 norm_vx = rms_norm(vx, eps=self.norm_eps)
                 norm_vx = _apply_scale_shift(norm_vx, vscale_msa, vshift_msa)
-                v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
                 x_list = [norm_vx]
                 del norm_vx
                 attn_out = self.attn1(x_list, mask=video.self_attention_mask, pe=video.positional_embeddings)
                 attn_out = _apply_gate(attn_out, vgate_msa)
-                attn_out.mul_(v_mask)
+                if perturbations.any_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):  # the mask is all ones otherwise
+                    attn_out.mul_(perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx))
                 vx.add_(attn_out)
                 attn_out = None
             attn_out = self._apply_text_cross_attention(
@@ -300,12 +300,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if not perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx):
                 norm_ax = rms_norm(ax, eps=self.norm_eps)
                 norm_ax = _apply_scale_shift(norm_ax, ascale_msa, ashift_msa)
-                a_mask = perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax)
                 x_list = [norm_ax]
                 del norm_ax
                 attn_out = self.audio_attn1(x_list, mask=audio.self_attention_mask, pe=audio.positional_embeddings)
                 attn_out = _apply_gate(attn_out, agate_msa)
-                attn_out.mul_(a_mask)
+                if perturbations.any_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx):
+                    attn_out.mul_(perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax))
                 ax.add_(attn_out)
                 attn_out = None
             attn_out = self._apply_text_cross_attention(
@@ -377,7 +377,6 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     scale_ca_video_hidden_states_v2a,
                     shift_ca_video_hidden_states_v2a,
                 )
-                v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
                 x_list, context_list = [ax_scaled], [vx_scaled]
                 del ax_scaled, vx_scaled
                 attn_out = self.video_to_audio_attn(
@@ -388,7 +387,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     k_pe=video.cross_positional_embeddings,
                 )
                 attn_out = _apply_gate(attn_out, gate_out_v2a)
-                attn_out.mul_(v2a_mask)
+                if perturbations.any_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx):
+                    attn_out.mul_(perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax))
                 pending_v2a = attn_out
                 attn_out = ax_scaled = vx_scaled = None
 
@@ -403,7 +403,6 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     scale_ca_audio_hidden_states_a2v,
                     shift_ca_audio_hidden_states_a2v,
                 )
-                a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
                 x_list, context_list  = [vx_scaled], [ax_scaled]
                 del vx_scaled, ax_scaled
                 attn_out = self.audio_to_video_attn(
@@ -414,7 +413,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     k_pe=audio.cross_positional_embeddings,
                 )
                 attn_out = _apply_gate(attn_out, gate_out_a2v)
-                attn_out.mul_(a2v_mask)
+                if perturbations.any_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx):
+                    attn_out.mul_(perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx))
                 vx.add_(attn_out)
                 attn_out = vx_scaled = ax_scaled = None
 
