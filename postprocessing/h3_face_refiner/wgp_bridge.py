@@ -77,6 +77,7 @@ class H3FaceRefinerBridge(SimpleScaleSuffixMixin):
             "sample_solver": "er_sde",
             "turbo_lora_strength": 1.0,
             "strength": 0.75,
+            "use_turbo_lora": False,
             "paste_region": "face_only",
             "mask_dilation": 24,
             "feather": 24,
@@ -199,8 +200,6 @@ class H3FaceRefinerBridge(SimpleScaleSuffixMixin):
         return wgp.get_lora_local_path(wgp.get_lora_dir(model_type), model_def[REF_TURBO_LORA_KEY])
 
     def _ensure_turbo(self, wgp):
-        if not self.settings.get("use_turbo_lora", False):
-            return None
         from models.minimax_h3.minimax_h3_handler import REF_TURBO_LORA_KEY
 
         model_def = self._private_model_def(wgp)
@@ -289,7 +288,13 @@ class H3FaceRefinerBridge(SimpleScaleSuffixMixin):
         reference_mode = bool(getattr(pipeline, "reference_mode", False))
         if reference_mode and not INJECT_REFERENCE_IMAGE:
             print("[H3FaceRefine] Reference image injection disabled; conditioning Ref2VA from the tracked control video and its audio track")
-        turbo_path = self._ensure_turbo(wgp) if loaded_model_context is None or loaded_model_context.model_family == "minimax_h3" else None
+        #turbo_path = self._ensure_turbo(wgp) if loaded_model_context is None or loaded_model_context.model_family == "minimax_h3" else None
+        use_turbo = (
+            locals().get("use_turbo_lora", False)
+            or (settings.get("use_turbo_lora", False) if "settings" in locals() and isinstance(settings, dict) else False)
+            or (parameters.get("use_turbo_lora", False) if "parameters" in locals() and isinstance(parameters, dict) else False)
+        )
+        turbo_path = self._ensure_turbo(wgp) if use_turbo and (loaded_model_context is None or loaded_model_context.model_family == "minimax_h3") else None
         refinement_prompt = prompt or DEFAULT_PROMPT
         print(f"[H3FaceRefine] Prompt: {refinement_prompt}")
         try:
