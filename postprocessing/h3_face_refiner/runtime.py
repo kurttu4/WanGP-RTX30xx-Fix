@@ -169,7 +169,7 @@ class H3FaceRefinerRuntime:
             model_kwargs = {"disable_pinning": True}
             if shared_context is not None:
                 model_kwargs.update(shared_h3_pipeline=shared_context.model, shared_h3_offloadobj=shared_context.offloadobj)
-            print(f"[H3FaceRefine] Loading private H3 runtime with default video memory profile {profile}; GGUF Q4_K_M text encoder; RAM pinning disabled")
+            print(f"[H3FaceRefine] Loading private H3 runtime with default video memory profile {profile}; GGUF Q2_K text encoder; RAM pinning disabled")
             self.model, self.offloadobj = wgp.load_models(DEFAULT_MODEL_TYPE, override_profile=profile, output_type="video", config_id=TEXT_ENCODER_CONFIG, track_as_main=False, **model_kwargs)
             self.shared_offloadobj = shared_offloadobj
             if shared_context is not None:
