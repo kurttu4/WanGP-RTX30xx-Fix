@@ -22,7 +22,7 @@ TEMPORAL_STRIDE = 17
 FRAME_OFFSET = 5
 MIN_WINDOW_FRAMES = FRAME_OFFSET + TEMPORAL_STRIDE
 DEFAULT_AUDIO_SAMPLE_RATE = 32000
-TEXT_ENCODER_CONFIG = "gguf_q4_k_m"
+TEXT_ENCODER_CONFIG = "gguf_q2_k"
 
 
 def _report(progress_callback, phase, current=None, total=None):
