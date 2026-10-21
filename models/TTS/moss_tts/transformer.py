@@ -7,7 +7,7 @@ from torch import nn
 from mmgp import runtime
 from shared import attention_kit
 from shared.kernels import ops
-from shared.llm_engines.nanovllm.layerwise import cached_attention
+from shared.llm_engines.lmgp.layerwise import cached_attention
 from shared.utils.lora_mapping import convert_lora_keys
 
 
@@ -26,10 +26,10 @@ class RMSNorm(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, cfg, engine):
+    def __init__(self, cfg, features):
         super().__init__()
         self.heads, self.kv_heads, self.head_dim = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
-        self.engine = engine
+        self.features = features
         self.q_proj = nn.Linear(cfg.hidden_size, self.heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(cfg.hidden_size, self.kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(cfg.hidden_size, self.kv_heads * self.head_dim, bias=False)
@@ -49,7 +49,7 @@ class Attention(nn.Module):
             if key is not None:
                 attention_kit.rows_(key, lambda part, first, last: rotate(part, first, last, self.k_norm))
         output = attention_kit.qkv_attention(x_list, self.q_proj, self.k_proj, self.v_proj, self.heads, self.head_dim, normalize,
-            kv_heads=self.kv_heads, attention_fn=lambda qkv, group: cached_attention(qkv, group, cache, positions, kv_len, self.engine, triton_cache=True))
+            kv_heads=self.kv_heads, attention_fn=lambda qkv, group: cached_attention(qkv, group, cache, positions, kv_len, self.features, triton_cache=True))
         return self.o_proj(output.flatten(2))
 
 
@@ -65,9 +65,9 @@ class MLP(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, cfg, engine):
+    def __init__(self, cfg, features):
         super().__init__()
-        self.self_attn = Attention(cfg, engine)
+        self.self_attn = Attention(cfg, features)
         self.mlp = MLP(cfg)
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
@@ -78,21 +78,21 @@ class DecoderLayer(nn.Module):
 
 
 class Backbone(nn.Module):
-    def __init__(self, cfg, engine):
+    def __init__(self, cfg, features):
         super().__init__()
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.layers = nn.ModuleList([DecoderLayer(cfg, engine) for _ in range(cfg.num_hidden_layers)])
+        self.layers = nn.ModuleList([DecoderLayer(cfg, features) for _ in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
 
 class MossTTS(nn.Module):
     _no_split_modules = ["DecoderLayer"]
 
-    def __init__(self, config, engine):
+    def __init__(self, config, features):
         super().__init__()
-        self.config, self.engine = config, engine
+        self.config, self.features = config, features
         cfg = config.language_config
-        self.language_model = Backbone(cfg, engine)
+        self.language_model = Backbone(cfg, features)
         self.emb_ext = nn.ModuleList([nn.Embedding(config.audio_vocab_size + 1, cfg.hidden_size) for _ in range(config.n_vq)])
         self.lm_heads = nn.ModuleList([nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)] +
                                     [nn.Linear(cfg.hidden_size, config.audio_vocab_size + 1, bias=False) for _ in range(config.n_vq)])

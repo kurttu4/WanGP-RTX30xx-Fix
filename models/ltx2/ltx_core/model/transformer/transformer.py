@@ -146,7 +146,6 @@ class BasicAVTransformerBlock(torch.nn.Module):
             self.audio_prompt_scale_shift_table = torch.nn.Parameter(torch.empty(2, audio.dim))
 
         self.norm_eps = norm_eps
-        self.ff_chunk_min_tokens = 1024
 
     def get_ada_values(
         self, scale_shift_table: torch.Tensor, batch_size: int, timestep: torch.Tensor, indices: slice
@@ -179,17 +178,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         return (*scale_shift_chunks, *gate_ada_values)
 
-    def _apply_ffn_chunked(self, ffn: FeedForward, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[1] < self.ff_chunk_min_tokens:
-            return ffn(x)
-        # Large videos benefit from keeping the expanded scratch below one full hidden state. Small workloads keep their
-        # established chunk count so that additional launches do not dominate their FFN time.
-        chunks = ffn.mult * (2 if x.numel() * x.element_size() >= 512 << 20 else 1)
-        chunk_size = max(int(x.shape[1] / max(chunks, 1)), 1)
-        x_flat = x.view(-1, x.shape[-1])
-        for chunk in torch.split(x_flat, chunk_size):
-            chunk[...] = ffn(chunk)
-        return x
+    @staticmethod
+    def _gated_ffn(ffn: FeedForward, x_list: list, gate: torch.Tensor, residual: torch.Tensor) -> None:
+        """residual += gate * ffn(x), x handed off in x_list, through the shared chunked FFN; a gate per token is applied after it."""
+        fc1, fc2 = ffn.net[0].proj, ffn.net[2]
+        if gate.shape[1] == residual.shape[1]:
+            residual.add_(kernels.mlp(x_list, fc1, fc2, "gelu").mul_(gate))
+        else:
+            kernels.mlp(x_list, fc1, fc2, "gelu", residual=residual, segments=kernels.gate_segments(gate, residual.shape[0], residual.shape[1]))
 
     def _apply_text_cross_attention(
         self,
@@ -443,10 +439,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vgate_mlp = vgate_mlp.to(vx.dtype)
             vx_scaled = rms_norm(vx, eps=self.norm_eps)
             vx_scaled = _apply_scale_shift(vx_scaled, vscale_mlp, vshift_mlp)
-            ff_out = self._apply_ffn_chunked(self.ff, vx_scaled)
-            ff_out = _apply_gate(ff_out, vgate_mlp)
-            vx.add_(ff_out)
-            ff_out = vx_scaled = None
+            vx_list, vx_scaled = [vx_scaled], None
+            self._gated_ffn(self.ff, vx_list, vgate_mlp, vx)
 
             del vshift_mlp, vscale_mlp, vgate_mlp
 
@@ -459,10 +453,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
             agate_mlp = agate_mlp.to(ax.dtype)
             ax_scaled = rms_norm(ax, eps=self.norm_eps)
             ax_scaled = _apply_scale_shift(ax_scaled, ascale_mlp, ashift_mlp)
-            ff_out = self.audio_ff(ax_scaled)
-            ff_out = _apply_gate(ff_out, agate_mlp)
-            ax.add_(ff_out)
-            ff_out = ax_scaled = None
+            ax_list, ax_scaled = [ax_scaled], None
+            self._gated_ffn(self.audio_ff, ax_list, agate_mlp, ax)
 
             del ashift_mlp, ascale_mlp, agate_mlp
 

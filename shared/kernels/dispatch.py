@@ -20,6 +20,12 @@ def _sm120(device_index):
     return torch.version.hip is None and torch.cuda.get_device_capability(device_index) == (12, 0)
 
 
+@functools.cache
+def triton_dtype_supported(device, dtype):
+    """BF16 arithmetic needs native conversion instructions on NVIDIA GPUs."""
+    return dtype != torch.bfloat16 or torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)
+
+
 def take(x_list):
     """Consume an owned activation. Callers must drop their other references.
 

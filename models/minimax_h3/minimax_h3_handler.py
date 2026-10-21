@@ -318,8 +318,35 @@ This model requires exactly **8 inference steps** and the **Euler** sampler. Two
 
 H3_VDN_INFOS = "\n\n### Automatic 8-step acceleration\nThe VDN 8-step acceleration LoRA is automatically loaded and generation defaults to 8 steps."
 
+FASTH3_STEPS = 8
+FASTH3_VIDEO_SHIFT = 12.0
+FASTH3_INFOS = """## FastH3 Omni — 8-Step Reference to Video and Audio
+
+FastH3 Omni is FastVideo's distilled MiniMax H3 Ref2VA student: it generates a video with stereo sound in **8 model evaluations**, on the PDD schedule learned during distillation.
+
+### What it accepts
+
+- **The Ref2VA inputs.** Ordered image, video and audio references named `<Picture N>`, `<Video N>` and `<Audio N>` in the prompt, start and end images, frame injection, reference or control videos, soundtracks, sliding windows and continuation, as described below for Ref2VA.
+- **Distilled with references.** FastVideo trained the student on ordered references (up to nine images, three videos and three audio clips, twelve in total, at least one image or video) and validates only those; the other inputs come from the Ref2VA base it was trained from. Expect the best results with at least one image or video reference.
+
+### How it runs
+
+- **8 inference steps, Euler sampler:** both are locked (a 32-interval PDD grid fused into 8 forwards). The **Flow Shift** (default 12) is the video shift the student was trained with; the audio shift stays 3.
+- **VSA sparse attention** is always on: every query tile of the generated video attends the 10% most relevant tiles of the video and 10% of each reference video, plus every text, audio and image token, with a learned coarse branch over the rest. It needs Triton on an NVIDIA RTX 30xx or newer GPU.
+- **Quality:** a distilled student favors speed; difficult motion, fine detail and some sounds can fall short of the full H3 models.
+"""
+FASTH3_DEEPY_INFOS = ("Generate video and stereo sound in 8 steps (FastVideo FastH3 Omni, a distilled Ref2VA student) with the Ref2VA settings: ordered "
+                      "`image_refs` (`I`, or `KI` to take the output size from the first image), `video_guide` / `video_guide2` / `video_guide3` reference "
+                      "videos (`V` modes, `V1-U` excerpts) or control videos (`VU`, `GV`), `audio_guide`... references (`A` / `AB` / `ABD`, `K` / `K1` "
+                      "soundtracks, `AS` / `KS` kept soundtracks), `image_start` / `image_end`, `FI` frame injection, `video_source` and sliding windows. "
+                      "Name references `<Picture N>`, `<Video N>`, `<Audio N>`. The student was distilled with ordered references (up to 9 images, 3 videos, "
+                      "3 audio clips, 12 in total): use at least one image or video reference for the best results; the other inputs are inherited from "
+                      "the Ref2VA base. `num_inference_steps` is locked to 8 with the Euler sampler; `flow_shift` defaults to 12 (the trained video shift). "
+                      "Attention is locked to VSA sparse attention (Triton, NVIDIA SM80+). Read `prompt_infos` for H3's structured prompt syntax.")
+
 H3_RUNTIME_INFOS = H3_PHASE_INFOS + H3_PHASE_TURBO_INFOS + H3_AUDIO_REFINEMENT_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + H3_COMMON_RUNTIME_INFOS
 H3_PDD_RUNTIME_INFOS = PDD_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
+H3_FASTH3_RUNTIME_INFOS = FASTH3_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
 
 PRUNED_INFOS = """
 ### Pruned 20B checkpoint
@@ -573,16 +600,20 @@ class family_handler:
         vdn = model_def.get("vdn", False)
         pdd = model_def.get("pdd", False)
         veda = model_def.get("veda", False)
+        fasth3 = model_def.get("fasth3", False)
+        if fasth3 and not (reference_mode and pdd):
+            raise ValueError("FastH3 Omni is a Ref2VA PDD student: declare it on the Ref2VA architecture with pdd")
+        fixed_schedule = pdd or fasth3
         text_encoder_variant = model_def.get("text_encoder_variant")
         text_encoder_files = [TEXT_ENCODER_BF16, TEXT_ENCODER_INT8] if text_encoder_variant is None else TEXT_ENCODER_VARIANTS[text_encoder_variant]
         result = {
             "dtype": "bf16",
             "device_explicit": True,
-            "cuda_graphs": [] if veda else ["transformer"],
+            "cuda_graphs": [] if veda or fasth3 else ["transformer"],
             "uint8_guides": _uint8_guides,
             "tiny_vae_architecture": REF2VA_ARCHITECTURE,
             "size": "lighter" if pruned else "large",
-            **({"accelerated": "native"} if pdd or vdn or veda else {}),
+            **({"accelerated": "native"} if pdd or vdn or veda or fasth3 else {}),
             **({"specialities": [{"name": "character consistency", "aliases": ["identity preservation"]}, {"name": "motion transfer", "description": "Transfer motion or camera from reference videos to image-reference characters."}]} if reference_mode else {}),
             "fps": 24,
             "v2i_switch_supported": True,
@@ -593,13 +624,13 @@ class family_handler:
             "frames_offset": 5,
             "block_size": 32,
             "vae_block_size": 32,
-            "guidance_max_phases": 1 if pdd else 2,
-            "lock_guidance_phases": pdd,
+            "guidance_max_phases": 1 if fixed_schedule else 2,
+            "lock_guidance_phases": fixed_schedule,
             "visible_phases": 0,
-            "lora_multiplier_phases": 1 if pdd else 2,
-            "phase_2_spatial_tiling": not pdd,
+            "lora_multiplier_phases": 1 if fixed_schedule else 2,
+            "phase_2_spatial_tiling": not fixed_schedule,
             "resolution_budget": "2048x2048",
-            **({"resolution_budget_tiled": "3840x2176"} if not pdd else {}),
+            **({"resolution_budget_tiled": "3840x2176"} if not fixed_schedule else {}),
             "custom_settings": [{
                 "id": H3_MASK_MODE_SETTING,
                 "name": "Mask Denoising Mode",
@@ -631,8 +662,8 @@ class family_handler:
                 "step": 0.0001,
             },
             "inference_steps": True,
-            "inference_steps2": not pdd,
-            "lock_inference_steps": pdd,
+            "inference_steps2": not fixed_schedule,
+            "lock_inference_steps": fixed_schedule,
             "flow_shift": True,
             "spectrum_cache": True,
             "first_block_cache": True,
@@ -642,19 +673,21 @@ class family_handler:
             "custom_attention_modes": {
                 "vdn": {"label": "VDN hybrid attention", "supports_sparsity": False, "installed": True, "supported": True},
             } if vdn else {
+                "vsa": {"label": "VSA Video Sparse Attention (Triton, NVIDIA SM80+)", "supports_sparsity": False},
+            } if fasth3 else {
                 "veda": {"label": "Veda Learned Sparse Attention (Triton, NVIDIA SM80+)", "supports_sparsity": False},
             } if veda else {
                 "sol": {"label": "Sol sparse attention, requires Triton and RTX 30xx or newer", "supports_sparsity": True},
             },
-            "default_attention_modes_supported": not (vdn or veda),
-            "attention": {">=0": "vdn"} if vdn else {">=80": "veda"} if veda else None,
+            "default_attention_modes_supported": not (vdn or veda or fasth3),
+            "attention": {">=0": "vdn"} if vdn else {">=80": "vsa"} if fasth3 else {">=80": "veda"} if veda else None,
             "attention_sparsity": {
                 "label": "Start Tau (higher = more sparse/faster; lower = more faithful; End Tau = 0.8)",
                 "start": 0.0,
                 "end": 4.0,
                 "inc": 0.05,
             },
-            "sample_solvers": [("Euler", "euler")] if pdd else [("Euler", "euler"), ("RES Multistep", "res_multistep"), ("Ralston 2S (~2x slower)", "ralston_2s")],
+            "sample_solvers": [("Euler", "euler")] if fixed_schedule else [("Euler", "euler"), ("RES Multistep", "res_multistep"), ("Ralston 2S (~2x slower)", "ralston_2s")],
             "no_negative_prompt": True,
             "returns_audio": True,
             "audio_window_alignment": True,
@@ -668,7 +701,7 @@ class family_handler:
             "control_video_trim_disabled": True,
             "extract_guide_from_window_start": True,  # sliding windows get pure window-aligned guide frames; continuation comes through input_video
             "prompt_enhancer_picture_labels": True,  # enhancer images are labelled with the <Picture N> the pipeline presents
-            "infos": (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_RUNTIME_INFOS) + (PRUNED_INFOS if pruned else "") + (H3_VDN_INFOS if vdn else "") + model_def.get("infos", ""),
+            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_RUNTIME_INFOS)) + (PRUNED_INFOS if pruned else "") + (H3_VDN_INFOS if vdn else "") + model_def.get("infos", ""),
             "prompt_infos": REF2VA_PROMPT_INFOS if reference_mode else FL2VA_PROMPT_INFOS,
             "prompt_enhancer_button_label": "Write",
             "prompt_enhancer_def": {
@@ -689,7 +722,7 @@ class family_handler:
             "image_prompt_enhancer_instructions1": H3_STILL_IMAGE_SYSTEM_PROMPT,
             "text_prompt_enhancer_max_tokens1": 1024,
             "image_prompt_enhancer_max_tokens1": 1024,
-            "profiles_dir": ["minimax_h3_vdn"] if vdn else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
+            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
             "finetune_custom_urls": ["video_vae_file", "audio_vae_file"],
             "vae_upsamplers": {X2_VAE_METHOD: [0, 1, 2]},
             "finetunes_infos": H3_FINETUNES_INFOS,
@@ -852,6 +885,8 @@ class family_handler:
                 "video_length_not_limited_by_audio": True,
                 "output_audio_is_input_audio": True,
             })
+        if fasth3:  # FastH3 Omni: the Ref2VA inputs, the student's own schedule and attention (locked above)
+            result["deepy_infos"] = FASTH3_DEEPY_INFOS
         if pdd:
             result["deepy_infos"] += " PDD requires exactly 8 inference steps and the Euler sampler."
         else:
@@ -879,6 +914,17 @@ class family_handler:
     def validate_generative_settings(base_model_type, model_def, inputs):
         if model_def.get("veda", False):
             inputs["overrides"] = set_override(inputs["overrides"], "attention_mode", "veda")
+        if model_def.get("fasth3", False):
+            inputs["overrides"] = set_override(inputs["overrides"], "attention_mode", "vsa")
+            if inputs["sample_solver"] != "euler":
+                return "MiniMax H3 FastH3 requires the Euler sampler"
+            inputs["num_inference_steps"] = FASTH3_STEPS
+            image_refs = inputs.get("image_refs") or []
+            video_prompt_type, audio_prompt_type = inputs.get("video_prompt_type") or "", inputs.get("audio_prompt_type") or ""
+            videos = (inputs.get("video_guide") is not None) + (inputs.get("video_guide2") is not None) + (inputs.get("video_guide3") is not None) if "V" in video_prompt_type else 0
+            audios = sum(flag in audio_prompt_type for flag in "ABD")
+            if len(image_refs) > 9 or len(image_refs) + videos + audios > 12:  # the student's trained reference budget
+                return "FastH3 Omni accepts at most nine image references and twelve references in total"
         if ((inputs.get("spatial_upsampling") or "").startswith(X2_VAE_METHOD) and int(inputs["image_mode"]) == 0
                 and base_model_type not in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE)
                 and "2" in inputs["audio_prompt_type"]):
@@ -1153,7 +1199,8 @@ class family_handler:
                                  video_vae_filename=video_vae_file,
                                  audio_vae_filename=model_def.get("audio_vae_file", AUDIO_VAE_FILE), shared_h3_pipeline=shared_h3_pipeline,
                                  pdd=pdd, pdd_num_steps=PDD_NUM_STEPS if pdd else None, pdd_block_size=PDD_BLOCK_SIZE if pdd else None,
-                                 vdn=model_def.get("vdn", False), veda=model_def.get("veda", False), audio_only=base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE,
+                                 vdn=model_def.get("vdn", False), veda=model_def.get("veda", False), vsa=model_def.get("fasth3", False),
+                                 audio_only=base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE,
                                  fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None)
         pipe = {"transformer": pipeline.transformer}
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE and H3_DIALOGUE_GENERATION:
@@ -1183,6 +1230,10 @@ class family_handler:
         if model_def.get("veda", False):
             ui_defaults["overrides"] = set_override(ui_defaults.get("overrides", ""), "attention_mode", "veda")
         elif get_override(ui_defaults.get("overrides", ""), "attention_mode") == "veda":
+            ui_defaults["overrides"] = set_override(ui_defaults["overrides"], "attention_mode", "")
+        if model_def.get("fasth3", False):
+            ui_defaults["overrides"] = set_override(ui_defaults.get("overrides", ""), "attention_mode", "vsa")
+        elif get_override(ui_defaults.get("overrides", ""), "attention_mode") == "vsa":
             ui_defaults["overrides"] = set_override(ui_defaults["overrides"], "attention_mode", "")
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE:
             return
@@ -1274,5 +1325,7 @@ class family_handler:
         })
         if reference_mode:
             ui_defaults.update({"image_refs_relative_size": 100, "remove_background_images_ref": 0})
+        if model_def.get("fasth3", False):
+            ui_defaults.update({"num_inference_steps": FASTH3_STEPS, "flow_shift": FASTH3_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
         if base_model_type in CONTROL_ARCHITECTURES:
             ui_defaults.update({"video_prompt_type": "PV", "control_net_weight": 1.0, "sliding_window_overlap": 22 if H3_CONTROL_LATENT_CONTINUATION else 18})

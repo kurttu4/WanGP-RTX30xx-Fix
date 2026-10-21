@@ -171,18 +171,6 @@ class ChromaModulationOut(ModulationOut):
         )
 
 
-def split_mlp(mlp, x, divide = 8):
-    x_shape = x.shape
-    x = x.view(-1, x.shape[-1])
-    chunk_size = int(x.shape[0]/divide)
-    chunk_size = int(x_shape[1]/divide)
-    x_chunks = torch.split(x, chunk_size)
-    for i, x_chunk  in enumerate(x_chunks):
-        mlp_chunk = mlp[0](x_chunk)
-        mlp_chunk = mlp[1](mlp_chunk)
-        x_chunk[...] = mlp[2](mlp_chunk)
-    return x.reshape(x_shape)      
-
 class Modulation(nn.Module):
     def __init__(self, dim: int, double: bool, bias: bool = True):
         super().__init__()
@@ -220,6 +208,7 @@ class DoubleStreamBlock(nn.Module):
         self.num_heads = num_heads
         self.hidden_size = hidden_size
         self.shared_modulation = shared_modulation
+        self.mlp_activation = "swiglu" if double_linear1_mlp_ratio is not None else "gelu"  # of both MLPs, for the shared chunked FFN
         if not shared_modulation:
             self.img_mod = Modulation(hidden_size, double=True, bias=mod_bias)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -282,18 +271,13 @@ class DoubleStreamBlock(nn.Module):
 
         # calculate the img blocks
         ops.gated_residual_(img, [self.img_attn.proj(img_attn)], img_mod1.gate, fused=True)
-        mod_img = ops.norm_scale_shift([img], self.img_norm2, img_mod2.scale, img_mod2.shift)
-        mod_img = split_mlp(self.img_mlp, mod_img)
-        # mod_img = self.img_mlp(mod_img)
-        mod_img_list, mod_img = [mod_img], None
-        ops.gated_residual_(img, mod_img_list, img_mod2.gate, fused=True)
+        ops.mlp([ops.norm_scale_shift([img], self.img_norm2, img_mod2.scale, img_mod2.shift)], self.img_mlp[0], self.img_mlp[2], self.mlp_activation,
+                residual=img, segments=ops.gate_segments(img_mod2.gate, img.shape[0], img.shape[1]))
 
         # calculate the txt blocks
         ops.gated_residual_(txt, [self.txt_attn.proj(txt_attn)], txt_mod1.gate, fused=True)
-        mod_txt = ops.norm_scale_shift([txt], self.txt_norm2, txt_mod2.scale, txt_mod2.shift, in_place=False)
-        mod_txt = self.txt_mlp(mod_txt)
-        mod_txt_list, mod_txt = [mod_txt], None
-        ops.gated_residual_(txt, mod_txt_list, txt_mod2.gate, fused=True)
+        ops.mlp([ops.norm_scale_shift([txt], self.txt_norm2, txt_mod2.scale, txt_mod2.shift, in_place=False)], self.txt_mlp[0], self.txt_mlp[2], self.mlp_activation,
+                residual=txt, segments=ops.gate_segments(txt_mod2.gate, txt.shape[0], txt.shape[1]))
         return img, txt
 
     def _attention_nag(self, img_list, txt, txt_mod1, pe, NAG):

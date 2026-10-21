@@ -122,18 +122,61 @@ def ensure_loaded(module):
 
 
 def weights_resident(module):
-    """Whether a managed model's weights are all in VRAM now (loaded, no block streamed; expert banks aside): an MMGP graph stage
-    may then span several of its blocks (see cuda_graphs.run). Check it at each call: a dynamic preload can release blocks between
-    calls. Unmanaged modules: True."""
+    """Whether the weights of a managed module are all in VRAM now (its model loaded, none of the blocks under the module streamed; expert
+    banks aside): an MMGP graph stage that runs this module may then span several of its blocks (see cuda_graphs.run). For a submodule
+    (e.g. the language model of a larger model), only its own blocks count: blocks the stage never runs may stay out of VRAM. Check it at
+    each call: a dynamic preload can release blocks between calls. Unmanaged modules: True."""
     owner = _owner(module)
     if owner is None:
         return True
     manager, model_id = owner
     if model_id not in manager.active_models_ids:
         return False
+    names = _block_names.get(manager)
+    if names is None:  # the blocks of a model are those of its profile
+        names = _block_names[manager] = {}
+    model = manager.models[model_id]
+    blocks = names.get((model_id, id(module)))
+    if blocks is None:
+        prefix = model_id + "/" + ("" if module is model else next(name for name, m in model.named_modules() if m is module) + ".")
+        blocks = names[(model_id, id(module))] = [name[len(model_id) + 1:] for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(prefix)]
     preloaded = manager.preloaded_blocks_per_model[model_id]
-    prefix = model_id + "/"
-    return all(name[len(prefix):] in preloaded for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(prefix))
+    return all(name in preloaded for name in blocks)
+
+
+_block_names = weakref.WeakKeyDictionary()  # an offload manager -> (model id, id of a module of the model) -> the names of its blocks
+_tower_entries = weakref.WeakKeyDictionary()  # a tower (ModuleList) -> (model id, the entry name of each of its blocks)
+
+
+def resident_runs(module, blocks):
+    """The blocks of a tower of a managed model (a ModuleList of its blocks) as runs (start, stop, resident) that cover them in order:
+    the blocks of a resident run are kept in VRAM now, the others are streamed when they run (all are resident while their model is
+    loaded whole). The first block of a tower where an automatic preload starts its cycles is a run of its own, not resident, as are
+    the blocks of a model not loaded yet. Query it at each pass: a dynamic preload changes the blocks kept between calls."""
+    owner = _owner(module)
+    if owner is None:
+        return ((0, len(blocks), True),)
+    manager, model_id = owner
+    entries = _tower_entries.get(blocks)
+    if entries is None or entries[0] != (id(manager), model_id):
+        model = manager.models[model_id]
+        prefix = next(name for name, submodule in model.named_modules() if submodule is blocks) + "."
+        names = [prefix + str(index) for index in range(len(blocks))]
+        entries = _tower_entries[blocks] = ((id(manager), model_id), [name if manager.blocks_of_modules_sizes.get(model_id + "/" + name) else None for name in names])
+    names = entries[1]
+    if model_id not in manager.active_models_ids:
+        return ((0, len(blocks), False),)
+    preloaded = manager.preloaded_blocks_per_model[model_id]
+    flags = [name is None or name in preloaded for name in names]
+    plan = None if manager.auto_preload is None else manager.auto_preload.plans.get(model_id)
+    if plan is not None and names and plan.first == names[0]:
+        flags[0] = False
+    runs, start = [], 0
+    for index in range(1, len(flags) + 1):
+        if index == len(flags) or flags[index] != flags[start] or not flags[start]:
+            runs.append((start, index, flags[start]))
+            start = index
+    return tuple(runs)
 
 
 def place_experts(module):
@@ -147,6 +190,16 @@ def place_experts(module):
     manager, model_id = owner
     residency = manager.expert_residency.get(model_id)
     return residency is None or residency.place()
+
+
+def dynamic_preload(module):
+    """Whether an automatic VRAM preload manages this model's blocks: it keeps as many as fit and releases some when another allocation
+    needs VRAM (a co-tenant loaded beside it then takes only what it needs), keeping them again later as they run."""
+    owner = _owner(module)
+    if owner is None:
+        return False
+    manager, model_id = owner
+    return manager.auto_preload is not None and model_id in manager.auto_preload.plans
 
 
 def requires_layer_offload(module):

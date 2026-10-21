@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <deque>
 #include <functional>
@@ -23,6 +24,8 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dxgi1_4.h>
+#undef small  // a macro of rpcndr.h, which the DXGI headers include
 #include <thread>
 #define EXPORT extern "C" __declspec(dllexport)
 #else
@@ -151,6 +154,7 @@ struct Driver {
     CUresult (*MemGetInfo)(size_t*, size_t*);
     CUresult (*MemGetAllocationGranularity)(size_t*, const CUmemAllocationProp*, int);
     CUresult (*DeviceGetPCIBusId)(char*, int, CUdevice);
+    CUresult (*DeviceGetLuid)(char*, unsigned*, CUdevice);  // Windows: the adapter of the device for DXGI (optional)
 } cu;
 
 struct NvmlMemory {
@@ -216,6 +220,7 @@ int load_driver() {
     bind(cu.MemGetAllocationGranularity, "cuMemGetAllocationGranularity");
     bind(cu.DeviceGetPCIBusId, "cuDeviceGetPCIBusId");
     if (!complete) return driver_status = 2;
+    cu.DeviceGetLuid = reinterpret_cast<CUresult (*)(char*, unsigned*, CUdevice)>(symbol("cuDeviceGetLuid"));
     return driver_status = cu.Init(0) == CUDA_SUCCESS ? 0 : 3;
 }
 
@@ -353,6 +358,7 @@ struct Device {
     size_t host_granularity = 0;                               // 0 when the driver cannot map system RAM this way
     int64_t spilled_bytes = 0;                                 // system RAM mapped by spills, live and cached
     int64_t driver_spilled = 0;                                // live allocations of the driver (alloc_driver)
+    void* dxgi_adapter = nullptr;                              // Windows: IDXGIAdapter3 of the device, see room_now
     void* nvml_device = nullptr;                               // see vram_short
     int64_t nvml_free = 0, nvml_reserved = 0;                  // whole GPU free memory at the last NVML reading, reserved_now then
     std::chrono::steady_clock::time_point nvml_read{};
@@ -458,9 +464,43 @@ void trim_pools(Device& d) {
 // An allocation that would fail anyway is tried once more without it (beyond_gpu): Windows pages the VRAM of idle processes out.
 enum Refusal : int { REFUSED_BY_BUDGET = 1, REFUSED_BY_GPU, REFUSED_BY_LIMIT, REFUSED_BY_DRIVER };
 
-int64_t room_now(Device& d, int* bound = nullptr) {  // bound: the Refusal of the smallest of the limits
+// On Windows this process' budget is read from DXGI (budget - usage, what Windows manages residency by), not from the driver's free memory:
+// once a CUDA memory pool holds memory, the driver also limits that figure to the addresses left in a window the pools may grow into,
+// which address ranges without memory behind them (this allocator's arenas, RAM registered in pieces) shrink: by up to half of the VRAM,
+// while allocations still succeed.
+void* dxgi_adapter(CUdevice dev) {
+#ifdef _WIN32
+    char luid[8];
+    unsigned mask = 0;
+    if (!cu.DeviceGetLuid || cu.DeviceGetLuid(luid, &mask, dev) != CUDA_SUCCESS) return nullptr;
+    HMODULE library = LoadLibraryA("dxgi.dll");
+    auto create = library ? reinterpret_cast<HRESULT (WINAPI*)(REFIID, void**)>(GetProcAddress(library, "CreateDXGIFactory1")) : nullptr;
+    IDXGIFactory4* factory = nullptr;
+    if (!create || FAILED(create(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)))) return nullptr;
+    LUID id;
+    memcpy(&id, luid, sizeof(id));
+    IDXGIAdapter3* adapter = nullptr;
+    if (FAILED(factory->EnumAdapterByLuid(id, __uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&adapter)))) adapter = nullptr;
+    factory->Release();
+    return adapter;
+#else
+    return nullptr;
+#endif
+}
+
+size_t process_free(const Device& d) {  // VRAM this process may still take: its DXGI budget on Windows, otherwise the driver's free memory
     size_t free_bytes = 0, total = 0;
+#ifdef _WIN32
+    DXGI_QUERY_VIDEO_MEMORY_INFO info;
+    if (d.dxgi_adapter && SUCCEEDED(static_cast<IDXGIAdapter3*>(d.dxgi_adapter)->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        return info.Budget > info.CurrentUsage ? static_cast<size_t>(info.Budget - info.CurrentUsage) : 0;
+#endif
     cu.MemGetInfo(&free_bytes, &total);
+    return free_bytes;
+}
+
+int64_t room_now(Device& d, int* bound = nullptr) {  // bound: the Refusal of the smallest of the limits
+    size_t free_bytes = process_free(d);
     int64_t room = static_cast<int64_t>(free_bytes);
     int smallest = REFUSED_BY_BUDGET;
     if (d.nvml_device && !d.beyond_gpu) {
@@ -585,6 +625,7 @@ Device& device_state(int index) {  // created by the first allocation on a devic
     d.access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     CUdevice dev;
     cu.DeviceGet(&dev, index);
+    d.dxgi_adapter = dxgi_adapter(dev);
     cu.DevicePrimaryCtxRetain(&d.context, dev);  // PyTorch's context, kept for the life of the process
     bind_context(d);
     cu.DeviceGetDefaultMemPool(&d.small_pool, dev);
@@ -1289,9 +1330,9 @@ const char* format_size(double bytes, char* text) {  // as PyTorch's out of memo
 }
 
 [[noreturn]] void out_of_memory(const Device& d, size_t size, int device, bool to_pool) {
-    size_t free_bytes = 0, total = 0;
-    cu.MemGetInfo(&free_bytes, &total);
-    NvmlMemory gpu = {};  // the whole GPU's free memory, read now: the driver's figure is this process' budget on Windows
+    size_t free_bytes = process_free(d), unused_free = 0, total = 0;
+    cu.MemGetInfo(&unused_free, &total);
+    NvmlMemory gpu = {};  // the whole GPU's free memory, read now: free_bytes is this process' budget on Windows
     bool whole_gpu = d.nvml_device && nvml.DeviceGetMemoryInfo(d.nvml_device, &gpu) == 0;
     char request[32], capacity[32], available[32], driver_free[32], allocated[32], unused[32], need[32], headroom[32], spilled[32], ram[32],
         margin[32], message[1280];
@@ -1299,7 +1340,7 @@ const char* format_size(double bytes, char* text) {  // as PyTorch's out of memo
              format_size(static_cast<double>(size), request), to_pool ? " for a CUDA graph" : "", device, format_size(static_cast<double>(total), capacity),
              format_size(static_cast<double>(whole_gpu ? gpu.free : free_bytes), available));
     if (whole_gpu)
-        length += snprintf(message + length, sizeof(message) - length, " (the driver reports %s free for this process)",
+        length += snprintf(message + length, sizeof(message) - length, " (%s free for this process)",
                            format_size(static_cast<double>(free_bytes), driver_free));
     length += snprintf(message + length, sizeof(message) - length, ". Of the allocated memory %s is allocated by PyTorch, and %s is reserved by "
              "the MMGP VRAM allocator but unallocated.", format_size(static_cast<double>(d.allocated), allocated),

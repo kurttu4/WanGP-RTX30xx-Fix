@@ -158,19 +158,9 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
         self.activation_fn = nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states.pop() if isinstance(hidden_states, list) else hidden_states
-        # Bound the expanded activation to approximately the input tensor size.
-        chunk = math.ceil(hidden_states.shape[1] * self.proj.in_features / self.proj.out_features) if hidden_states.shape[1] > 1024 else hidden_states.shape[1]
-        for start in range(0, hidden_states.shape[1], chunk):
-            check_abort()
-            part = hidden_states[:, start:start + chunk]
-            gate = self.gate_layer(part)
-            activations, gate = [gate, self.proj(part)], None
-            gate = kernels.swiglu(activations, packed=False)
-            # Input is a disposable normalized activation, not the residual.
-            part.copy_(self.out(gate))
-            del gate, part
-        return hidden_states
+        check_abort()
+        x_list = hidden_states if isinstance(hidden_states, list) else [hidden_states]
+        return kernels.mlp(x_list, self.gate_layer, self.out, "swiglu", up=self.proj)  # in place of the disposable normalized activation
 
 class QwenImage21AdaLayerNormContinuous(nn.Module):
 

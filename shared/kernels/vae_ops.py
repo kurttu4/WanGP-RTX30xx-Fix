@@ -75,13 +75,19 @@ def rope_plan(x, dim_head, rotary):
 
 
 def normalize_projection(x_list, norm, rotary, plan):
+    """Consume a (batch, tokens, heads, head_dim) projection, normalizing each row independently."""
     x = take(x_list)
     family, cast = plan
     if family is not None:
         return x
     dtype = x.dtype
+    if not cast:
+        from shared.attention_kit import rows_
+        # Keep FP32 norm arithmetic without full-projection FP32 temporaries.
+        rows_(x, lambda part, first, last: norm(part.float()).to(dtype))
+        return x
     x = norm(x.float())
-    return _video.cast_rope(x, rotary) if cast else x.to(dtype)
+    return _video.cast_rope(x, rotary)
 
 
 def finish_rope_(q, k, rotary, eps, plan):

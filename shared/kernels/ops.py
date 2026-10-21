@@ -32,8 +32,9 @@ except ValueError as exc:
     _kitchen_rms_rope = None
 
 
-def can_linear(layer, x, *, dtypes=(torch.bfloat16,)):
-    return int8_backend.can_fuse_linear(layer, x, dtypes=dtypes)
+def can_linear(layer, x, *, dtypes=(torch.bfloat16,), act=None):
+    """Whether layer(x) can run through the INT8 backend's fused kernel, with the input operation act ('gelu' needs WGPKernels)."""
+    return int8_backend.can_fuse_linear(layer, x, dtypes=dtypes, act=act)
 
 
 def linear(layer, x_list, **fusion):
@@ -175,6 +176,67 @@ def gated_linear(layer, x_list, residual, gate, segments):
                          residual_scale=gate[row].to(x.dtype), out=residual[start:stop])
             residual[start:stop].copy_(out)
     return residual
+
+
+MLP_MIN_ROWS = 2048  # fewer rows per chunk make the GEMMs less efficient (RTX 4090: 3744 rows within noise, 936 rows 3-5 % slower)
+MLP_MAX_CHUNKS = 16  # per call: every chunk adds its kernels to a block's CUDA graph
+MLP_L2_FRACTION = 0.75  # of the device's L2 cache for a chunk's expanded activation, so that the activation kernel reads it from L2
+_l2_cache_bytes = {}
+
+
+def mlp_chunk_rows(tokens, expanded_row_bytes, device):
+    """Rows per chunk of mlp(): the expanded chunk (fc1 output) within MLP_L2_FRACTION of the device's L2 cache, never fewer than
+    MLP_MIN_ROWS nor more than MLP_MAX_CHUNKS chunks per call; the whole input when it is that short."""
+    index = torch.cuda.current_device() if device.index is None else device.index
+    if index not in _l2_cache_bytes:
+        _l2_cache_bytes[index] = torch.cuda.get_device_properties(index).L2_cache_size
+    return min(tokens, max(MLP_MIN_ROWS, int(_l2_cache_bytes[index] * MLP_L2_FRACTION) // expanded_row_bytes, -(-tokens // MLP_MAX_CHUNKS)))
+
+
+def gate_segments(gate, batch, tokens):
+    """mlp() segments for a gate of shape (batch or 1, groups, dim) over an input (batch, tokens, dim): groups is 1, or a number of
+    frames that divides the tokens. A gate per token does not fit segments: apply it after mlp()."""
+    gate = gate.reshape(gate.shape[0], -1, gate.shape[-1])
+    groups, span = gate.shape[1], tokens // gate.shape[1]
+    return [(b * tokens + g * span, b * tokens + (g + 1) * span, gate[b if gate.shape[0] > 1 else 0, g]) for b in range(batch) for g in range(groups)]
+
+
+def mlp(x_list, fc1, fc2, act, *, up=None, residual=None, gate=None, segments=None):
+    """fc2(act(fc1(x))) by chunks of tokens (mlp_chunk_rows): each chunk's output replaces its input rows, or is added to residual
+    scaled by gate and written into residual. x, handed off in x_list, and residual have shape (..., dim) and are contiguous.
+    act: 'gelu' (tanh approximation), 'gelu_erf', or 'swiglu' (fc1 rows gate | value; with up: silu(fc1(x)) * up(x)). gate is one
+    vector per channel for all tokens, or segments [(start, stop, vector)] over the flattened tokens (frames, spans, batch rows:
+    gate_segments). Where the INT8 backend supports it, the activation is fused into fc2's kernel (gelu, packed swiglu) and the
+    gated residual into its epilogue, rounded once; otherwise the activation runs in place and the residual update follows.
+    Returns x, or residual."""
+    x = take(x_list)
+    shape, x = x.shape, x.view(-1, x.shape[-1])
+    out = x if residual is None else residual.view(-1, x.shape[-1])
+    width = fc1.out_features + (0 if up is None else up.out_features)
+    rows = mlp_chunk_rows(x.shape[0], width * x.element_size(), x.device)
+    fusable = act if up is None and act != "gelu_erf" else None
+    for start, stop, scale in [(0, x.shape[0], gate)] if segments is None else segments:
+        scale = None if scale is None else scale.reshape(-1).to(out.dtype)
+        for first in range(start, stop, rows):
+            last = min(first + rows, stop)
+            h = fc1(x[first:last])
+            fused = fusable if fusable and can_linear(fc2, h, act=fusable) else None
+            if fused is None:
+                h = (swiglu([h, up(x[first:last])], packed=False) if up is not None else swiglu([h]) if act == "swiglu"
+                     else torch.ops.aten.gelu_(h, approximate="tanh" if act == "gelu" else "none"))
+            target = out[first:last]
+            if target.dtype == h.dtype and (fused is not None or (residual is not None and can_linear(fc2, h))):
+                linear(fc2, [h], input_act=fused, residual=None if residual is None else target, residual_scale=scale, out=target)
+                continue
+            y = linear(fc2, [h], input_act=fused) if fused is not None else fc2(h)
+            del h
+            if residual is None:
+                target.copy_(y)
+            elif scale is None:
+                target.add_(y)
+            else:
+                target.addcmul_(y, scale)
+    return out.view(shape)
 
 
 def prepare_split_half_rope(rope):

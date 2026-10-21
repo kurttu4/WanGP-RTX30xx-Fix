@@ -287,6 +287,13 @@ def _collect_specs(state_dict, metadata=None):
     return specs
 
 
+def cpu_compute_supported(tensor):
+    """Whether linears with this INT8 weight (INT8 ConvRot or Quanto qint8) compute on the CPU in its storage when MMGP leaves their block
+    there (cpuCompute)."""
+    from shared.kernels import cpu_linear
+    return isinstance(tensor, WeightQBytesTensor) and tensor._data.dtype == torch.int8 and cpu_linear.supported(tensor)
+
+
 def detect(state_dict, verboseLevel=1, metadata=None):
     specs = _collect_specs(state_dict, metadata)
     if not specs:
@@ -454,6 +461,11 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         qweight = self.qweight
+        if getattr(qweight, "_mm_cpu_compute", False) and qweight._data.device.type == "cpu":  # a block that MMGP leaves on the CPU (cpuCompute)
+            from shared.kernels import cpu_linear
+            if self.weight_qtype == _QINT8_CONVROT_QTYPE:
+                input = _rotate_activation(input, self._convrot_group_size)
+            return cpu_linear.linear(qweight, input, self.bias, input.dtype)
         prepared = getattr(self, '_wangp_prequantized_input', None)
         if prepared is not None:
             return int8_backend.linear_prequantized(qweight, self.bias, *prepared)

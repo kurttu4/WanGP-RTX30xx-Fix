@@ -22,7 +22,7 @@ def _wgp_installed():
 
 
 CHOICES = [("Disabled: PyTorch (slowest, most precise)", "disabled"), ("Auto (best available)", "auto"),
-           (f"WGPKernels (recommended,{'installed' if _wgp_installed() else 'not installed'}, second fastest, precise)", "wgpkernels"),
+           (f"WGPKernels (recommended, {'installed' if _wgp_installed() else 'not installed'}, second fastest, precise)", "wgpkernels"),
            ("Triton (fast, less precise)", "triton"), ("Comfy Kitchen Kernels (fastest, least precise)", "kitchen")]
 _LABELS = {"wgpkernels": "WGPKernels", "kitchen": "Comfy Kitchen", "triton": "Triton"}
 _backend = "pytorch"
@@ -111,8 +111,9 @@ def _probe_wgpkernels():
         return None, "requires a GPU"
     if torch.version.hip is not None and not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1201"):
         return None, "requires an AMD RDNA4 GPU (gfx1201) with ROCm"
-    if torch.version.hip is None and torch.cuda.get_device_capability() < (8, 0):
-        return None, "requires an NVIDIA GPU with compute capability 8.0 or newer"
+    # Turing (7.5) runs builds that include sm_75 code; on older builds the selftest below fails (no kernel image) and Auto moves on
+    if torch.version.hip is None and torch.cuda.get_device_capability() < (7, 5):
+        return None, "requires an NVIDIA GPU with compute capability 7.5 or newer"
     try:
         module = importlib.import_module("wgpkernels.int8")
         if module._lib is None:
@@ -361,17 +362,18 @@ def _wide_convrot_linear(input, weight, bias=None):
     return out.reshape(*input.shape[:-1], weight.shape[0])
 
 
-def can_fuse_linear(module, x, dtypes=(torch.bfloat16,)):
+def can_fuse_linear(module, x, dtypes=(torch.bfloat16,), act=None):
     """Keep qtype/backend details out of model code; MMGP still owns module calls.
-    Callers widen `dtypes` only for activation dtypes validated with their model.
+    Callers widen `dtypes` only for activation dtypes validated with their model; act is the input operation they want fused
+    ('rms_norm', 'swiglu', or 'gelu', which only WGPKernels provide).
     WGPKernels fuse with the precision of their unfused linears (full precision or per-block activations, input operations in FP32,
     one rounding), whatever the kernel precision setting; Comfy Kitchen's rowwise fusions need the fast (approximate) setting."""
     if (torch.compiler.is_compiling() or not torch.is_inference_mode_enabled() or triton._is_fake_tensor(x) or not x.is_cuda
             or x.dtype not in dtypes or (getattr(module, '_mm_lora_old_forward', None) and getattr(module, '_mm_lora_data', None) != {})):
         return False
     if _backend == "wgpkernels":
-        return getattr(module, '_convrot_group_size', 0) in (16, 64, 256) and module.in_features % 16 == 0
-    return (kernel_policy.allow_approximate() and kitchen_enabled() and _sm120_cutlass
+        return act in _wgp.ACTS and getattr(module, '_convrot_group_size', 0) in (16, 64, 256) and module.in_features % 16 == 0
+    return (act != "gelu" and kernel_policy.allow_approximate() and kitchen_enabled() and _sm120_cutlass
             and getattr(module, '_convrot_group_size', 0) == 256
             and 256 <= module.in_features <= 16384 and module.in_features % 256 == 0
             and module.out_features % 8 == 0

@@ -19,17 +19,13 @@ class MossTTSPipeline:
     sample_rate = 24000
     frame_length = 1920
 
-    def __init__(self, transformer_path, codec_path, tokenizer_path, engine, local=False):
-        self.engine = engine
+    def __init__(self, transformer_path, codec_path, tokenizer_path, features, local=False):
+        self.features = features  # the LM decoder optimizations (LMFeatures)
         self.local = local
         self.channels = 2 if local else 1
         self.sample_rate = 48000 if local else 24000
         self.frame_length = 3840 if local else 1920
-        if engine == "vllm":
-            from shared.llm_engines.nanovllm.vllm_support import probe_vllm_runtime
-            if not probe_vllm_runtime()["supported"]:
-                raise RuntimeError("MOSS-TTS vLLM mode requires the shared FlashAttention 2 and Triton runtime")
-        self.transformer = load_transformer(transformer_path, engine, local=local)
+        self.transformer = load_transformer(transformer_path, features, local=local)
         self.vae = load_codec(codec_path, local=local)
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
         self._interrupt = self._early_stop = False
@@ -37,7 +33,7 @@ class MossTTSPipeline:
         self.vae.get_VAE_tile_size = self.get_vae_tile_size
         self.reference_cache = TextEncoderCache()
         self.last_codes = self.last_finish_reason = None
-        tqdm.write(f"[MOSS-TTS] {'Local v1.5 4B' if local else 'v1.5 8B'} - {engine}")
+        tqdm.write(f"[MOSS-TTS] {'Local v1.5 4B' if local else 'v1.5 8B'}")
 
     @staticmethod
     def get_vae_tile_size(vae_config, device_mem_capacity, mixed_precision):
@@ -130,7 +126,7 @@ class MossTTSPipeline:
         if callback is not None:
             callback(step_idx=-1, override_num_inference_steps=max_frames, progress_title="Generating Audio Tokens", progress_unit="frames")
         updated, started, completed_frames = 0.0, time.perf_counter(), 0
-        with tqdm(total=max_frames, desc="Generating Audio Tokens", unit="frame", mininterval=1/3) as bar, cuda_graphs.scope(enabled=self.engine != "legacy"):
+        with tqdm(total=max_frames, desc="Generating Audio Tokens", unit="frame", mininterval=1/3) as bar, cuda_graphs.scope(enabled=self.features.graphs):
             for step in range(max_steps):
                 self.check_abort()
                 if self._early_stop:

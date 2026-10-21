@@ -46,7 +46,7 @@ AB/ABD require all corresponding Speaker 1: through Speaker 2:/3: labels at line
 pause_seconds inserts silence between speaker changes (default 0.2; 0 disables it); pauses count toward duration_seconds and are deducted from the speech target. No leading/trailing pause is inserted.
 alt_prompt is a spoken-language name (e.g. English, French, Chinese), not voice styling. model_mode=0 makes duration_seconds a maximum;
 model_mode=1 also requests that target duration through upstream token-duration conditioning. Natural termination can precede the maximum.
-No VoiceGenerator voice-design or native TTSD joint dialogue generation. lm_decoder_engine uses legacy/cg/vllm; vllm requires FlashAttention2 and Triton.
+No VoiceGenerator voice-design or native TTSD joint dialogue generation.
 The Deepy speech template uses gen_speech_from_sample. Plain text-to-speech is available through normal generation with audio_prompt_type='';
 gen_speech_from_description is not supported because its voice_description input is not a spoken-language name.
 """

@@ -36,9 +36,9 @@ class FishAudioPipeline:
     sample_rate = 44100
     frame_length = 2048
 
-    def __init__(self, backbone_path, codebooks_path, codec_path, tokenizer_path, silence_probe_path, lm_decoder_engine="legacy"):
-        self.engine = lm_decoder_engine
-        self.config, self.transformer, self.transformer2 = load_transformers(backbone_path, codebooks_path, self.engine)
+    def __init__(self, backbone_path, codebooks_path, codec_path, tokenizer_path, silence_probe_path, features):
+        self.features = features  # the LM decoder optimizations (LMFeatures)
+        self.config, self.transformer, self.transformer2 = load_transformers(backbone_path, codebooks_path, features)
         self.vae = load_codec(codec_path)
         self.silence_tables, self.silence_offsets, self.silence_limits, self.silence_probe = self._silence_classifier(silence_probe_path)
         self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
@@ -50,7 +50,7 @@ class FishAudioPipeline:
         # What a voice reference gives, by file (path, size, modification time): its encoded audio codes, and the Whisper transcript
         # of a reference given without one.
         self.reference_cache = TextEncoderCache()
-        print(f"[Fish Audio] Drama 3 - {self.engine}; Individual CPU/GPU Experts Managed by MMGP")
+        print("[Fish Audio] Drama 3: Individual CPU/GPU Experts Managed by MMGP")
 
     def _silence_classifier(self, path):
         """The first layer of the silent-frame classifier as tables per codebook entry: the codec latent of a frame is the sum of its codes'
@@ -171,8 +171,8 @@ class FishAudioPipeline:
         logits = backbone.compute_logits(hidden)
         produced, finish_reason = 0, "length"
         # Graph replays never reach MMGP's hooks: the GPU expert copies a preload allows (vllm computes them in the graphs) are placed
-        # before the decoding graph is captured, at the first step where the dense layers and the tower are all in VRAM.
-        placed = self.engine != "vllm"
+        # before the decoding graph is captured, at the first step where the dense layers and the tower are all in VRAM (Triton experts).
+        placed = not self.features.triton
         if callback is not None:
             callback(step_idx=offset - 1, override_num_inference_steps=total, denoising_extra="Generating Speech" + part, progress_unit="frames")
         updated = 0.0
@@ -182,7 +182,7 @@ class FishAudioPipeline:
         frame_done = torch.cuda.Event(blocking=True)
         status = torch.empty(frames.shape[1] + 1, dtype=torch.long, device="cpu", pin_memory=True)  # the sampled frame and its finiteness
         started = time.perf_counter()
-        with tqdm(total=max_frames, desc="Generating Speech" + part, unit="frame", mininterval=1 / 3) as progress, cuda_graphs.scope(enabled=self.engine != "legacy"):
+        with tqdm(total=max_frames, desc="Generating Speech" + part, unit="frame", mininterval=1 / 3) as progress, cuda_graphs.scope(enabled=self.features.graphs):
             for step in range(max_frames):
                 self._check_abort()
                 if self._early_stop:

@@ -9,7 +9,7 @@ from .codec import Codec, adapt_attention
 from .configuration_moss_audio_tokenizer import MossAudioTokenizerConfig
 
 
-def load_transformer(path, engine, local=False):
+def load_transformer(path, features, local=False):
     config = json.loads(Path(__file__).with_name("moss_tts_local_v1_5.json" if local else "moss_tts_v1_5.json").read_text())
     config["language_config"] = SimpleNamespace(**config["language_config"])
     if local:
@@ -19,9 +19,9 @@ def load_transformer(path, engine, local=False):
     with init_empty_weights(include_buffers=True):
         if local:
             from .local_transformer import MossLocalTTS
-            model = MossLocalTTS(config, engine)
+            model = MossLocalTTS(config, features)
         else:
-            model = MossTTS(config, engine)
+            model = MossTTS(config, features)
     offload.load_model_data(model, str(path), writable_tensors=False, default_dtype=torch.bfloat16,
                            **({"fused_split_map": model.split_map()} if local else {}))
     return model.eval()

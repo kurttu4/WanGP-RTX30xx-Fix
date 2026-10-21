@@ -461,17 +461,12 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
-        # FFN expansion factor for chunking (diffusers FeedForward default is 4x)
-        self.ffn_mult = 4
         self.zero_cond_t = zero_cond_t
 
-    def _apply_ffn_chunked(self, ffn_in: torch.Tensor, mlp: nn.Module) -> None:
-        _, seq_len, dim = ffn_in.shape
-        ffn_in_flat = ffn_in.reshape(-1, dim)
-        chunk_size = max(seq_len // self.ffn_mult, 1)
-        for ffn_chunk in torch.split(ffn_in_flat, chunk_size):
-            ffn_chunk[...] = mlp(ffn_chunk)
-        # ffn_in is already modified in-place via ffn_in_flat view
+    @staticmethod
+    def _apply_ffn_chunked(ffn_in: torch.Tensor, mlp: nn.Module) -> None:
+        """ffn_in <- mlp(ffn_in) in place through the shared chunked FFN (the gate, per token when indexed, is applied by the caller)."""
+        ops.mlp([ffn_in], mlp.net[0].proj, mlp.net[2], "gelu")
 
     def _modulate(self, x_list, mod_params, index=None):
         """Apply modulation to input tensor"""
@@ -556,7 +551,7 @@ class QwenImageTransformerBlock(nn.Module):
 
             txt_normed2 = ops.norm_scale_shift([encoder_hidden_states], self.txt_norm2, txt_scale2.unsqueeze(1), txt_shift2.unsqueeze(1))
             txt_gate2 = txt_gate2.unsqueeze(1)
-            txt_normed2 = self.txt_mlp(txt_normed2)
+            self._apply_ffn_chunked(txt_normed2, self.txt_mlp)
             output_list, txt_normed2 = [txt_normed2], None
             ops.gated_residual_(encoder_hidden_states, output_list, txt_gate2, fused=True)
         else:
@@ -597,7 +592,7 @@ class QwenImageTransformerBlock(nn.Module):
             txt_normed2 = self.txt_norm2(encoder_hidden_states)
             normed_list, txt_normed2 = [txt_normed2], None
             txt_modulated2, txt_gate2 = self._modulate(normed_list, txt_mod2)
-            txt_modulated2 = self.txt_mlp(txt_modulated2)
+            self._apply_ffn_chunked(txt_modulated2, self.txt_mlp)
             output_list, txt_modulated2 = [txt_modulated2], None
             ops.gated_residual_(encoder_hidden_states, output_list, txt_gate2, fused=True)
 

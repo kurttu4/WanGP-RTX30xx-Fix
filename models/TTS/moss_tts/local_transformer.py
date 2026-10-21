@@ -6,16 +6,16 @@ import torch
 from torch import nn
 from mmgp import runtime
 from shared import attention_kit
-from shared.llm_engines.nanovllm.layerwise import cached_attention
+from shared.llm_engines.lmgp.layerwise import cached_attention
 from shared.utils.lora_mapping import convert_lora_keys
 from .transformer import Backbone, GenerationCancelled
 
 
 class DepthAttention(nn.Module):
-    def __init__(self, cfg, engine):
+    def __init__(self, cfg, features):
         super().__init__()
         self.heads, self.width = cfg.n_head, cfg.n_embd // cfg.n_head
-        self.engine = engine
+        self.features = features
         self.q_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
         self.k_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
         self.v_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
@@ -31,7 +31,7 @@ class DepthAttention(nn.Module):
                 if value is not None:
                     attention_kit.rows_(value, rows)
         value = attention_kit.qkv_attention(x_list, self.q_proj, self.k_proj, self.v_proj, self.heads, self.width, rotate,
-            attention_fn=lambda qkv, group: cached_attention(qkv, group, cache, positions, 13, self.engine, triton_cache=True))
+            attention_fn=lambda qkv, group: cached_attention(qkv, group, cache, positions, 13, self.features, triton_cache=True))
         return self.c_proj(value.flatten(2))
 
 
@@ -46,10 +46,10 @@ class DepthMLP(nn.Module):
 
 
 class DepthBlock(nn.Module):
-    def __init__(self, cfg, engine):
+    def __init__(self, cfg, features):
         super().__init__()
         self.ln_1 = nn.LayerNorm(cfg.n_embd, eps=cfg.layer_norm_epsilon)
-        self.attn = DepthAttention(cfg, engine)
+        self.attn = DepthAttention(cfg, features)
         self.ln_2 = nn.LayerNorm(cfg.n_embd, eps=cfg.layer_norm_epsilon)
         self.mlp = DepthMLP(cfg)
 
@@ -59,9 +59,9 @@ class DepthBlock(nn.Module):
 
 
 class DepthTransformer(nn.Module):
-    def __init__(self, cfg, engine):
+    def __init__(self, cfg, features):
         super().__init__()
-        self.h = nn.ModuleList([DepthBlock(cfg, engine) for _ in range(cfg.n_layer)])
+        self.h = nn.ModuleList([DepthBlock(cfg, features) for _ in range(cfg.n_layer)])
         self.ln_f = nn.LayerNorm(cfg.n_embd, eps=cfg.layer_norm_epsilon)
 
 
@@ -69,12 +69,12 @@ class MossLocalTTS(nn.Module):
     _no_split_modules = ["DecoderLayer", "DepthBlock"]
     _offload_hooks = ["forward", "depth_step", "audio_embedding", "audio_head", "text_head"]
 
-    def __init__(self, config, engine):
+    def __init__(self, config, features):
         super().__init__()
-        self.config, self.engine = config, engine
+        self.config, self.features = config, features
         cfg = config.qwen3_config
-        self.transformer = Backbone(cfg, engine)
-        self.local_transformer = DepthTransformer(config.gpt2_config, engine)
+        self.transformer = Backbone(cfg, features)
+        self.local_transformer = DepthTransformer(config.gpt2_config, features)
         self.audio_embeddings = nn.ModuleList([nn.Embedding(size, cfg.hidden_size) for size in config.audio_codebook_sizes])
         self.audio_lm_heads = nn.ModuleList([nn.Linear(cfg.hidden_size, size, bias=False) for size in config.audio_codebook_sizes])
         self.local_text_lm_head = nn.Linear(cfg.hidden_size, 2, bias=False)

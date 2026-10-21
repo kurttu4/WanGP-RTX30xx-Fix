@@ -1165,6 +1165,14 @@ class MiniMaxH3Pipeline:
             payload.update(control_rows=control_rows, control_scale=float(context_scale[0]), control_anchor_frames=control_anchor_frames)
         control_rows = None
 
+        fasth3 = getattr(self.transformer, "fasth3_inference", None)
+        grid_max_t = 1.0
+        if fasth3 is not None:  # a FastH3 student runs its trained contract: its video shift, a PDD fine grid on [0, grid_max_t]
+            if starting_sigma is not None:
+                raise ValueError("MiniMax H3 FastH3 does not support partial-schedule refinement")
+            if not pdd or int(sampling_steps) != len(fasth3["pdd_step_indices"]) - 1 or sample_solver != "euler":
+                raise ValueError(f"MiniMax H3 FastH3 requires exactly {len(fasth3['pdd_step_indices']) - 1} PDD inference steps with the Euler sampler")
+            shift, grid_max_t = float(fasth3["video_scheduler_shift"]), float(fasth3.get("grid_max_t", 1.0))
         if starting_sigma is None:
             base_sigmas = torch.linspace(1.0, 0.0, int(sampling_steps) + 1, dtype=torch.float32, device=self.device)
         else:
@@ -1177,6 +1185,10 @@ class MiniMaxH3Pipeline:
         sigmas_audio = torch.unique_consecutive(3.0 * base_sigmas / (1.0 + 2.0 * base_sigmas))
         if sigmas_video.shape != sigmas_audio.shape:
             raise ValueError("The selected H3 flow shift collapses a different number of video and audio schedule points")
+        if grid_max_t != 1.0:  # the whole grid scaled to grid_max_t: the first noise level is grid_max_t, so is the initial noise
+            sigmas_video, sigmas_audio = sigmas_video * grid_max_t, sigmas_audio * grid_max_t
+            video.mul_(grid_max_t)
+            audio.mul_(grid_max_t)
         refinement_sigmas_video = None
         if source_latents is not None and starting_sigma is not None and preserve_input_mask_values:
             if editable_mask is None or editable_mask.shape[-2:] != (1, 1):
@@ -1208,9 +1220,9 @@ class MiniMaxH3Pipeline:
             audio_on_video_schedule = stage_solver in ("res_multistep", "ralston_2s")
             model_steps = stage_sigmas_video.numel() - 1
             if pdd:
-                stage_pdd_video_plans = pdd_sampling_plans_for_sigmas(stage_sigmas_video, shift, self.transformer.pdd_num_steps)
-                stage_pdd_audio_plans = (pdd_sampling_plans(3.0, self.transformer.pdd_num_steps, self.transformer.pdd_block_size)[-1:].expand(model_steps, -1)
-                                         if freeze_audio else pdd_sampling_plans_for_sigmas(stage_sigmas_audio, 3.0, self.transformer.pdd_num_steps))
+                stage_pdd_video_plans = pdd_sampling_plans_for_sigmas(stage_sigmas_video, shift, self.transformer.pdd_num_steps, grid_max_t)
+                stage_pdd_audio_plans = (pdd_sampling_plans(3.0, self.transformer.pdd_num_steps, self.transformer.pdd_block_size, grid_max_t)[-1:].expand(model_steps, -1)
+                                         if freeze_audio else pdd_sampling_plans_for_sigmas(stage_sigmas_audio, 3.0, self.transformer.pdd_num_steps, grid_max_t))
             else:
                 stage_pdd_video_plans = stage_pdd_audio_plans = None
             tau_denominator = max(1, model_steps - 1)
@@ -1550,8 +1562,8 @@ class MiniMaxH3Pipeline:
                 payload["target_video_condition_frames"] = 0
                 phase_extra = "Phase 2/2 Tiled"
                 model_steps = phase_2_sigmas_video.numel() - 1
-                phase_2_pdd_video_plans = pdd_sampling_plans_for_sigmas(phase_2_sigmas_video, shift, self.transformer.pdd_num_steps) if pdd else None
-                phase_2_pdd_audio_plan = pdd_sampling_plans(3.0, self.transformer.pdd_num_steps, self.transformer.pdd_block_size)[-1:] if pdd else None
+                phase_2_pdd_video_plans = pdd_sampling_plans_for_sigmas(phase_2_sigmas_video, shift, self.transformer.pdd_num_steps, grid_max_t) if pdd else None
+                phase_2_pdd_audio_plan = pdd_sampling_plans(3.0, self.transformer.pdd_num_steps, self.transformer.pdd_block_size, grid_max_t)[-1:] if pdd else None
                 progress_steps = model_steps * tile_count
                 denoising_start_step = 0 if starting_sigma is not None else int(round(model_steps * (1.0 - float(denoising_strength)), 4))
                 mask_end_step = min(model_steps, denoising_start_step + math.ceil(model_steps * float(masking_strength))) if phase_2_editable_mask is not None else 0

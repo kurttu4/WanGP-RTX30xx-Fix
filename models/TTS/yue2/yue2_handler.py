@@ -263,7 +263,7 @@ class family_handler:
             "guidance_max_phases": 1, "no_negative_prompt": True, "inference_steps": True,
             "temperature": True, "top_k_slider": True, "top_p_slider": True, "embedded_guidance": False,
             "image_prompt_types_allowed": "", "profiles_dir": [ARCHITECTURE], "compile": False,
-            "lm_engines": ["cg", "vllm"], "prompt_class": "Lyrics", "prompt_enhancer_button_label": "Enhance",
+            "lm_decoder": True, "prompt_class": "Lyrics", "prompt_enhancer_button_label": "Enhance",
             "text_encoder_URLs": [f"https://huggingface.co/{REPO_ID}/resolve/main/{TEXT_ENCODER_FOLDER}/YuE2_AR_{precision}.safetensors" for precision in ("bf16", "int8_convrot")],
             "text_encoder_folder": TEXT_ENCODER_FOLDER,
             "yue2_lora_instrumental": f"https://huggingface.co/{REPO_ID}/resolve/main/yue2/ar_lora_inst_v3abc.bf16.safetensors",
@@ -315,7 +315,7 @@ class family_handler:
         return files
 
     @staticmethod
-    def load_model(model_filename, model_type, base_model_type, model_def, dtype=None, VAE_dtype=None, save_quantized=False, profile=0, lm_decoder_engine="legacy", text_encoder_filename=None, **kwargs):
+    def load_model(model_filename, model_type, base_model_type, model_def, dtype=None, VAE_dtype=None, save_quantized=False, profile=0, lm_features=None, text_encoder_filename=None, **kwargs):
         from .pipeline import YuE2Pipeline
         paths = {name: fl.locate_file(os.path.join("yue2", name)) for name in ASSETS}
         if base_model_type == HUM_ARCHITECTURE:
@@ -325,9 +325,7 @@ class family_handler:
             acoustic_weights, = model_filename
             hum_weights = hum_encoder_weights = None
         tokenizer_path = fl.locate_file(os.path.join(TEXT_ENCODER_FOLDER, "qwen.tiktoken"))
-        pipeline = YuE2Pipeline(text_encoder_filename, acoustic_weights, tokenizer_path, paths["YuE2_VAE_bf16.safetensors"], paths["vae_config.json"], dtype, VAE_dtype, lm_decoder_engine, scoring_checkpoint=fl.locate_file(os.path.join("sheetsage2", SCORING_CHECKPOINT)), hum_weights=hum_weights, hum_encoder_weights=hum_encoder_weights)
-        if lm_decoder_engine in ("cg", "vllm"):
-            pipeline.text_encoder._budget = 0
+        pipeline = YuE2Pipeline(text_encoder_filename, acoustic_weights, tokenizer_path, paths["YuE2_VAE_bf16.safetensors"], paths["vae_config.json"], dtype, VAE_dtype, lm_features, scoring_checkpoint=fl.locate_file(os.path.join("sheetsage2", SCORING_CHECKPOINT)), hum_weights=hum_weights, hum_encoder_weights=hum_encoder_weights)
         if save_quantized:
             from wgp import save_quantized_model
             directory = Path(__file__).parent
@@ -335,7 +333,7 @@ class family_handler:
         pipe = {"text_encoder": pipeline.text_encoder, "transformer": pipeline.transformer, "vae": pipeline.vae}
         if pipeline.hum is not None:
             pipe.update(hum_projections=pipeline.hum, hum_encoder=pipeline.hum_encoder)
-        return pipeline, {"pipe": pipe, "loras": ["text_encoder"]}
+        return pipeline, {"pipe": pipe, "loras": ["text_encoder"], "cudaGraphs": ["text_encoder"] if lm_features.graphs else False}
 
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):

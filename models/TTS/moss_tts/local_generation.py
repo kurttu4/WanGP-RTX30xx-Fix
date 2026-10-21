@@ -52,7 +52,7 @@ def generate_local_codes(pipe, prompt, max_frames, temperature, top_k, top_p, ca
     pipe.last_finish_reason = "length"
     generated, updated = 0, 0.0
     started = time.perf_counter()
-    with tqdm(total=max_frames, desc="Generating Audio Tokens", unit="frame", mininterval=1/3) as bar, cuda_graphs.scope(enabled=pipe.engine != "legacy"):
+    with tqdm(total=max_frames, desc="Generating Audio Tokens", unit="frame", mininterval=1/3) as bar, cuda_graphs.scope(enabled=pipe.features.graphs):
         for frame in range(max_frames):
             pipe.check_abort()
             if pipe._early_stop:

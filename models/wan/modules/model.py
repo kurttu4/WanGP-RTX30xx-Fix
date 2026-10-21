@@ -12,6 +12,7 @@ from typing import Union,Optional
 from mmgp import offload
 from mmgp.offload import get_cache, clear_caches
 from shared import attention_kit
+from shared.kernels import ops as kernels
 from shared.attention import pay_attention
 from torch.backends.cuda import sdp_kernel
 from ..multitalk.multitalk_utils import get_attn_map_with_target
@@ -722,25 +723,8 @@ class WanAttentionBlock(nn.Module):
         y = restore_latent_shape(y)
         y = y.to(attention_dtype)
 
-        ffn = self.ffn[0]
-        gelu = self.ffn[1]
-        ffn2= self.ffn[2]
-
-        y_shape = y.shape
-        y = y.view(-1, y_shape[-1])
-        chunk_size = max(1, int(y.shape[0]/5.4)) # expanded chunks of about half the hidden states
-        chunks =torch.split(y, chunk_size)
-        for y_chunk  in chunks:
-            mlp_chunk = ffn(y_chunk)
-            for part in torch.split(mlp_chunk, max(1, (64 << 20) // (mlp_chunk.shape[-1] * mlp_chunk.element_size()))):
-                part.copy_(gelu(part)) # in place by rows: the same values without a second expanded chunk
-            y_chunk[...] = ffn2(mlp_chunk)
-            del mlp_chunk
-        y = y.view(y_shape)
-        y = y.to(dtype)
-        x, y = reshape_latent(x , latent_frames), reshape_latent(y , latent_frames)
-        x.addcmul_(y, e[5])
-        x, y = restore_latent_shape(x), restore_latent_shape(y)
+        y_list, y = [y], None  # the FFN by chunks, its output gated per latent frame into x
+        kernels.mlp(y_list, self.ffn[0], self.ffn[2], "gelu", residual=x, segments=kernels.gate_segments(e[5].reshape(1, latent_frames, -1), x.shape[0], x.shape[1]))
 
         if hints_processed is not None:
             for hint, scale in zip(hints_processed, context_scale):

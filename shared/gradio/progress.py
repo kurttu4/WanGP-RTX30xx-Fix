@@ -186,9 +186,14 @@ class WangpProgress:
                 title = f"Downloading files — {title}" if title else "Downloading files"
         if title.lower().startswith(("downloading ", "loading model")):
             title = title.removesuffix("...").removesuffix("…").rstrip()
+        if download is not None and active and (download.get("file_count") or 0) > 1:
+            suffix = title[len("Downloading"):]
+            if suffix.lower().startswith(" files"):
+                suffix = suffix[len(" files"):]
+            title = f'Downloading File {download["file_index"]}/{download["file_count"]}{suffix or "..."}'
         if aborting:
             title = f"Stopping… {title}"
-        filename = counter = amount = speed = ""
+        filename = amount = speed = ""
         timing = self.timing
         if download is not None and active:
             data = download
@@ -197,8 +202,6 @@ class WangpProgress:
             amount = _format_bytes(completed) + (f" / {_format_bytes(total)}" if total is not None else "")
             speed = f'{_format_bytes(data["speed"])}/s'
             filename = data["filename"] or ""
-            if data["file_count"] > 1:
-                counter = f'File {data["file_index"]}/{data["file_count"]}'
         elif position is not None and active:
             index, total, unit, ratio = position
             if index is not None:
@@ -235,8 +238,8 @@ class WangpProgress:
         percent = f"{percentage:.0f}%" if percentage is not None and not has_subtask_label else ""
         complete = percentage == 100 and (download is None or download.get("finished_at") is not None)
         tooltip = escape(title + ("\n" + text if text else ""))
-        details = escape(" · ".join(item for item in (amount, speed, counter, timing) if item))
-        metadata = ' · '.join(f'<span class="progress-{name}">{escape(value)}</span>' for name, value in (("amount", amount), ("counter", counter), ("speed", speed)) if value)
+        details = escape(" · ".join(item for item in (amount, speed, timing) if item))
+        metadata = ' · '.join(f'<span class="progress-{name}">{escape(value)}</span>' for name, value in (("amount", amount), ("speed", speed)) if value)
         model_words = " ".join(f"<span>{escape(word)}</span>" for word in model_name.split())
         model_html = f'<span class="progress-model" title="{escape(model_name)}">{model_words}</span>' if model_name else ""
         return f'''<div class="{classes}" data-complete="{str(complete).lower()}" style="--progress:{width}">

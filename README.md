@@ -64,6 +64,21 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 ## 🔥 Latest Updates : 
 
+## 21st of October 2026: WanGP v18.20 - No GPU Left Behind
+
+- **Profile 0 — More Speed with Less RAM (Experimental)**: a new, fully automated mode. WanGP gives fast Reserved RAM and spare VRAM to the model currently running, then makes those resources available to the next task. This makes switching between large models much friendlier to low-RAM PCs. Higher-end PCs may still get better results by choosing a profile manually.
+
+- **RTX 20XX Gets a Second Wind**: older RTX cards now benefit from new **WGPKernels 1.3.0** (please check *docs/INSTALLATION.md*) and faster local language-model processing. LTX-2.5 image and video VAE encoding, decoding, and upscaling are measured **4.8–6.8× faster**, turning jobs that were painfully slow into practical workflows.
+
+- **Faster Deepy, Prompt Enhancer, Speech and Music**: WanGP automatically selects the best acceleration supported by your GPU. When a language model is too large for VRAM, the CPU can work on the part left in RAM while the GPU handles the rest—often making responses about twice as fast. For instance, you can now run **Deepy Prime** with **Qwen 3.8 Bonsai** on an RTX 2080 Ti at **60 tokens/s**.
+
+- **MiniMax H3 FastH3 Omni**: on RTX 30XX or newer, this new H3 variant combines the quality of the **PDD** process with **VSA sparse attention**. Best of all, it is an **omni** model that should work well for both **FL2VA** and **Ref2VA** workflows, which is why you will find it in the Ref2VA section. There is also an **NVFP4** variant that should bring the RTX 5090 close to real-time generation.
+
+- **Fibo 2.0**: ranked as the **best open-source image generator**, it can also edit with up to **four references** or replace a masked area. **Edit Turbo** makes edits in only four steps. Prompts can be simple descriptions or structured captions, with extra help for rendering the intended text.
+
+- **Useful Extras and Fixes**: `--offline` prevents all downloads and clearly reports missing files. Linux DLSS Frame Generation x2 is easier to install, and several audio-model compatibility issues are fixed.
+
+
 ## 18h of October 2026: WanGP v18.19 - More Drama per Gigabyte
 
 - **Flux 3 Klein 5.6B**: text-to-image generation and editing with up to **10 reference images**. Choose the distilled model for **16-step generation**, or Base for **50 steps with guidance**. Both come in BF16, INT8 ConvRot and NVFP4. The new **Prompt Helper** lets you draw layout boxes, place elements from reference images, and mark objects for removal. Boxes guide the composition; they do not act as exact pixel masks.

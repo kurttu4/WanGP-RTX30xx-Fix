@@ -9,7 +9,7 @@ from mmgp import offload
 from tqdm import tqdm
 from transformers import Qwen3Config
 
-from shared.llm_engines.nanovllm.token_generation import TokenGenerationEngine
+from shared.llm_engines.lmgp.token_generation import TokenGenerationEngine
 from shared.utils.loras_mutipliers import update_loras_slists
 
 from .modules import YuE2Config
@@ -27,11 +27,11 @@ class YuE2Pipeline:
     sample_rate = 48000
     frame_rate = 25
 
-    def __init__(self, ar_weights, acoustic_weights, tokenizer_path, vae_weights, vae_config, dtype, vae_dtype, lm_decoder_engine, scoring_checkpoint=None, hum_weights=None, hum_encoder_weights=None):
+    def __init__(self, ar_weights, acoustic_weights, tokenizer_path, vae_weights, vae_config, dtype, vae_dtype, lm_features, scoring_checkpoint=None, hum_weights=None, hum_encoder_weights=None):
         directory = Path(__file__).parent
         self._interrupt = False
         self._early_stop = False
-        self.lm_decoder_engine = lm_decoder_engine
+        self.lm_features = lm_features
         self.scoring_checkpoint = scoring_checkpoint
         self.hum = None
         self.hum_encoder = None
@@ -55,19 +55,20 @@ class YuE2Pipeline:
         for model, filename, precision in ((self.text_encoder, ar_weights, dtype), (self.transformer, acoustic_weights, dtype), (self.vae, vae_weights, vae_dtype)):
             offload.load_model_data(model, filename, default_dtype=precision, writable_tensors=False)
             model.eval().requires_grad_(False)
-        self.text_encoder.configure_engine(lm_decoder_engine, self._abort_requested)
-        self.transformer.engine = lm_decoder_engine
+        self.text_encoder._mm_pinned_pool = True  # registered as text_encoder but decodes token by token: its blocks enter MMGP's pinned pool
+        self.text_encoder.configure_engine(lm_features, self._abort_requested)
+        self.transformer.flash = lm_features.flash
         self.transformer.abort_fn = self._abort_requested
         self.vae._model_dtype = vae_dtype
         self.vae._offload_hooks = ["decode", "decode_tiled"]
         self.vae.get_VAE_tile_size = self.get_vae_tile_size
         self._vae_abort_handles = [block.register_forward_hook(self._abort_after_block) for block in self.vae.decoder.layers]
         self.tokenizer = YuE2TextTokenizer(tokenizer_path)
-        self.engine = TokenGenerationEngine(self.text_encoder, ar_weights, self.tokenizer, enforce_eager=lm_decoder_engine == "legacy")
+        self.engine = TokenGenerationEngine(self.text_encoder, ar_weights, self.tokenizer, enforce_eager=not lm_features.graphs)
         self.lora_target = YuE2LoraTarget(self.text_encoder, self.transformer)
         self._ar_lora_signature = None
-        print(f"[YuE2] AR LM engine: {lm_decoder_engine} (CUDA graphs: {'off' if lm_decoder_engine == 'legacy' else 'on'}; Triton decoder kernels: {'on' if lm_decoder_engine == 'vllm' else 'off'}; attention: {'FlashAttention 2' if lm_decoder_engine == 'vllm' else 'PyTorch SDPA'}).")
-        print(f"[YuE2] Acoustic flow: PyTorch midpoint solver; attention: {'FlashAttention 2' if lm_decoder_engine == 'vllm' else 'PyTorch SDPA'}; CUDA graphs: off.")
+        print(f"[YuE2] AR LM: {lm_features.describe()}.")
+        print(f"[YuE2] Acoustic flow: PyTorch midpoint solver; attention: {'FlashAttention 2' if lm_features.flash else 'PyTorch SDPA'}; CUDA graphs: off.")
         self.generation_config = GenerationConfig()
         self.last_plan = None
         self.last_latents = None

@@ -14,6 +14,24 @@ from shared.gradio import metadata_events
 
 
 _EDITOR_PATH = Path(__file__).parent / 'wangp_image_editor/templates/component/index.js'
+# Gradio's upload control and the editor's bundled upload action must resolve
+# gallery previews identically. Fetch the original only when a drop occurs.
+_GALLERY_DROP_FILES = r'''async function wangpGalleryDropFiles(event) {
+    const files = Array.from(event.dataTransfer.files);
+    const media = event.dataTransfer.getData('application/x-wangp-gallery-media');
+    const source = media || event.dataTransfer.getData('text/uri-list').split(/\r?\n/).find(line => line && !line.startsWith('#'));
+    if (!source || !URL.canParse(source)) return files;
+    const url = new URL(source);
+    if (url.origin !== location.origin || !url.pathname.includes('/file=') || (!media && !url.searchParams.has('__wangp_gallery_preview'))) return files;
+    // Replace the browser's reduced-resolution image File entirely.
+    url.searchParams.delete('__wangp_gallery_preview');
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Could Not Load Original Gallery Media.');
+    const blob = await response.blob();
+    const name = decodeURIComponent(url.pathname.split('/file=')[1]).split(/[\\/]/).pop();
+    return [new File([blob], name, {type: blob.type})];
+}
+'''
 # Pixi's scheduler only serves wall-clock GC tasks in this bundle. Retain its
 # callbacks, offsets and repeat bookkeeping, but wake at their actual deadlines.
 # The separate pointer ticker must still run whenever hit testing unpauses it.
@@ -311,23 +329,7 @@ _PATCHES = {
         ('d(t){t&&b(e),i=!1', 'd(t){window.WanGPImageZoom.destroy(e);t&&b(e),i=!1'),
     ],
     'Upload-B_zkKtR-.js': [
-        ('function it(){', r'''async function wangpGalleryDropFiles(event) {
-            const files = Array.from(event.dataTransfer.files);
-            const media = event.dataTransfer.getData('application/x-wangp-gallery-media');
-            const source = media || event.dataTransfer.getData('text/uri-list').split(/\r?\n/).find(line => line && !line.startsWith('#'));
-            if (!source || !URL.canParse(source)) return files;
-            const url = new URL(source);
-            if (url.origin !== location.origin || !url.pathname.includes('/file=') || (!media && !url.searchParams.has('__wangp_gallery_preview'))) return files;
-            // Keep previews lightweight. Read the original only after a drop,
-            // replacing the browser's reduced-resolution image File entirely.
-            url.searchParams.delete('__wangp_gallery_preview');
-            const response = await fetch(url);
-            if (!response.ok) throw new Error('Could Not Load Original Gallery Media.');
-            const blob = await response.blob();
-            const name = decodeURIComponent(url.pathname.split('/file=')[1]).split(/[\\/]/).pop();
-            return [new File([blob], name, {type: blob.type})];
-        }
-        function it(){'''),
+        ('function it(){', _GALLERY_DROP_FILES + 'function it(){'),
         ('function s(f){if(f.preventDefault(),f.stopPropagation(),e.on_drag_change?.(!1),!f.dataTransfer?.files)return;const c=Array.from(f.dataTransfer.files);c.length>0&&e.on_files?.(c)}',
          'async function s(f){if(f.preventDefault(),f.stopPropagation(),e.on_drag_change?.(!1),!f.dataTransfer?.files)return;try{const c=await wangpGalleryDropFiles(f);c.length>0&&e.on_files?.(c)}catch(error){e.on_error?.(error.message)}}'),
         ('on_files:t[31],accepted_types:', 'on_files:t[31],on_error:t[32],accepted_types:'),
@@ -414,6 +416,20 @@ _PATCHES = {
         ('_t(()=>{document.addEventListener("fullscreenchange",()=>{l(17,j=!!document.fullscreenElement)})})', '_t(()=>{const changed=()=>l(17,j=document.fullscreenElement===V);document.addEventListener("fullscreenchange",changed);return()=>document.removeEventListener("fullscreenchange",changed)})'),
     ],
     'index.js': [
+        ('function yq() {', _GALLERY_DROP_FILES + 'function yq() {'),
+        ('''function l(f) {
+        if (f.preventDefault(), f.stopPropagation(), e.on_drag_change?.(!1), !f.dataTransfer?.files) return;
+        const m = Array.from(f.dataTransfer.files);
+        m.length > 0 && e.on_files?.(m);
+      }''', '''async function l(f) {
+        if (f.preventDefault(), f.stopPropagation(), e.on_drag_change?.(!1), !f.dataTransfer?.files) return;
+        try {
+          const m = await wangpGalleryDropFiles(f);
+          if (m.length > 0) await e.on_files?.(m);
+        } catch (error) { e.on_error?.(error.message); }
+      }'''),
+        ('r[33]\n        ),\n        accepted_types:', 'r[33]\n        ),\n        on_error: message => r[32]("download_error", message),\n        accepted_types:'),
+        ('E[33]\n        ),\n        accepted_types:', 'E[33]\n        ),\n        on_error: message => E[32]("download_error", message),\n        accepted_types:'),
         ('jC.SchedulerSystem = XC;', _EDITOR_SCHEDULER + 'jC.SchedulerSystem = XC;'),
         ('this._pauseUpdate = e;', 'this._pauseUpdate = e; e ? this.removeTickerListener() : this.addTickerListener();'),
         ('this._tickerAdded || !this.domElement ||', 'this._pauseUpdate || this._tickerAdded || !this.domElement ||'),

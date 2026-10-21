@@ -133,11 +133,11 @@ class Qwen3TTSPipeline:
         *,
         ckpt_root: Optional[Path] = None,
         device: Optional[torch.device] = None,
-        lm_decoder_engine: Optional[str] = None,
+        cuda_graphs: bool = False,
     ) -> None:
         self.device = device or torch.device("cpu")
         self.base_model_type = base_model_type
-        self.lm_decoder_engine = str(lm_decoder_engine or "legacy").strip().lower()
+        self.cuda_graphs = bool(cuda_graphs)
         self.ckpt_root = Path(ckpt_root) if ckpt_root is not None else Path(fl.get_download_location())
         self._interrupt = False
         self._early_stop = False
@@ -149,7 +149,7 @@ class Qwen3TTSPipeline:
         self.processor = self._load_text_processor(assets)
 
         self.model.load_speech_tokenizer(self.speech_tokenizer)
-        self.model.set_lm_decoder_engine(self.lm_decoder_engine)
+        self.model.set_cuda_graphs(self.cuda_graphs)
         self.tts = Qwen3TTSModel(
             model=self.model,
             processor=self.processor,
@@ -163,8 +163,7 @@ class Qwen3TTSPipeline:
 
         self.supported_speakers = sorted(self.tts.get_supported_speakers() or [])
         self.supported_languages = sorted(self.tts.get_supported_languages() or [])
-        engine = "cg" if self.lm_decoder_engine == "cg" else "legacy"
-        print(f"[Qwen3TTS] LM Engine='{engine}'")
+        print(f"[Qwen3TTS] CUDA graphs: {'on' if self.cuda_graphs else 'off'}")
 
     def _abort_requested(self) -> bool:
         return bool(self._interrupt)
@@ -462,7 +461,7 @@ class Qwen3TTSPipeline:
             raise
         speaker_prompts = dict(enumerate(prompt_items))
 
-        keep_shared_graph = self.lm_decoder_engine == "cg"
+        keep_shared_graph = self.cuda_graphs
         shared_gen_kwargs = {}
         if keep_shared_graph:
             max_prompt_tokens = self._estimate_two_speaker_prompt_tokens(
@@ -876,7 +875,7 @@ class Qwen3TTSPipeline:
                     if max_total_samples is not None and elapsed_samples >= max_total_samples:
                         break
             finally:
-                if self.base_model_type == "qwen3_tts_base" and self.lm_decoder_engine == "cg":
+                if self.base_model_type == "qwen3_tts_base" and self.cuda_graphs:
                     self.model.release_decode_cuda_graph()
 
             if len(audio_segments) == 0:

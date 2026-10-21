@@ -111,13 +111,8 @@ class Block(nn.Module):
 
             attn = attention_kit.qkv_attention([x_mod], self.q_proj, self.k_proj, self.v_proj, self.heads, self.head_dim, normalize).flatten(2)[0]
             for start, end, (shift, scale, gate) in spans:
-                for first in range(start, end, chunk_size):
-                    last = min(first + chunk_size, end)
-                    activated = kernels.swiglu([self.mlp_in(x_mod[first:last])])
-                    result = self.attn_out(attn[first:last]) + self.mlp_out(activated)
-                    del activated
-                    result_list, result = [result], None
-                    kernels.gated_residual_(x[first:last], result_list, gate)
+                kernels.gated_residual_(x[start:end], [self.attn_out(attn[start:end])], gate)
+                kernels.mlp([x_mod[start:end]], self.mlp_in, self.mlp_out, "swiglu", residual=x[start:end], gate=gate)
             streams[branch] = x
         return streams
 

@@ -39,6 +39,10 @@ ATTENTION_MODE_AVAILABILITY = {
         "installed": triton_installed,
         "supported": triton_installed and major >= 8 and not torch.version.hip,
     },
+    "vsa": {
+        "installed": triton_installed,
+        "supported": triton_installed and major >= 8 and not torch.version.hip,
+    },
 }
 
 
@@ -372,6 +376,15 @@ def attention_config_shared_state(attention_mode=None, resolver=resolve_attentio
         else:
             offload.shared_state["_attention"] = previous
 
+def _sparge_core():
+    """shared.spas_sage_attn_core when the SpargeAttn package and its kernels import, else None."""
+    try:
+        from shared import spas_sage_attn_core
+    except Exception:
+        return None
+    return spas_sage_attn_core
+
+
 def sage_staged(device, head_dim, force_attention=None, masked=False):
     """(core, settings) of the staged_* functions (q, k and v quantized as soon as each is computed) of the SageAttention that
     pay_attention would run without sequence lengths on this device (with this force_attention, and a mask when masked):
@@ -382,6 +395,10 @@ def sage_staged(device, head_dim, force_attention=None, masked=False):
     if attn == "veda":
         attn = offload.shared_state.get("_attention_fallback") or get_default_attention_mode()
     attn = get_default_attention_mode() if attn in ("sol", "vdn") else attn
+    if attn == "sparge":  # FlashVSR's SpargeAttn block-sparse kernels over a per-group block map (shared.spas_sage_attn_core)
+        core = _sparge_core() if masked else None
+        settings = core.staged_settings(device, head_dim) if core is not None else None
+        return None if settings is None else (core, settings)
     if attn == "sage":
         return None if masked or sage1_core is None or head_dim not in sage1_core.head_dims(device) else (sage1_core, sage1_core.SCALED_V_SETTINGS if scale_v else sage1_core.SETTINGS)
     if attn not in ("sage2", "radial") or sageattn2 is None or masked and sageattn_attention_mask_support_reason(device=device) is not None:
@@ -440,7 +457,7 @@ def pay_attention(
         raise ValueError("pay_attention received both attention_mask and causal=True; build a combined mask once and pass causal=False.")
     if attention_mask != None:
         requested_attn = offload.shared_state["_attention"] if force_attention == None else force_attention
-        if requested_attn == "veda":
+        if requested_attn in ("veda", "vsa"):
             requested_attn = offload.shared_state.get("_attention_fallback") or get_default_attention_mode()
         requested_attn = get_default_attention_mode() if requested_attn in ("sol", "vdn") else requested_attn
         requested_attn = "sage2" if requested_attn == "radial" else requested_attn
@@ -460,7 +477,7 @@ def pay_attention(
         if  attention_mask.dtype == torch.bfloat16 and not bfloat16_supported:
             attention_mask = attention_mask.to(torch.float16)
     attn = offload.shared_state["_attention"] if force_attention== None else force_attention
-    if attn == "veda":
+    if attn in ("veda", "vsa"):
         attn = offload.shared_state.get("_attention_fallback") or get_default_attention_mode()
     attn = get_default_attention_mode() if attn in ("sol", "vdn") else attn
 

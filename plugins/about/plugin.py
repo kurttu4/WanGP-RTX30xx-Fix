@@ -18,6 +18,7 @@ class AboutPlugin(WAN2GPPlugin):
     def create_about_ui(self):
         gr.Markdown("<H2>WanGP - AI Generative Models for the GPU Poor by <B>DeepBeepMeep</B> (<A HREF='https://github.com/deepbeepmeep/Wan2GP'>GitHub</A>)</H2>")
         gr.Markdown("Many thanks to:")
+        gr.Markdown("- <B>Bria AI</B> for Fibo 2.0 Dev\\* image generation and editing, and Fibo 2.0 Edit Turbo\\* four-step editing (https://huggingface.co/briaai/Fibo-2.0-dev, https://huggingface.co/briaai/Fibo-2.0-edit-turbo)")
         gr.Markdown("- <B>Alibaba Wan Team</B> for the best open source video generators (https://github.com/Wan-Video/Wan2.1, https://github.com/Wan-Video/Wan2.2)")
         gr.Markdown("- <B>Alibaba Vace, Multitalk and Fun Teams</B> for their incredible control net models (https://github.com/ali-vilab/VACE), (https://github.com/MeiGen-AI/MultiTalk) and  (https://huggingface.co/alibaba-pai/Wan2.2-Fun-A14B-InP) ")
         gr.Markdown("- <B>Tencent</B> for the impressive Hunyuan Video\\* models (https://github.com/Tencent-Hunyuan/HunyuanVideo, https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5)")

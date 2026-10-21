@@ -41,7 +41,7 @@ class family_handler:
             "no_negative_prompt": True, "inference_steps": False, "guidance_max_phases": 0,
             "temperature": True, "temperature_slider": {"end": 2.0}, "top_k_slider": True, "top_p_slider": True,
             "compile": False, "cuda_graphs": True, "supports_early_stop": True,
-            "profiles_dir": [base_model_type], "lm_engines": ["legacy", "cg", "vllm"], "lm_engine_supports_offload": True,
+            "profiles_dir": [base_model_type], "lm_decoder": True,
             "image_prompt_types_allowed": "", "any_audio_prompt": True, "audio_prompt_choices": True,
             "audio_prompt_type_sources": {"selection": ["", "A", "AB", "ABD"], "default": "", "letters_filter": "ABD", "labels": {"": "New Voice", "A": "Voice Reference", "AB": "Voice References for Speakers 1 and 2", "ABD": "Voice References for Speakers 1, 2 and 3"}},
             "audio_guide_label": "Speaker 1 Voice Reference", "audio_guide2_label": "Speaker 2 Voice Reference", "audio_guide3_label": "Speaker 3 Voice Reference",
@@ -60,18 +60,18 @@ class family_handler:
         return [{"repoId": "DeepBeepMeep/TTS", "sourceFolderList": ["moss_tts_local" if local else "moss_tts"], "fileList": [[LOCAL_CODEC if local else CODEC, *TOKENIZER_FILES]]}]
 
     @staticmethod
-    def load_model(model_filename, model_type, base_model_type, model_def, save_quantized=False, lm_decoder_engine="legacy", **kwargs):
+    def load_model(model_filename, model_type, base_model_type, model_def, save_quantized=False, lm_features=None, **kwargs):
         from .pipeline import MossTTSPipeline
         model_filename, = model_filename
         local = base_model_type == LOCAL_ARCHITECTURE
         codec, folder = (LOCAL_CODEC, "moss_tts_local") if local else (CODEC, "moss_tts")
         files = {name: fl.locate_file(str(Path(folder) / name)) for name in (codec, *TOKENIZER_FILES)}
-        pipeline = MossTTSPipeline(model_filename, files[codec], str(Path(files["tokenizer.json"]).parent), lm_decoder_engine, local=local)
+        pipeline = MossTTSPipeline(model_filename, files[codec], str(Path(files["tokenizer.json"]).parent), lm_features, local=local)
         if save_quantized:
             from wgp import save_quantized_model
             save_quantized_model(pipeline.transformer, model_type, model_filename, torch.bfloat16,
                                  str(Path(__file__).with_name(base_model_type + ".json")), convrot_prefixes=("",))
-        return pipeline, {"pipe": {"transformer": pipeline.transformer, "vae": pipeline.vae}, "cudaGraphs": lm_decoder_engine != "legacy"}
+        return pipeline, {"pipe": {"transformer": pipeline.transformer, "vae": pipeline.vae}, "cudaGraphs": lm_features.graphs}
 
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):

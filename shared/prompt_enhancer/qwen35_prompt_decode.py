@@ -4,7 +4,7 @@ from time import perf_counter
 
 from tqdm import tqdm
 
-from shared.llm_engines.nanovllm.engine.block_manager import BlockManager
+from shared.llm_engines.lmgp.engine.block_manager import BlockManager
 from shared.prompt_enhancer.streaming import ThrottledStreamEmitter
 from shared.utils.cancellation import check_cancelled
 

@@ -529,6 +529,12 @@ def get_file_metadata(file_path):
     return OrderedDict(result[0]), dict(result[1])
 
 
+def cpu_compute_supported(tensor):
+    """Whether linears with this weight compute on the CPU in its storage when MMGP leaves their block there (cpuCompute)."""
+    from shared.kernels import cpu_linear
+    return isinstance(tensor, GGUFWeightTensor) and cpu_linear.supported(tensor)
+
+
 def _filter_state_dict_basic(state_dict, base_model_prefix, keep_prefix=False):
     new_state_dict = {}
     start = -1
@@ -896,6 +902,7 @@ def _row_loop_selected(module, raw, qtype_name, shape, x, bias, target_dtype, st
 
 
 def _llamacpp_cuda_linear(module, raw, qtype_name, shape, input_tensor, bias, target_dtype):
+    input_tensor = input_tensor.contiguous()
     out_features, in_features = shape
     rows = input_tensor.numel() // in_features
     step = max(128, _LLAMACPP_SLICE_BYTES // (4 * out_features + in_features * 9 // 8) // 128 * 128)
@@ -1531,6 +1538,9 @@ class GGUFWeightTensor(QTensor):
         else:
             target_dtype = _resolve_default_dtype(self._gguf_default_dtype, fallback=self.dtype)
             target_device = self.device
+        if self._data.device.type == "cpu" and getattr(self, "_mm_cpu_compute", False):  # a block that MMGP leaves on the CPU (cpuCompute)
+            from shared.kernels import cpu_linear
+            return cpu_linear.linear(self, input, bias, target_dtype)
         if self._tensor_type == PrismQuantizationType.PTQ1_0 and target_device.type == "cuda":
             from .prism import ptq_linear
             return ptq_linear(input, self._data, list(self._tensor_shape), bias, target_dtype)
@@ -1811,7 +1821,7 @@ class QLinearGGUF(QModuleMixin, torch.nn.Linear):
         # Decode and short speculative batches (up to 8 rows): typed outputs and
         # fused SiLU-multiply avoid separate conversion and activation kernels
         # (bit-identical results). Prefill keeps the established kernels.
-        if optimized and input.numel() <= 8 * input.shape[-1] and input.is_cuda and torch.version.hip is None and isinstance(qweight, GGUFWeightTensor):
+        if optimized and input.numel() <= 8 * input.shape[-1] and input.is_cuda and torch.version.hip is None and isinstance(qweight, GGUFWeightTensor) and qweight._data.is_cuda:
             native = _gguf_cuda_module()
             supports = getattr(native, "supports_linear_fusions", None)
             if (callable(supports) and qweight.shape[1] % _quantization_sizes(qweight._tensor_type)[0] == 0
@@ -1819,7 +1829,7 @@ class QLinearGGUF(QModuleMixin, torch.nn.Linear):
                 dtype = _resolve_default_dtype(qweight._gguf_default_dtype, fallback=input.dtype)
                 return linear_fused(input, qweight._data, qweight._tensor_type.name, list(qweight._tensor_shape), self.bias, dtype, silu_mul)
         if silu_mul:
-            from shared.llm_engines.nanovllm.layers.activation import silu_mul as apply_silu_mul
+            from shared.llm_engines.lmgp.layers.activation import silu_mul as apply_silu_mul
             input = apply_silu_mul(input, use_triton=optimized)
         if isinstance(qweight, GGUFWeightTensor):
             return qweight.linear(input, bias=self.bias)
@@ -2129,6 +2139,13 @@ class QEmbedding(BaseQEmbedding):
                 self.scale_grad_by_freq,
                 self.sparse,
             )
+            return self._apply_embed_scale(output)
+        if (isinstance(qweight, QTensor) and getattr(qweight, "_data", None) is not None and qweight._data.dim() == 2
+                and tuple(qweight._scale.shape) == (qweight._data.shape[0], 1) and self.max_norm is None):
+            # Quanto per-row table: dequantize the looked-up rows only, as its dequantization does (scale * data), not the whole table
+            # (a 248K-token INT8 vocabulary is 2 GB in BF16 per call)
+            data = qweight._data[input]
+            output = qweight._scale[input] * (data.to(qweight._scale.dtype) if qweight.qtype.is_floating_point else data)
             return self._apply_embed_scale(output)
         return super().forward(input)
 
