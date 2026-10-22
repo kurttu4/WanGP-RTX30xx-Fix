@@ -26,6 +26,10 @@ from mmgp import cuda_graphs
 
 from .sageattention_patch import patch_sageattention
 from .sage1_core import fp16_v, scale_output
+try:  # the fused norm + RoPE + quantization kernels (fused_qk_layouts)
+    from shared.kernels import qk_quant_triton as _qk_layouts
+except (ImportError, OSError, RuntimeError):
+    _qk_layouts = None
 
 patch_sageattention()
 
@@ -397,6 +401,20 @@ def staged_settings(device, masked=False, scale_v=False, head_dim=128):
     else:
         return _fp8_pv_settings(arch) if SM89_ENABLED and arch in ("sm89", "sm120") else None
     return {**settings, "scale_v": True} if scale_v else settings
+
+
+def fused_qk_layouts(settings, head_dim):
+    """Row layouts of these settings' staged q / k quantization for shared.kernels.qk_quant_triton (the norm and RoPE of q and k fused
+    with their quantization): {"q": (layout, block, sm_scale, scale_eps), "k": (...)} as staged_quantize_q / staged_quantize_k
+    quantize; None where the fused kernels do not reproduce the core's quantizers (the per-warp CUDA kernels of sm120 round
+    differently by one LSB in places and are not validated there)."""
+    if _qk_layouts is None:
+        return None
+    if settings["qk_quant_gran"] == "per_thread":
+        return {"q": (_qk_layouts.LAYOUT_THREAD_Q, 32, 1.0, 1e-7), "k": (_qk_layouts.LAYOUT_THREAD_K, 64, 1.0, 1e-7)}
+    if settings["qk_quant_gran"] == "per_block":
+        return {"q": (_qk_layouts.LAYOUT_PER_BLOCK, settings["block_m"], 1.0 / head_dim ** 0.5 * 1.44269504, 0.0), "k": (_qk_layouts.LAYOUT_PER_BLOCK, 64, 1.0, 0.0)}
+    return None
 
 
 def _quant_per_block(x, x_int8, block, sm_scale):

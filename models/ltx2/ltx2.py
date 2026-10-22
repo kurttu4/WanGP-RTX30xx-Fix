@@ -15,7 +15,6 @@ from safetensors.torch import load_file
 from shared.utils import files_locator as fl
 from shared.utils.phase_progress import generation_progress
 from shared.cuda_memory import mmgp_vram_allocator
-from shared.kernels import scaled_fp16
 from shared.utils.hdr import VIDEO_PROMPT_HDR_OUTPUT_FLAG, hdr_linear_to_vae_range, sdr_to_vae_range
 
 from .ltx_core.conditioning import AudioConditionByLatent, AudioConditionByLatentPrefix, AudioConditionByReferenceLatent
@@ -1016,7 +1015,6 @@ class LTX2:
             video_vae = _VAEContainer(video_encoder, video_decoder)
         vae_postprocess = _make_diffusion_vae_postprocess("vae.") if diffusion_vae else _make_vae_postprocess("vae.")
         video_vae = _load_component(video_vae, video_vae_path, postprocess=vae_postprocess, ignore_unused_weights=True)
-        scaled_fp16.install(video_vae.encoder if diffusion_vae else video_vae, self.device)  # Turing: BF16 convolutions on FP16 tensor cores
         video_encoder = video_vae.encoder
         video_decoder = video_vae.decoder
 
@@ -1076,7 +1074,6 @@ class LTX2:
             with init_empty_weights():
                 spatial_upsampler = LatentUpsamplerConfigurator.from_config(upsampler_config)
             spatial_upsampler = _load_component(spatial_upsampler, spatial_upsampler_path, None)
-            scaled_fp16.install(spatial_upsampler, self.device)
 
         self.text_encoder = text_encoder
         self.text_embedding_projection = text_embedding_projection

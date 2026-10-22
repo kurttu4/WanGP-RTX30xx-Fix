@@ -480,6 +480,9 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
                 return int8_backend.wgp_linear(input, qweight, self.bias, group=self._convrot_group_size)
             if (int8_backend.kitchen_enabled() and self._convrot_group_size == 256
                     and input.is_cuda and input.dtype in (torch.bfloat16, torch.float16, torch.float32)):
+                # This direct kernel bypasses F.linear's autocast (LayerNorm can supply FP32 even in a BF16 encoder).
+                if torch.is_autocast_enabled("cuda"):
+                    input = input.to(torch.get_autocast_dtype("cuda"))
                 return int8_backend.kitchen_linear(input, qweight, self.bias, convrot=True)
             if (quanto_int8_inject.FUSED_CONVROT_ENABLED and quanto_int8_inject._PATCH_STATE.enabled
                     and self._convrot_group_size == 256

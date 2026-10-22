@@ -1703,6 +1703,7 @@ class ACEStep15Pipeline:
 
         return xt
 
+    @torch.inference_mode()
     def generate(
         self,
         input_prompt: str,

@@ -356,6 +356,7 @@ class family_handler:
                 "audio_prompt_choices": True,
                 "enabled_audio_lora": True,
                 "lm_decoder": True,
+                "cuda_graphs": ["transformer"],
                 "prompt_class": "Lyrics",
                 "prompt_infos": "Write the actual lyrics in `prompt`, not an instruction to write a song. Describe the desired sound in `alt_prompt`, for example: warm acoustic folk, fingerpicked guitar, soft female vocals, restrained percussion. For instrumental music, use `[Instrumental]` in `prompt` and describe the instruments in the caption.\n\n" + ACE_STEP_LYRICS_PROMPT_INFOS,
                 "alt_guidance": "LM Guidance (CFG)",

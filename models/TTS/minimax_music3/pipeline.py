@@ -171,12 +171,12 @@ class MiniMaxMusic3Pipeline:
             f"{_IM_START}{_CAPTION_START}{_clean_caption(caption)}{_CAPTION_END}"
             f"{_LYRICS_START}{_normalize_lyrics(lyrics)}{_LYRICS_END}{_IM_END}{_AUDIO_START}"
         )
-        input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"]
+        input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"].to(self.device)  # built on the CPU: device-explicit generate()
         if input_ids.shape[1] > _MAX_PROMPT_TOKENS:
             raise ValueError(f"The assembled MiniMax Music 3 prompt has {input_ids.shape[1]} tokens; the maximum is {_MAX_PROMPT_TOKENS}")
         unconditional_ids = input_ids.clone()
         unconditional_ids[:, 1:-2] = _AUDIO_CFG_TOKEN_ID
-        return torch.cat((input_ids, unconditional_ids), dim=0).to(self.device)
+        return torch.cat((input_ids, unconditional_ids), dim=0)
 
     def _embed_audio_frame(self, frame_codes: torch.Tensor) -> torch.Tensor:
         num_codebooks = self.rvq_depth_decoder.config.num_codebooks

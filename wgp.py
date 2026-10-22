@@ -189,7 +189,7 @@ AUTOSAVE_ERROR_FILENAME = "error_queue.zip"
 AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
-WanGP_version = "18.20"
+WanGP_version = "18.21"
 VIDEO_LENGTH_ROUNDING = "ceil"  # how a requested video length is fitted to the model's frame steps: "floor", "ceil" (never shorter than requested) or "nearest"
 set_video_length_rounding(VIDEO_LENGTH_ROUNDING)
 settings_version = 2.81
@@ -239,7 +239,7 @@ for handler in _HANDLER_MODULES:
     quant_router.register_handler(handler)
 from shared.qtypes import gguf as gguf_handler
 quant_router.register_file_extension("gguf", gguf_handler)
-from shared.kernels import fp8_backend, int8_backend, kernel_policy, rowmap_linear  # rowmap_linear: MMGP row views keep interleaved fused weights uncopied
+from shared.kernels import fp8_backend, int8_backend, kernel_policy, rowmap_linear, scaled_fp16  # rowmap_linear: MMGP row views keep interleaved fused weights uncopied
 from shared import attention_kit
 
 
@@ -4094,6 +4094,7 @@ def init_pipe(pipe, kwargs, profile, output_type="video", extension=None):
         kwargs["pinnedMemory"] = False
         kwargs["asyncTransfers"] = False
 
+    scaled_fp16.install_globally(processing_device)  # once per process: every BF16 convolution on the FP16 tensor cores where the route applies (Turing)
     return mmgp_profile
 
 reset_prompt_enhancer_requested = False
@@ -6315,6 +6316,7 @@ def edit_media(
             image_extension = get_image_format(server_config.get("image_output_codec", None), rgba=sample.shape[0] == 4)["ext"]
             image_path = get_available_filename(image_save_path, video_source, "_post", force_extension=image_extension)
             image_paths = []
+            set_saving_file_status(state, gen, send_cmd, image_path)
             for no, img in enumerate(sample.transpose(1,0)):
                 img_path = get_available_filename(image_save_path, image_path, "" if no == 0 else f"_{no}")
                 image_paths.append(save_image(img, save_file=img_path, quality=server_config.get("image_output_codec", None)))
@@ -6328,6 +6330,7 @@ def edit_media(
             clear_status(state)
             return
         video_path = get_available_filename(save_path, video_source, "_tmp", force_extension=video_extension) if any_soundtrack_processor or has_already_audio or has_subtitles else get_available_filename(save_path, video_source, "_post", force_extension=video_extension)
+        set_saving_file_status(state, gen, send_cmd, video_path)
         video_path = save_video( tensor=sample[None], save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type= server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"))
         saved_video_duration = sample.shape[1] / output_fps
         api_video_tensor = sample if api_return_video_uint8 else None
@@ -9525,6 +9528,14 @@ def clear_status(state):
     gen["window_no"] = 1
     gen["repeat_no"] = 0
     gen["total_generation"] = 0
+
+def set_saving_file_status(state, gen, send_cmd, file_path):
+    """The generic 'Saving File ...' status of a post-processed output, shown while it is encoded and written (the last upsampler or
+    processor phase would stay on screen otherwise)."""
+    file_name = os.path.basename(file_path)
+    phase_text = f"Saving File {file_name if len(file_name) <= 50 else file_name[:12] + '...' + file_name[-35:]}"
+    gen["progress_phase"] = (phase_text, -1)
+    send_cmd("progress", [0, get_latest_status(state, phase_text)])
 
 def get_latest_status(state, context=""):
     gen = get_gen_info(state)

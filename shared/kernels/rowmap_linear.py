@@ -16,7 +16,7 @@ _DTYPES = (torch.bfloat16, torch.float16)
 
 
 def _triton_usable(x, weight, head_dim):
-    return (_triton is not None and cuda_inference(x, dtypes=_DTYPES, sm120=False) and triton_dtype_supported(x.device, x.dtype)
+    return (_triton is not None and cuda_inference(x, dtypes=_DTYPES, hip=True)  # the GEMM runs on HIP too (Triton's own conversions)
             and weight.dtype == x.dtype and weight.is_cuda and weight.stride(1) == 1 and x.stride(1) == 1 and head_dim % 64 == 0)
 
 

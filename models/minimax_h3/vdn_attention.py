@@ -11,6 +11,7 @@ from mmgp import offload
 from torch import nn
 
 from shared import attention_kit
+from shared.kernels import ops as kernels
 
 try:
     import triton
@@ -407,7 +408,8 @@ class VDNHybridAttention(nn.Module):
             branch[self.tokens_per_frame:(self.frames - 1) * self.tokens_per_frame] = readout.reshape(-1, self.heads * self.head_dim)
             readout = None
         query = states = project = source = gate = None
-        output[video].add_(self.to_out_linear(branch))
+        branch_list, branch = [branch], None
+        kernels.linear_residual_(self.to_out_linear, branch_list, output[video])
         return output
 
     def _forward_head_groups(self, x_handoff, qkv, norm_rope, original_out):
@@ -464,7 +466,8 @@ class VDNHybridAttention(nn.Module):
                 readout = None
             gated = None
         project = source = states = None
-        output[video].add_(self.to_out_linear(branch))
+        branch_list, branch = [branch], None
+        kernels.linear_residual_(self.to_out_linear, branch_list, output[video])
         return output
 
     def _window_softmax(self, qkv_handoff):

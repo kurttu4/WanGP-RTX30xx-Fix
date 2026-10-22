@@ -54,15 +54,18 @@ def pdd_sampling_plans_for_sigmas(sigmas, shift, num_steps=PDD_NUM_STEPS, max_t=
 
 
 class MiniMaxH3ParallelHead(nn.Module):
-    """One output head per PDD interval, fused into one velocity at runtime."""
+    """One output head per PDD interval, fused into one velocity at runtime. Head 0 is the base projection, an ordinary Linear
+    (`linear`) so that a LoRA of the base model applies to it through the shared LoRA path; `heads` holds the other heads relative
+    to it (head n - head 0). As the plan weights sum to one, a delta on the base projection is a delta on every fused head."""
 
     def __init__(self, in_features, out_features, num_steps=PDD_NUM_STEPS, bias=True, device=None):
         super().__init__()
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.num_steps = int(num_steps)
-        self.weight = nn.Parameter(torch.empty(self.num_steps, self.out_features, self.in_features, dtype=torch.float32, device=device))
-        self.bias = nn.Parameter(torch.empty(self.num_steps, self.out_features, dtype=torch.float32, device=device)) if bias else None
+        self.linear = nn.Linear(self.in_features, self.out_features, bias=bias, dtype=torch.float32, device=device)
+        self.heads = nn.Parameter(torch.empty(self.num_steps - 1, self.out_features, self.in_features, dtype=torch.float32, device=device))
+        self.head_biases = nn.Parameter(torch.empty(self.num_steps - 1, self.out_features, dtype=torch.float32, device=device)) if bias else None
         self.plan = torch.zeros(1, self.num_steps)
         self.plan[0, 0] = 1.0
 
@@ -72,10 +75,10 @@ class MiniMaxH3ParallelHead(nn.Module):
         self.plan = plan
 
     def forward(self, hidden_states):
-        plan = self.plan.to(device=self.weight.device, dtype=self.weight.dtype)
-        weight = torch.einsum("pn,noi->poi", plan, self.weight).flatten(0, 1)
-        bias = None if self.bias is None else torch.einsum("pn,no->po", plan, self.bias).flatten()
-        return F.linear(hidden_states, weight, bias)
+        plan = self.plan.to(device=self.heads.device, dtype=self.heads.dtype)[0, 1:]
+        weight = torch.einsum("n,noi->oi", plan, self.heads)
+        bias = None if self.head_biases is None else torch.einsum("n,no->o", plan, self.head_biases)
+        return self.linear(hidden_states) + F.linear(hidden_states, weight, bias)
 
 
 __all__ = ["MiniMaxH3ParallelHead", "PDD_BLOCK_SIZE", "PDD_NUM_STEPS", "pdd_sampling_plan", "pdd_sampling_plans",

@@ -50,9 +50,22 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-def select_per_token(value_noisy: torch.Tensor, value_clean: torch.Tensor, noise_mask: torch.Tensor, seq_len: int) -> torch.Tensor:
-    noise_mask_expanded = noise_mask.unsqueeze(-1)
-    return torch.where(noise_mask_expanded == 1, value_noisy.unsqueeze(1).expand(-1, seq_len, -1), value_clean.unsqueeze(1).expand(-1, seq_len, -1))
+def modulation_segments(batch: int, seq_len: int, noisy: tuple[int, int] | None=None) -> list[tuple[int, int, int]]:
+    """(start, stop, row) over the rows of (batch * seq_len) for ops.norm_modulate and ops.gated_residual_: the modulation row of each
+    span of tokens, row b for batch item b; with noisy = (start, stop), the span of noisy tokens, those tokens take row b and the clean
+    ones row batch + b (the modulation rows of the noisy inputs first, then those of the clean inputs)."""
+    if noisy is None:
+        return [(b * seq_len, (b + 1) * seq_len, b) for b in range(batch)]
+    start, stop = noisy
+    segments = []
+    for b in range(batch):
+        base = b * seq_len
+        if start > 0:
+            segments.append((base, base + start, batch + b))
+        segments.append((base + start, base + stop, b))
+        if stop < seq_len:
+            segments.append((base + stop, base + seq_len, batch + b))
+    return segments
 
 class FeedForward(nn.Module):
 
@@ -74,19 +87,13 @@ class FinalLayer(nn.Module):
         self.linear = nn.Linear(hidden_size, out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(min(hidden_size, ADALN_EMBED_DIM), hidden_size, bias=True))
 
-    def forward(self, x, c=None, noise_mask=None, c_noisy=None, c_clean=None) -> torch.Tensor:
-        seq_len = x.shape[1]
-        if noise_mask is not None:
-            scale_noisy = 1.0 + self.adaLN_modulation(c_noisy)
-            scale_clean = 1.0 + self.adaLN_modulation(c_clean)
-            scale = select_per_token(scale_noisy, scale_clean, noise_mask, seq_len)
-        else:
-            assert c is not None, 'Either c or (c_noisy, c_clean) must be provided'
-            scale = 1.0 + self.adaLN_modulation(c)
-            scale = scale.unsqueeze(1)
-        x = self.norm_final(x) * scale
-        x = self.linear(x)
-        return x
+    def forward(self, x, adaln, segments) -> torch.Tensor:
+        """adaln: the modulation inputs, one row per batch item (or noisy then clean rows); segments: their spans of tokens
+        (modulation_segments). norm_final(x) * (1 + scale[row]) in one fused pass."""
+        scale = self.adaLN_modulation(adaln)
+        batch, tokens, dim = x.shape
+        x_list, x = [x.view(-1, dim)], None
+        return self.linear(ops.norm_modulate(x_list, self.norm_final, torch.zeros_like(scale), scale, segments)).view(batch, tokens, -1)
 
 class RopeEmbedder:
 
@@ -154,21 +161,17 @@ class BriaFibo2Attention(nn.Module):
         self.head_dim = dim_head
 
     def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor | None=None, attention_mask: torch.Tensor | None=None, freqs_cis: torch.Tensor | None=None) -> torch.Tensor:
-
-        def norm_rope(query, key, group):
-            for tensor, norm in ((query, self.norm_q), (key, self.norm_k)):
-                if tensor is not None:
-
-                    def rows(part, first, last):
-                        result = ops.complex_norm_rope([part.transpose(1, 2)], norm, None if freqs_cis is None else freqs_cis[:, first:last])
-                        return result.to(part.dtype).transpose(1, 2)
-                    attention_kit.rows_(tensor, rows)
+        # the complex frequencies (1 | batch, tokens, pairs) viewed as real are the (cos, sin) pairs of the rotation of channels (2p, 2p + 1)
+        table = None if freqs_cis is None else torch.view_as_real(freqs_cis).unsqueeze(2)
         mask = None if attention_mask is None else attention_mask[:, None, None, :]
         hidden_list, hidden_states = ([hidden_states], None)
+        options = dict(attention_mask=mask,
+                       fused_quant=lambda query, key, group, core, settings: ops.split_half_norm_rope_quant_(query, key, table, self.norm_q, self.norm_k, core, settings, interleaved=True))
+        norm_rope = lambda query, key, group: ops.interleaved_norm_rope_(query, key, table, self.norm_q, self.norm_k)
         if encoder_hidden_states is None:
-            result = attention_kit.qkv_attention(hidden_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, attention_mask=mask)
+            result = attention_kit.qkv_attention(hidden_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, **options)
         else:
-            result = attention_kit.cross_qkv_attention(hidden_list, [encoder_hidden_states], self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, attention_mask=mask)
+            result = attention_kit.cross_qkv_attention(hidden_list, [encoder_hidden_states], self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, **options)
         return self.to_out[0](result.flatten(2))
 
 class BriaFibo2TransformerBlock(nn.Module):
@@ -191,43 +194,32 @@ class BriaFibo2TransformerBlock(nn.Module):
         else:
             self.cross_attention = None
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None, freqs_cis: torch.Tensor, adaln_input: torch.Tensor | None=None, noise_mask: torch.Tensor | None=None, adaln_noisy: torch.Tensor | None=None, adaln_clean: torch.Tensor | None=None, encoder_hidden_states: torch.Tensor | None=None, encoder_attention_mask: torch.Tensor | None=None) -> torch.Tensor:
-        seq_len = x.shape[1]
-        if noise_mask is not None:
-            mod_noisy = self.adaLN_modulation(adaln_noisy)
-            mod_clean = self.adaLN_modulation(adaln_clean)
-            scale_msa_noisy, gate_msa_noisy, scale_mlp_noisy, gate_mlp_noisy = mod_noisy.chunk(4, dim=1)
-            scale_msa_clean, gate_msa_clean, scale_mlp_clean, gate_mlp_clean = mod_clean.chunk(4, dim=1)
-            gate_msa_noisy, gate_mlp_noisy = (gate_msa_noisy.tanh(), gate_mlp_noisy.tanh())
-            gate_msa_clean, gate_mlp_clean = (gate_msa_clean.tanh(), gate_mlp_clean.tanh())
-            scale_msa_noisy, scale_mlp_noisy = (1.0 + scale_msa_noisy, 1.0 + scale_mlp_noisy)
-            scale_msa_clean, scale_mlp_clean = (1.0 + scale_msa_clean, 1.0 + scale_mlp_clean)
-            scale_msa = select_per_token(scale_msa_noisy, scale_msa_clean, noise_mask, seq_len)
-            gate_msa = select_per_token(gate_msa_noisy, gate_msa_clean, noise_mask, seq_len)
-        else:
-            mod = self.adaLN_modulation(adaln_input)
-            scale_msa, gate_msa, scale_mlp, gate_mlp = mod.unsqueeze(1).chunk(4, dim=2)
-            gate_msa, gate_mlp = (gate_msa.tanh(), gate_mlp.tanh())
-            scale_msa, scale_mlp = (1.0 + scale_msa, 1.0 + scale_mlp)
-        attn_out = self.attention(self.attention_norm1(x).mul_(scale_msa), attention_mask=attn_mask, freqs_cis=freqs_cis)
-        normalized, attn_out = self.attention_norm2(attn_out), None
-        values, normalized = [normalized], None
-        x = ops.gated_residual_(x, values, gate_msa)
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None, freqs_cis: torch.Tensor, adaln: torch.Tensor, segments: list,
+                encoder_hidden_states: torch.Tensor | None=None, encoder_attention_mask: torch.Tensor | None=None) -> torch.Tensor:
+        """adaln: the modulation inputs, one row per batch item, or the rows of the noisy inputs then those of the clean inputs;
+        segments: the modulation row of each span of tokens (modulation_segments), so no per-token scale or gate tensor exists."""
+        scale_msa, gate_msa, scale_mlp, gate_mlp = (t.contiguous() for t in self.adaLN_modulation(adaln).chunk(4, dim=1))
+        gate_msa, gate_mlp = (gate_msa.tanh(), gate_mlp.tanh())
+        shift = torch.zeros_like(scale_msa)  # scale-only modulation: norm(x) * (1 + scale[row]) + shift[row]
+        batch, tokens, dim = x.shape  # the modulation works on the rows of (batch * tokens)
+        x_list = [x.view(-1, dim)]
+        attn_out = self.attention(ops.norm_modulate(x_list, self.attention_norm1, shift, scale_msa, segments).view(batch, tokens, dim), attention_mask=attn_mask, freqs_cis=freqs_cis)
+        normalized, attn_out = (self.attention_norm2(attn_out), None)
+        values, normalized = ([normalized], None)
+        x = ops.gated_residual_(x, values, gate_msa, segments=segments)
         del scale_msa, gate_msa
         if self.cross_attention is not None:
             cross_out = self.cross_attention(self.cross_attn_norm1(x), encoder_hidden_states=encoder_hidden_states, attention_mask=encoder_attention_mask)
-            normalized, cross_out = self.cross_attn_norm2(cross_out), None
-            values, normalized = [normalized], None
+            normalized, cross_out = (self.cross_attn_norm2(cross_out), None)
+            values, normalized = ([normalized], None)
             x = ops.gated_residual_(x, values, self.cross_attn_gate, tanh=True)
-        if noise_mask is not None:
-            scale_mlp = select_per_token(scale_mlp_noisy, scale_mlp_clean, noise_mask, seq_len)
-        ffn_out = self.feed_forward(self.ffn_norm1(x).mul_(scale_mlp))
-        del scale_mlp
-        normalized, ffn_out = self.ffn_norm2(ffn_out), None
-        if noise_mask is not None:
-            gate_mlp = select_per_token(gate_mlp_noisy, gate_mlp_clean, noise_mask, seq_len)
-        values, normalized = [normalized], None
-        return ops.gated_residual_(x, values, gate_mlp)
+        x_list = [x.view(-1, dim)]
+        values = [ops.norm_modulate(x_list, self.ffn_norm1, shift, scale_mlp, segments).view(batch, tokens, dim)]
+        del scale_mlp, shift
+        ffn_out = ops.mlp(values, self.feed_forward.w1, self.feed_forward.w2, "swiglu", up=self.feed_forward.w3)
+        normalized, ffn_out = (self.ffn_norm2(ffn_out), None)
+        values, normalized = ([normalized], None)
+        return ops.gated_residual_(x, values, gate_mlp, segments=segments)
 
 class BriaFibo2PerceiverLayer(nn.Module):
     """Gist tokens read the text encoder (cross-attention), then each other (self-attention), then an FFN."""
@@ -336,14 +328,13 @@ class BriaFibo2Transformer2DModel(nn.Module):
             ids.append(self.create_coordinate_grid(context_size, (image_plane + k + 1, 0, 0), device))
         hidden_states = self.x_embedder(torch.cat(tokens, dim=1))
         image_freqs = self.rope_embedder(torch.cat([grid.flatten(0, 2) for grid in ids])).unsqueeze(0)
-        refiner_noise_mask = None
-        if context_latents:
-            refiner_noise_mask = torch.zeros(batch_size, hidden_states.shape[1], dtype=torch.long, device=device)
-            refiner_noise_mask[:, :num_image_tokens] = 1
+        # modulation rows: the noisy inputs (batch rows), then the clean ones; the refiner's context tokens are clean
+        adaln = torch.cat([adaln_noisy, adaln_clean])
+        refiner_segments = modulation_segments(batch_size, hidden_states.shape[1], (0, num_image_tokens) if context_latents else None)
         for block in self.noise_refiner:
             if self._interrupt:
                 raise GenerationAborted
-            hidden_states = block(hidden_states, None, image_freqs, adaln_input=adaln_noisy, noise_mask=refiner_noise_mask, adaln_noisy=adaln_noisy, adaln_clean=adaln_clean)
+            hidden_states = block(hidden_states, None, image_freqs, adaln if context_latents else adaln_noisy, refiner_segments)
             if self._interrupt:
                 raise GenerationAborted
         if encoder_attention_mask is not None:
@@ -370,17 +361,16 @@ class BriaFibo2Transformer2DModel(nn.Module):
             freqs_cis = torch.cat([image_freqs, gist_freqs], dim=1)
             image_mask = torch.ones(batch_size, num_image_tokens + num_context_tokens, dtype=torch.bool, device=device)
             attention_mask = torch.cat([image_mask, gist_mask], dim=1)
-        noise_mask = torch.zeros(batch_size, hidden_states.shape[1], dtype=torch.long, device=device)
-        noise_mask[:, image_start:image_start + num_image_tokens] = 1
+        segments = modulation_segments(batch_size, hidden_states.shape[1], (image_start, image_start + num_image_tokens))
         bundle_index = {layer_id: index + 1 for index, layer_id in enumerate(self.config.injection_layer_ids)}
         for layer_id, block in enumerate(self.layers):
             if self._interrupt:
                 raise GenerationAborted
             text = encoder_hidden_states[:, bundle_index[layer_id]] if layer_id in bundle_index else None
-            hidden_states = block(hidden_states, attention_mask, freqs_cis, noise_mask=noise_mask, adaln_noisy=adaln_noisy, adaln_clean=adaln_clean, encoder_hidden_states=text, encoder_attention_mask=encoder_attention_mask)
+            hidden_states = block(hidden_states, attention_mask, freqs_cis, adaln, segments, encoder_hidden_states=text, encoder_attention_mask=encoder_attention_mask)
             if self._interrupt:
                 raise GenerationAborted
-        hidden_states = self.final_layer(hidden_states[:, image_start:image_start + num_image_tokens], c=adaln_noisy)
+        hidden_states = self.final_layer(hidden_states[:, image_start:image_start + num_image_tokens], adaln_noisy, modulation_segments(batch_size, num_image_tokens))
         hidden_states = hidden_states.view(batch_size, height_tokens, width_tokens, channels, patch_size, patch_size)
         output = hidden_states.permute(0, 3, 1, 4, 2, 5).reshape(batch_size, channels, height, width)
         return (output,)

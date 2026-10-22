@@ -79,6 +79,8 @@ class family_handler:
             ],
             "text_encoder_folder": TEXT_ENCODER_FOLDER,
             "lm_decoder": True,
+            "device_explicit": True,
+            "cuda_graphs": ["transformer"],
             "compile": False,
             "prompt_class": "Lyrics",
             "prompt_enhancer_button_label": "Enhance",
@@ -196,7 +198,9 @@ class family_handler:
             "cudaGraphs": ["text_encoder", "rvq_depth_decoder"] if lm_features.graphs else False,
         }
         if int(profile) in (0, 2, 4, 5):
-            offload_def["budgets"] = {"transformer": 400, "text_encoder": 800}
+            # the flow transformer runs hundreds of times per song (30 steps per 8 s chunk) on 2 x 690 tokens: kept whole (2.3 GB in
+            # INT8) rather than streamed at every call (2.7x slower); MMGP still streams it when it exceeds its share of the VRAM
+            offload_def["budgets"] = {"transformer": 0, "text_encoder": 800}
         return pipeline, offload_def
 
     @staticmethod

@@ -12,6 +12,9 @@ projecting q/k/v and calling pay_attention.
   statistics computed beforehand.
 - Joint attentions: the projections of several streams (text and image tokens) are joined along the tokens in their order, and keys
   and values computed beforehand (a cached prefix) can be put before the projected ones.
+- Fused quantization (fused_quant): with a staged SageAttention 2 core, a model whose q/k norm and RoPE have a fused kernel
+  (shared.kernels.ops.split_half_norm_rope_quant_) quantizes q and k straight from the projection output, without the in-place
+  16-bit pass and the core's separate quantizers (and, for k, its mean and subtraction passes).
 """
 from collections import namedtuple
 
@@ -99,7 +102,7 @@ def cross_qkv_attention(x_list, context_list, q_proj, k_proj, v_proj, heads, hea
 @torch.compiler.disable()
 def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm_spans_heads=False, split_heads=True, kv_prefix=None,
                         attention_mask=None, force_attention=None, attention_fn=None, norm_stats=None, _cross=False, norm_v=None, softmax_scale=None,
-                        head_split_level=None):
+                        head_split_level=None, fused_quant=None):
     """Attention of the q/k/v projections of several streams joined along the tokens in their order: streams is a list of
     (x_list, (q_proj, k_proj, v_proj)), each x handed off in its list, of shape (batch, tokens, features) or (tokens, features).
     Returns (batch, all tokens, heads, head_dim).
@@ -120,7 +123,12 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
     When every K/V stream shares its k and v module, reuse its projection with independent tensors for normalization.
     softmax_scale: explicit SDPA scale; requires force_attention="sdpa".
     head_split_level: Attention Head Split level of this call instead of the Performance tab's (a model-specific sparse attention
-    bounding its working set). A stream may carry a fourth projection: attention_fn then receives its head group's rows in a list."""
+    bounding its working set). A stream may carry a fourth projection: attention_fn then receives its head group's rows in a list.
+    fused_quant(query, key, group, core, settings): optional norm + RoPE fused with a staged core's quantization (for example
+    shared.kernels.ops.split_half_norm_rope_quant_), returning (q_quantized, k_quantized) for the tensors given (the other None) as
+    the core's staged_quantize_q / staged_quantize_k do, or None to run norm_rope and the core's quantizers instead; used by the
+    staged cores unless the attention_mask is a callable (it reads the normalized 16-bit q and k); with a kv_prefix only q is fused
+    (the prefix joins the normalized 16-bit k)."""
     global _unsplit_notice
     if softmax_scale is not None and (force_attention != "sdpa" or attention_fn is not None):
         raise ValueError("An explicit softmax_scale requires force_attention='sdpa' and no attention_fn")
@@ -211,6 +219,9 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
         core, settings = staged
         if attention_mask is not None and not callable(attention_mask):  # in SageAttention's layout (batch, heads, q, k)
             attention_mask = sage_attention_mask(attention_mask, dtype)
+    # a callable mask reads the normalized 16-bit q and k; a prefix joins the normalized 16-bit k (q alone is still fused)
+    fusing_q = staged is not None and fused_quant is not None and not callable(attention_mask)
+    fusing_k = fusing_q and kv_prefix is None
     q_heads, kv_group_heads = heads // groups, kv_heads // groups
     output = None
     for index in range(groups):
@@ -249,31 +260,48 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
         if groups == 1:  # all heads: k is quantized and released before q is projected
             if not shared_kv:
                 key = project(1, group.kv)
-            norm_rope(None, key, group)
-            key = with_prefix(key, 1, group.kv)
-            if callable(attention_mask):
-                attention_mask(None, key, group)
-            quantized[1] = core.staged_quantize_k([key], settings)
-            del key
+            fused = fused_quant(None, key, group, core, settings) if fusing_k else None
+            if fused is None:
+                norm_rope(None, key, group)
+                key = with_prefix(key, 1, group.kv)
+                if callable(attention_mask):
+                    attention_mask(None, key, group)
+                quantized[1] = core.staged_quantize_k([key], settings)
+            else:
+                quantized[1] = fused[1]
+            del key, fused
             query = project(0, group.q)
             release()
-            norm_rope(query, None, group)
-            mask = attention_mask(query, None, group) if callable(attention_mask) else attention_mask
-            quantized[0] = core.staged_quantize_q(query, settings)
+            fused = fused_quant(query, None, group, core, settings) if fusing_q else None
+            if fused is None:
+                norm_rope(query, None, group)
+                mask = attention_mask(query, None, group) if callable(attention_mask) else attention_mask
+                quantized[0] = core.staged_quantize_q(query, settings)
+            else:
+                mask, quantized[0] = attention_mask, fused[0]
+            del fused
             return core.staged_attention(query, quantized, settings, mask)
         query = project(0, group.q)
         if not shared_kv:
             key = project(1, group.kv)
         if last:
             release()
-        norm_rope(query, key, group)
-        key = with_prefix(key, 1, group.kv)
-        if callable(attention_mask):
-            attention_mask(None, key, group)
-        quantized[1] = core.staged_quantize_k([key], settings)
+        fused = fused_quant(query, key, group, core, settings) if fusing_k else fused_quant(query, None, group, core, settings) if fusing_q else None
+        if fused is None or fused[1] is None:
+            norm_rope(query if fused is None else None, key, group)
+            key = with_prefix(key, 1, group.kv)
+            if callable(attention_mask):
+                attention_mask(None, key, group)
+            quantized[1] = core.staged_quantize_k([key], settings)
+        else:
+            quantized[1] = fused[1]
         del key
-        mask = attention_mask(query, None, group) if callable(attention_mask) else _head_slice(attention_mask, 1, group.q)
-        quantized[0] = core.staged_quantize_q(query, settings)
+        if fused is None:
+            mask = attention_mask(query, None, group) if callable(attention_mask) else _head_slice(attention_mask, 1, group.q)
+            quantized[0] = core.staged_quantize_q(query, settings)
+        else:
+            mask, quantized[0] = _head_slice(attention_mask, 1, group.q), fused[0]
+        del fused
         if output is None:
             output = query.new_empty((batch, tokens, heads, head_dim))
         core.staged_attention(output[..., group.q.start:group.q.stop, :], quantized, settings, mask)

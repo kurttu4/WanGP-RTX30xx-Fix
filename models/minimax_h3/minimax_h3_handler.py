@@ -313,7 +313,7 @@ PDD_INFOS = """
 
 At each step, PDD merges four learned denoising-interval outputs into one prediction, covering 32 intervals in only 8 model evaluations.
 
-This model requires exactly **8 inference steps** and the **Euler** sampler. Two-phase generation is disabled. Use the FL2VA PDD weights only with FL2VA and the Ref2VA PDD weights only with Ref2VA.
+This model requires exactly **8 inference steps** and the **Euler** sampler. Two-phase generation is disabled. Use the FL2VA PDD weights only with FL2VA and the Ref2VA PDD weights only with Ref2VA. LoRAs trained for the matching base model apply; their output-layer changes reach all PDD heads.
 """
 
 H3_VDN_INFOS = "\n\n### Automatic 8-step acceleration\nThe VDN 8-step acceleration LoRA is automatically loaded and generation defaults to 8 steps."
@@ -334,6 +334,7 @@ FastH3 Omni is FastVideo's distilled MiniMax H3 Ref2VA student: it generates a v
 - **8 inference steps, Euler sampler:** both are locked (a 32-interval PDD grid fused into 8 forwards). The **Flow Shift** (default 12) is the video shift the student was trained with; the audio shift stays 3.
 - **VSA sparse attention** is always on: every query tile of the generated video attends the 10% most relevant tiles of the video and 10% of each reference video, plus every text, audio and image token, with a learned coarse branch over the rest. It needs Triton on an NVIDIA RTX 30xx or newer GPU.
 - **Quality:** a distilled student favors speed; difficult motion, fine detail and some sounds can fall short of the full H3 models.
+- **LoRAs:** LoRAs trained for Ref2VA apply; their output-layer changes reach all PDD heads.
 """
 FASTH3_DEEPY_INFOS = ("Generate video and stereo sound in 8 steps (FastVideo FastH3 Omni, a distilled Ref2VA student) with the Ref2VA settings: ordered "
                       "`image_refs` (`I`, or `KI` to take the output size from the first image), `video_guide` / `video_guide2` / `video_guide3` reference "
@@ -342,7 +343,7 @@ FASTH3_DEEPY_INFOS = ("Generate video and stereo sound in 8 steps (FastVideo Fas
                       "Name references `<Picture N>`, `<Video N>`, `<Audio N>`. The student was distilled with ordered references (up to 9 images, 3 videos, "
                       "3 audio clips, 12 in total): use at least one image or video reference for the best results; the other inputs are inherited from "
                       "the Ref2VA base. `num_inference_steps` is locked to 8 with the Euler sampler; `flow_shift` defaults to 12 (the trained video shift). "
-                      "Attention is locked to VSA sparse attention (Triton, NVIDIA SM80+). Read `prompt_infos` for H3's structured prompt syntax.")
+                      "Attention is locked to VSA sparse attention (Triton, NVIDIA SM80+). LoRAs trained for Ref2VA apply. Read `prompt_infos` for H3's structured prompt syntax.")
 
 H3_RUNTIME_INFOS = H3_PHASE_INFOS + H3_PHASE_TURBO_INFOS + H3_AUDIO_REFINEMENT_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + H3_COMMON_RUNTIME_INFOS
 H3_PDD_RUNTIME_INFOS = PDD_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
@@ -888,7 +889,7 @@ class family_handler:
         if fasth3:  # FastH3 Omni: the Ref2VA inputs, the student's own schedule and attention (locked above)
             result["deepy_infos"] = FASTH3_DEEPY_INFOS
         if pdd:
-            result["deepy_infos"] += " PDD requires exactly 8 inference steps and the Euler sampler."
+            result["deepy_infos"] += " PDD requires exactly 8 inference steps and the Euler sampler. LoRAs trained for the matching base model apply."
         else:
             result["deepy_infos"] += " Two-phase generation uses `num_inference_steps2` (default 3) for final enhancement and `switch_threshold` for its starting noise. Accelerator LoRAs before `|` with any nonzero phase-2 multiplier replace the automatic Turbo together, at their specified multipliers; if all are zero, the automatic Turbo is used. `1;0` means phase 1 only, `1;0.6` sets phase 2 to 0.6, and `1` applies to both phases. LoRAs after `|` keep their multipliers."
         if vdn:

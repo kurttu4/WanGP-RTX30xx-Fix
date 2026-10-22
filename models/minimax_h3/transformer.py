@@ -197,6 +197,9 @@ class Attention(nn.Module):
 
     def _out_projection(self, attention_list, seq_len, residual, gate, segments):
         output = _take(attention_list).reshape(seq_len, -1)
+        if residual is not None and gate is None:
+            output_list, output = [output], None
+            return kernels.linear_residual_(self.out_proj, output_list, residual)
         if residual is not None:
             output_list, output = [output], None
             return kernels.gated_linear(self.out_proj, output_list, residual, gate, segments)
@@ -219,6 +222,8 @@ class Attention(nn.Module):
             # VSA: q, k, v and the gate are projected by head groups from one prepared input, so the tiled copies stay bounded
             attention = attention_kit.qkv_attention(x_list, self.q_proj, self.k_proj, self.v_proj, self.heads, self.head_dim,
                                                     lambda query, key, group: self._norm_rope_(query, key, rope, packed_rope, allow_fusion),
+                                                    fused_quant=(lambda query, key, group, core, settings:
+                                                                 kernels.split_half_norm_rope_quant_(query, key, rope, self.q_norm, self.k_norm, core, settings)) if allow_fusion else None,
                                                     attention_fn=self.vsa if use_vsa else self.veda if use_veda else None,
                                                     extra_proj=self.gate_proj if use_vsa else None, head_split_level=VSA_HEAD_SPLIT_LEVEL if use_vsa else None)
             attention_list, attention = [attention], None
@@ -288,14 +293,8 @@ class RefinerBlock(nn.Module):
 
     def forward(self, x_list):
         hidden = _take(x_list)
-        branch = self.attn([self.norm1(hidden)])
-        branch.add_(hidden)
-        del hidden
-        residual = branch
-        branch = self.mlp([self.norm2(residual)])
-        branch.add_(residual)
-        del residual
-        return branch
+        hidden = self.attn([self.norm1(hidden)], residual=hidden)
+        return kernels.mlp([self.norm2(hidden)], self.mlp.fc1, self.mlp.fc2, "swiglu", residual=hidden)
 
 
 class TokenRefiner(nn.Module):
@@ -343,8 +342,7 @@ def _gated_residual(hidden_list, gate_list, branch_list, segments):
     gate, branch = gate_list[0].to(hidden.dtype), _take(branch_list)
     gate_list.clear()
     for start, stop, row in segments:
-        branch[start:stop].mul_(gate[row]).add_(hidden[start:stop])
-        hidden[start:stop].copy_(branch[start:stop])
+        kernels.gated_residual_(hidden[start:stop], [branch[start:stop]], gate[row])
     return hidden
 
 
@@ -360,20 +358,15 @@ class DiTBlock(nn.Module):
                                     dtype=adaln_dtype or dtype, device=device)
 
     @staticmethod
-    def _gated_branch(hidden, gate, branch, segments, signature_stride=0, signature=None):
+    def _gated_branch(hidden, gate, branch, segments, signature_stride, signature=None):
         for start, stop, row in segments:
-            branch[start:stop].mul_(gate[row])
-        if signature_stride:
-            # Sample the existing gated branch before it is released; never materialize a full block residual copy.
-            sampled = branch.reshape(-1)[::signature_stride]
-            if signature is None:
-                signature = sampled.clone()
-            else:
-                signature.add_(sampled)
-            hidden.add_(branch)
+            kernels.gated_residual_(hidden[start:stop], [branch[start:stop]], gate[row])
+        # Sample the gated branch (gated in place) before it is released; never materialize a full block residual copy.
+        sampled = branch.reshape(-1)[::signature_stride]
+        if signature is None:
+            signature = sampled.clone()
         else:
-            branch.add_(hidden)
-            hidden.copy_(branch)
+            signature.add_(sampled)
         return hidden, signature
 
     def forward(self, x_list, temb, segments, rope, residual_signature_elements=0):
@@ -464,13 +457,8 @@ class FinalLayer(nn.Module):
             self.audio_out = MiniMaxH3ParallelHead(hidden, audio_dim, pdd_num_steps, device=device)
 
     def _head(self, h_list, shift, scale, row, output):
-        value = self.norm(_take(h_list)).to(scale.dtype)
-        if isinstance(row, list):
-            for start, stop, index in row:
-                value[start:stop].mul_(1.0 + scale[index]).add_(shift[index])
-        else:
-            value.mul_(1.0 + scale[row]).add_(shift[row])
-        value = value.to(output.weight.dtype)
+        rows = row if isinstance(row, list) else [(0, h_list[0].shape[0], row)]
+        value = kernels.norm_modulate(h_list, self.norm, shift, scale, rows, dtype=scale.dtype).to(torch.float32)
         return output(value)
 
     def forward(self, x_list, temb, video_segment, audio_segment):
@@ -551,6 +539,12 @@ class MiniMaxH3Model(nn.Module):
                                                     ".lora.up.weight", ".lora.up.default.weight")):
                     value = torch.cat(value.chunk(2, dim=0)[::-1], dim=0).contiguous()
             converted[key] = value
+        if self.pdd_num_steps:  # PDD: a base-model head LoRA applies to every head through the base projection
+            for wrapper in ("", "diffusion_model.", "transformer."):
+                for head in ("final_layer.video_out.", "final_layer.audio_out."):
+                    prefix = wrapper + head
+                    for key in [key for key in converted if key.startswith(prefix)]:
+                        converted[prefix + "linear." + key[len(prefix):]] = converted.pop(key)
         from .lora_affine import convert_adaln_loras
 
         if self.use_adaln_curves:
@@ -653,7 +647,8 @@ class MiniMaxH3Model(nn.Module):
         else:
             fp32_modules.extend((self.time_embedder.proj_in, self.time_embedder.proj_out))
         for module in fp32_modules:
-            module._lock_dtype = torch.float32
+            for submodule in module.modules():
+                submodule._lock_dtype = torch.float32
 
     def preprocess_text_embeds(self, text_states):
         if text_states.shape[-1] == self.hidden_size:
@@ -721,7 +716,7 @@ class MiniMaxH3Model(nn.Module):
         # Skips are applied in row chunks so no full-sequence skip tensor is ever materialized.
         for first, last in row_ranges:
             for start, stop in _chunk_rows(first, last):
-                hidden[start:stop].add_(after_proj(stream[start:stop]), alpha=scale)
+                kernels.linear_residual_(after_proj, [stream[start:stop]], hidden[start:stop], scale)
 
     def _time_embedding(self, timesteps, table=None):
         if not self.use_adaln_curves:

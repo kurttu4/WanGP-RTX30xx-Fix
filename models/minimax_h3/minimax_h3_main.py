@@ -79,6 +79,12 @@ def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pd
         return result
 
     state_dict = strip(state_dict)
+    if pdd:  # stacked PDD heads [num_steps, out, in]: head 0 is the base projection, the others are stored relative to it (FP32)
+        for key in [key for key in state_dict if key.startswith(("final_layer.video_out.", "final_layer.audio_out."))]:
+            head, suffix = key.rsplit(".", 1)
+            stacked = state_dict.pop(key)
+            base = stacked[0].float()
+            state_dict[f"{head}.linear.{suffix}"], state_dict[f"{head}.{'heads' if suffix == 'weight' else 'head_biases'}"] = base, stacked[1:].float() - base
     if ref2va_adaln_t_table is not None:
         state_dict["ref2va_adaln_t_table"] = ref2va_adaln_t_table
     return state_dict, strip(quantization_map), strip(tied_weights_map)

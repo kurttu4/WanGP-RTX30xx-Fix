@@ -10,9 +10,10 @@ range lose bits, and the result rounds to FP16 (11 bits) before BF16 (8 bits): L
 measured within +-3% of the PyTorch BF16 route's error against FP32, 4.8-6.8x faster. Used with every kernel precision (user decision,
 2026-10-21: a few % more error than PyTorch's route is worth it where PyTorch has no fast BF16 convolution), an exception to the strict rule.
 
-install(module, device) at load time: on an eligible GPU, each Conv1d / Conv2d / Conv3d of the module computes its BF16 CUDA calls this
-way; other dtypes, devices, autograd, compilation and graph capture keep PyTorch's route. Any model can call it
-on its VAE, upsampler or other convolutional component."""
+install_globally(device), called once by wgp.py: on an eligible GPU the stock _conv_forward of Conv1d / Conv2d / Conv3d (which
+subclasses with causal paddings and caches call through super()) computes every BF16 CUDA call of the process this way; other dtypes,
+devices, autograd, compilation and graph capture keep PyTorch's route. install(module, device) does the same for the layers of one
+module (tests, standalone use); conv2d() is the functional entry for a layer computing a convolution itself."""
 import functools
 
 import torch
@@ -43,43 +44,108 @@ def supported(device) -> bool:
     return triton is not None and device.type == "cuda" and torch.version.hip is None and torch.cuda.is_available() and _supported(device.index)
 
 
+def _functional(layer):
+    """F.convNd of a Conv1d/2d/3d layer or of a subclass that keeps the stock _conv_forward (causal paddings and caches around it)."""
+    for cls, fn in _CONVOLUTIONS.items():
+        if isinstance(layer, cls) and type(layer)._conv_forward is cls._conv_forward:
+            return fn
+    return None
+
+
 def install(module, device) -> int:
-    """Route the BF16 calls of module's Conv1d/2d/3d layers on an eligible GPU (supported(device)); returns the number of layers."""
+    """Route the BF16 calls of module's Conv1d/2d/3d layers (and subclasses with the stock _conv_forward) on an eligible GPU
+    (supported(device)); returns the number of layers."""
     if not supported(device):
         return 0
     count = 0
     for layer in module.modules():
-        if type(layer) in _CONVOLUTIONS and "_conv_forward" not in layer.__dict__:
+        if _functional(layer) is not None and "_conv_forward" not in layer.__dict__:
             layer._conv_forward = functools.partial(_conv_forward, layer, layer._conv_forward)
             count += 1
     return count
 
 
-def _conv_forward(layer, original, input, weight, bias):
-    if (not cuda_inference(input, sm120=False, inference=False) or weight.dtype != torch.bfloat16
+def _eligible(input, weight, bias):
+    """The input to route (a BF16 autocast's FP32 input cast first, as autocast would), or None: BF16 CUDA input, weight and bias,
+    inference, no compilation or capture, on a GPU of the route (also for the functional entries, which are not installed per device)."""
+    if not input.is_cuda or not _supported(input.device.index):
+        return None
+    if (input.dtype == torch.float32 and weight.dtype == torch.bfloat16 and input.is_cuda and torch.is_autocast_enabled("cuda")
+            and torch.get_autocast_dtype("cuda") == torch.bfloat16):
+        input = input.to(torch.bfloat16)  # what the caller's BF16 autocast does before the convolution (FP32 norm outputs under autocast)
+    if (not cuda_inference(input, capability_floor=(7, 5)) or weight.dtype != torch.bfloat16  # BF16 handled as bits
             or type(weight) not in (torch.Tensor, torch.nn.Parameter) or weight.device != input.device
             or (bias is not None and bias.dtype != torch.bfloat16) or torch.cuda.is_current_stream_capturing()):
-        return original(input, weight, bias)
+        return None
+    return input
+
+
+def install_globally(device) -> bool:
+    """Route the BF16 calls of every Conv1d / Conv2d / Conv3d of the process (their stock _conv_forward, which subclasses call through
+    super()) on an eligible GPU (supported(device)); once per process, from wgp.py. False (nothing patched) elsewhere."""
+    if not supported(device):
+        return False
+    for cls in _CONVOLUTIONS:
+        if "_scaled_fp16_stock" not in cls.__dict__:
+            cls._scaled_fp16_stock = cls._conv_forward
+            cls._conv_forward = _global_conv_forward
+    return True
+
+
+def _route(layer, input, weight, bias):
+    """layer's convolution on the route for an eligible call, else None."""
+    routed = _eligible(input, weight, bias)
+    if routed is None:
+        return None
     choose("BF16 Convolution", owned_triton=True)
-    return convolution(layer, input, weight, bias)
+    fn = next(fn for cls, fn in _CONVOLUTIONS.items() if isinstance(layer, cls))
+    return _scaled(fn, routed, weight, bias, layer.stride, layer.padding, layer.dilation, layer.groups, layer.padding_mode,
+                   layer._reversed_padding_repeated_twice, layer, "_scaled_fp16_stats")
 
 
-def _weight_shift(layer, weight):
-    """(power of two applied to the weight, largest L1 norm of an output channel's scaled weights): measured once per layer, at its first
-    call on the GPU (one synchronization)."""
-    stats = layer.__dict__.get("_scaled_fp16_stats")
+def _global_conv_forward(layer, input, weight, bias):
+    out = _route(layer, input, weight, bias)
+    return type(layer)._scaled_fp16_stock(layer, input, weight, bias) if out is None else out
+
+
+def _conv_forward(layer, original, input, weight, bias):
+    out = _route(layer, input, weight, bias)
+    return original(input, weight, bias) if out is None else out
+
+
+def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, *, owner, key):
+    """F.conv2d, on the scaled-FP16 route where _conv_forward would take it (a layer computing a 2-D convolution itself, for example
+    with a slice of a 3-D weight); owner.__dict__[key] caches the bound of that weight (one measurement, as for a layer)."""
+    routed = _eligible(input, weight, bias)
+    if routed is None:
+        return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
+    choose("BF16 Convolution", owned_triton=True)
+    return _scaled(F.conv2d, routed, weight, bias, stride, padding, dilation, groups, "zeros", None, owner, key)
+
+
+def _weight_shift(owner, weight, key="_scaled_fp16_stats"):
+    """(power of two applied to the weight, largest L1 norm of an output channel's scaled weights): measured once per layer (or per
+    owner and key), at its first call on the GPU (one synchronization)."""
+    stats = owner.__dict__.get(key)
     if stats is None:
         magnitude = weight.abs()
         _, exponent = torch.frexp(magnitude.amax().float())
         l1 = magnitude.float().flatten(1).sum(1).amax()
         shift = max(-_SHIFT_LIMIT, min(_SHIFT_LIMIT, -int(exponent.item())))
-        stats = layer._scaled_fp16_stats = (shift, float(l1.item()) * 2.0 ** shift * (1 + 2.0 ** -10))  # bound rounded up
+        stats = (shift, float(l1.item()) * 2.0 ** shift * (1 + 2.0 ** -10))  # bound rounded up
+        owner.__dict__[key] = stats
     return stats
 
 
 def convolution(layer, input, weight, bias):
     """layer's convolution (its stride, padding, padding mode, dilation, groups) of BF16 CUDA input, weight and bias on FP16 tensor cores."""
-    weight_shift, l1 = _weight_shift(layer, weight)
+    return _scaled(_functional(layer), input, weight, bias, layer.stride, layer.padding, layer.dilation, layer.groups, layer.padding_mode,
+                   layer._reversed_padding_repeated_twice, layer, "_scaled_fp16_stats")
+
+
+def _scaled(fn, input, weight, bias, stride, padding, dilation, groups, padding_mode, reversed_padding, owner, key):
+    """fn (F.conv1d/2d/3d) of BF16 CUDA input, weight and bias on FP16 tensor cores; owner.__dict__[key] caches the bound of weight."""
+    weight_shift, l1 = _weight_shift(owner, weight, key)
     x = input.contiguous()
     low, high = torch.aminmax(x)
     x16 = torch.empty(x.shape, dtype=torch.float16, device=x.device)
@@ -91,10 +157,10 @@ def convolution(layer, input, weight, bias):
     w16 = torch.empty(weight.shape, dtype=torch.float16, device=weight.device)
     _to_fp16_kernel[(triton.cdiv(weight.numel(), _BLOCK),)](weight.view(torch.int16), w16, weight.numel(), weight_shift, None, None, 0.0,
                                                              None, False, _BLOCK)
-    padding = layer.padding
-    if layer.padding_mode != "zeros":
-        x16, padding = F.pad(x16, layer._reversed_padding_repeated_twice, mode=layer.padding_mode), 0
-    y = _CONVOLUTIONS[type(layer)](x16, w16, None, layer.stride, padding, layer.dilation, layer.groups).contiguous()
+    if padding_mode != "zeros":
+        x16, padding = F.pad(x16, reversed_padding, mode=padding_mode), 0
+    with torch.autocast(device_type="cuda", enabled=False):  # a caller's BF16 autocast would turn the FP16 convolution back into BF16
+        y = fn(x16, w16, None, stride, padding, dilation, groups).contiguous()
     x16 = w16 = None
     channels, spatial = y.shape[1], y[0, 0].numel()
     _to_bf16_kernel[(triton.cdiv(y.numel(), _BLOCK),)](y, y.view(torch.int16), None if bias is None else bias.view(torch.int16), shift,
