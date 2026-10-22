@@ -1,0 +1,8 @@
+{
+    "enabled": true,
+    "sound_type": "double_beep",
+    "beep_freq": 2550,
+    "beep_duration": 100,
+    "repeat_count": 2,
+    "repeat_delay": 50
+}

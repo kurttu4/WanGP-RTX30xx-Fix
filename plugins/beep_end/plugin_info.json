@@ -1,0 +1,7 @@
+{
+  "name": "Beep on End (Windows)",
+  "author": "Custom",
+  "version": "1.0.0",
+  "description": "Plays an audio signal (beep/chord/melody) when video generation is completed in Wan2GP (Windows).",
+  "type": "app"
+}
