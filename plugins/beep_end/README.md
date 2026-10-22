@@ -27,4 +27,4 @@ A plugin for **Wan2GP** that plays a native Windows sound signal (beep, melody c
 3. Go to the **Plugins** tab in the Wan2GP interface.
 4. Find the plugin `Beep on End (Windows)` (or `beep_end`) in the list, check it and click **Save Settings**.
 5. Restart Wan2GP.
-6. In the top menu, you will see the tab **🔔 End Sound**, where you can choose a sound and check it with the button.
+6. In the top menu, you will see the tab **🔔Beep on End**, where you can choose a sound and check it with the button.
