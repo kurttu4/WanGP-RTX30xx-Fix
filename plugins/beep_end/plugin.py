@@ -99,7 +99,7 @@ in the background stream, without blocking the interface.
         # 3. Plugin Settings Tab
         self.add_tab(
             tab_id="beep_end_tab",
-            label="🔔beep end",
+            label="🔔Beep on End",
             component_constructor=self.create_settings_ui,
             position=-1
         )
