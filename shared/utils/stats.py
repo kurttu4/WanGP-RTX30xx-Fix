@@ -158,7 +158,7 @@ class SystemStatsApp:
             justify-content: space-between;
             align-items: flex-start;
             padding: 0px 5px;
-            height: 60px;
+            height: 100px;
             width: 100%;
             box-sizing: border-box;
         }}
