@@ -8,7 +8,7 @@ import psutil
 class GpuBackend:
     """Base class for GPU stat providers."""
     def query(self):
-        """Returns (gpu_percent, vram_used_bytes, vram_total_bytes)."""
+        """Returns (gpu_percent, vram_used_bytes, vram_total_bytes, gpu_temp)."""
         raise NotImplementedError
 
 
@@ -22,7 +22,8 @@ class NvmlBackend(GpuBackend):
     def query(self):
         util = self._nvml.nvmlDeviceGetUtilizationRates(self._handle)
         mem = self._nvml.nvmlDeviceGetMemoryInfo(self._handle)
-        return util.gpu, mem.used, mem.total
+        temp = self._nvml.nvmlDeviceGetTemperature(self._handle, self._nvml.NVML_TEMPERATURE_GPU)
+        return util.gpu, mem.used, mem.total, temp
 
 
 class AmdsmiBackend(GpuBackend):
@@ -133,11 +134,11 @@ class SystemStatsApp:
         ssd_bar_height = min(100.0, (total_disk_speed / MAX_SSD_SPEED_MB_S) * 100)
 
         # Get GPU stats
-        gpu_percent, vram_percent, vram_used_gb, vram_total_gb = 0, 0, 0, 0
+        gpu_percent, vram_percent, vram_used_gb, vram_total_gb, gpu_temp = 0, 0, 0, 0, 0
 
         if gpu_backend is not None:
             try:
-                gpu_percent, vram_used, vram_total = gpu_backend.query()
+                gpu_percent, vram_used, vram_total, gpu_temp = gpu_backend.query()
                 vram_used_gb = vram_used / (1024**3)
                 vram_total_gb = vram_total / (1024**3)
                 vram_percent = (vram_used / vram_total) * 100 if vram_total else 0
@@ -233,6 +234,7 @@ class SystemStatsApp:
                     <div class="stats-bar-fill" style="width: {gpu_percent}%;"></div>
                 </div>
                 <div class="stats-title">GPU: {gpu_percent:.1f}%</div>
+                <div class="stats-detail">{gpu_temp}°C</div>
             </div>
             
             <!-- VRAM Stat Block -->
