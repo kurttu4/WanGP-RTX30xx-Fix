@@ -22,7 +22,7 @@
     gap: calc(4px * var(--progress-scale));
     align-items: center;
     box-sizing: border-box;
-    height: calc(88px * var(--progress-scale));
+    height: calc(100px * var(--progress-scale));
     padding: calc(8px * var(--progress-scale)) calc(12px * var(--progress-scale));
     overflow: hidden;
     border: var(--block-border-width) solid var(--block-border-color);
@@ -41,7 +41,7 @@
 .wangp-progress .progress-caption { grid-column: 2; display: flex; justify-content: center; min-width: 0; }
 .wangp-progress .progress-timing { grid-column: 3; overflow: hidden; text-overflow: ellipsis; text-align: right; font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
 .wangp-progress .progress-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.wangp-progress .progress-model { grid-column: 1; width: max-content; min-width: 0; height: 1.3em; overflow: hidden; white-space: normal; font-size: .9em; font-weight: 700; }
+.wangp-progress .progress-model { grid-column: 1; width: max-content; min-width: 0; height: 2em; overflow: hidden; white-space: normal; font-size: .9em; font-weight: 700; }
 /* Hide whole words beyond the first line; only an oversized word needs ellipsis. */
 .wangp-progress .progress-model > span { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: top; }
 /* Equal side tracks center short captions; label widths constrain longer ones. */
