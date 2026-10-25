@@ -202,10 +202,15 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
             attn_implementation="sdpa",
             variant=qwen35_variant,
             speculative_decoding=speculative_decoding,
-            kv_cache_int8=deepy_kv_cache_quantization == "int8",
+            kv_cache_int8=deepy_kv_cache_quantization != "",
+            kv_cache_layout=deepy_kv_cache_quantization,
         )
         if speculative_tokens is not None:
             speculative_tokens = min(speculative_tokens, getattr(runtime.llm_model, "_block_draft_max_tokens", speculative_tokens))
+            if backend == enhancer_quantization_GGUF:
+                # 8 drafts verify 9 rows, beyond the 2-8 row GGUF decode kernels: the verification falls to MMQ (36.5 ms a pass instead
+                # of 26 for 4 drafts on an RTX 4090, Qwen3.8 27B Q4_K_M) for no more emitted tokens
+                speculative_tokens = min(speculative_tokens, 7)
             runtime.llm_model._prompt_enhancer_speculative_tokens = speculative_tokens
             runtime.llm_model._prompt_enhancer_speculative_sampling_tokens = speculative_tokens
         runtime.llm_tokenizer = getattr(runtime.llm_model, "_prompt_enhancer_tokenizer", None)

@@ -49,6 +49,8 @@ from .qwen35_vl import (
 QWEN35_LLM_DISABLE_ENV = "WGP_LLM_DISABLE"
 QWEN35_LLM_PLANNED_CONTEXT = 32768  # tokens of KV cache planned beside the LLM's weights (MMGP cpuCompute pinning share)
 QWEN35_LLM_MAX_PRELOAD_MB = 0  # tests of partial residency: most VRAM the LLM's weights may keep (base, blocks, slots of the streamed ones); 0: all that fit
+# Prototype: the input token table (not tied to the head) pinned in RAM and read by the GPU over the bus, out of VRAM (see _map_qwen35_token_table)
+QWEN35_LLM_MAPPED_TOKEN_TABLE = False
 
 QWEN35_GGUF_LLAMACPP_ENV = "WGP_GGUF_LLAMACPP_CUDA"
 QWEN35_PROMPT_MIN_NEW_TOKENS = 4
@@ -129,6 +131,44 @@ def _resolve_gguf_linear_attention_layout_from_filename(model_path: str) -> tupl
     return False, False, True
 
 
+class _HostMapping:
+    """A pinned CPU tensor seen as CUDA memory: with unified addressing its host address is a device address (zero-copy reads)."""
+
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
+        self.__cuda_array_interface__ = dict(shape=(tensor.numel() * tensor.element_size(),), typestr="|u1", data=(tensor.data_ptr(), False), version=3)
+
+
+def _host_mapped(tensor: torch.Tensor) -> torch.Tensor:
+    pinned = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+    pinned.copy_(tensor.as_subclass(torch.Tensor))
+    return torch.as_tensor(_HostMapping(pinned), device=torch.device("cuda", torch.cuda.current_device())).view(tensor.dtype).view(tensor.shape)
+
+
+def _map_qwen35_token_table(model) -> None:
+    """The input token table (and the MTP drafter's alias of it) pinned in RAM and read by the GPU in place: the lookups, inside the engine's
+    graphs and with token ids sampled on the GPU too, gather their packed rows over the bus and dequantize them with the same kernels, bit for
+    bit. Held outside the modules' parameters, MMGP neither moves it to VRAM nor counts it in budgets; the engine registers it as graph state.
+    A head tied to the table reads all of it at each pass: it stays with MMGP."""
+    weight = model.token_embd.weight
+    data_ptr = lambda tensor: (tensor._data if isinstance(tensor, GGUFWeightTensor) else tensor).data_ptr()
+    if data_ptr(model.output.weight) == data_ptr(weight):
+        return
+    modules = [model.token_embd] + ([model.mtp.embed_tokens] if model.mtp is not None else [])
+    if any(data_ptr(module.weight) != data_ptr(weight) for module in modules):
+        raise RuntimeError("The MTP token table is not the target's.")
+    if isinstance(weight, GGUFWeightTensor):
+        weight._data = _host_mapped(weight._data)
+    elif type(weight.data) is torch.Tensor:
+        weight = _host_mapped(weight.data)
+    else:  # other quantized tables (Quanto) keep the GPU path of their qtype
+        return
+    for module in modules:
+        del module._parameters["weight"]
+        module.__dict__["weight"] = weight
+    model._lm_engine_token_table_mapped = True
+
+
 def _load_text_config(config_path: str) -> Qwen3_5TextConfig:
     with open(config_path, "r", encoding="utf-8") as reader:
         config = json.load(reader)
@@ -194,7 +234,14 @@ def _normalize_generated_text(text: str, *, keep_trailing_newlines: bool = False
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+    lines, fence = [], ""
+    for line in text.split("\n"):
+        marker = re.match(r" {0,3}(`{3,}|~{3,})", line)
+        if fence and not (marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence) and not line.strip().strip(fence[0])):
+            lines.append(line)  # code keeps its indentation and spacing
+            continue
+        fence = "" if fence else (marker.group(1) if marker else "")
+        lines.append(re.sub(r"[ \t]+", " ", line).strip())
     text = "\n".join(lines)
     return text.lstrip() if keep_trailing_newlines else text.strip()
 
@@ -647,13 +694,17 @@ def _qwen35_preload_workload(args, kwargs) -> str:
     return "decode" if hidden_states.shape[-2] <= 64 else "prefill"
 
 
-def _describe_llm_features(features: dict, kv_cache_int8: bool, speculative: str) -> str:
+def _describe_llm_features(features: dict, kv_cache_int8: bool, speculative: str, kv_cache_layout: str = "int8") -> str:
     def item(name, used, reason=""):
         return name if used else f"no {name} ({reason})"
     parts = [item("CUDA graphs", features["graphs"], features["graphs_reason"]),
              item("Triton fused kernels", features["triton"], features["triton_reason"])]
     if kv_cache_int8:
-        parts.append("INT8 KV cache" + (" (Triton paged attention)" if features["triton"] else " (dequantized attention)"))
+        from shared.deepy.config import describe_deepy_kv_cache_quantization
+        from shared.llm_engines.lmgp.layers.kv_formats import parse_layout
+        layout = parse_layout(kv_cache_layout or "int8")
+        exact = f" with INT8 sink and last {layout.recent_tokens} tokens" if layout.overlay else ""
+        parts.append(f"{describe_deepy_kv_cache_quantization(layout.value)} KV cache{exact}" + (" (Triton paged attention)" if features["triton"] else " (dequantized attention)"))
     else:
         parts.append(item("FlashAttention 2", features["flash"], features["flash_reason"]))
     if features["gguf"]:
@@ -718,6 +769,7 @@ def _get_or_create_vllm_engine(model, usage_mode: str | None = None):
         enforce_eager=not enable_cudagraph,
         graph_pool_handle=graph_pool_handle,
         kv_cache_int8=bool(getattr(model, "_deepy_kv_cache_int8", False)),
+        kv_cache_layout=str(getattr(model, "_deepy_kv_cache_layout", "") or "int8"),
     )
     model._prompt_enhancer_vllm_engine = engine
     model._prompt_enhancer_vllm_mode = usage_mode
@@ -1180,6 +1232,7 @@ def load_qwen35_text_prompt_enhancer(
     variant: str | None = None,
     speculative_decoding: bool = QWEN35_PROMPT_ENABLE_SPECULATIVE_DECODING,
     kv_cache_int8: bool = False,
+    kv_cache_layout: str = "int8",
 ):
     del attn_implementation
     if assets_dir is None:
@@ -1340,6 +1393,7 @@ def load_qwen35_text_prompt_enhancer(
     model._prompt_enhancer_speculative_decoding = enable_mtp
     model._prompt_enhancer_speculative_method_logged = False
     model._deepy_kv_cache_int8 = bool(kv_cache_int8)
+    model._deepy_kv_cache_layout = str(kv_cache_layout or "int8") if kv_cache_int8 else ""
     model._prompt_enhancer_speculative_tokens = spec.get("mtp_speculative_tokens", QWEN35_PROMPT_SPECULATIVE_TOKENS)
     model._prompt_enhancer_speculative_sampling_tokens = spec.get("mtp_speculative_sampling_tokens", QWEN35_PROMPT_SPECULATIVE_SAMPLING_TOKENS)
     model._prompt_enhancer_speculative_confidence = spec.get("mtp_speculative_confidence", 0.30)
@@ -1351,14 +1405,22 @@ def load_qwen35_text_prompt_enhancer(
     # MMGP manages the weights: its graphs replay the decoding passes, its dynamic preload keeps in VRAM all the blocks that fit beside the
     # KV cache and the activations (all of them at first: without its VRAM allocator, the budgets of the profile apply)
     model._lm_engine_mmgp_graphs = features["graphs"]
+    if QWEN35_LLM_MAPPED_TOKEN_TABLE and features["cuda"]:
+        _map_qwen35_token_table(model)
     from mmgp import allocator
     if allocator.active == "vmm":
         model._budget = 2 * os.path.getsize(model_path)  # beyond the model: every block preloaded
     # MMGP cpuCompute (decoding computes the blocks out of VRAM on the CPU): what the runtime needs beside the weights, for its pinning share
     config = model.config
     layers = sum(layer_type == "full_attention" for layer_type in config.layer_types)
-    kv_bytes = layers * 2 * int(config.num_key_value_heads) * int(getattr(config, "head_dim", int(config.hidden_size) // int(config.num_attention_heads)))
-    model._mm_cpu_compute_reserve = kv_bytes * (1 if kv_cache_int8 else 2) * QWEN35_LLM_PLANNED_CONTEXT + (2 << 30)  # KV cache, activations, vision tower
+    kv_heads, head_dim = int(config.num_key_value_heads), int(getattr(config, "head_dim", int(config.hidden_size) // int(config.num_attention_heads)))
+    if kv_cache_int8:
+        from shared.llm_engines.lmgp.layers.kv_formats import parse_layout
+        layout = parse_layout(model._deepy_kv_cache_layout)
+        kv_bytes = layout.body_bytes_per_token(layers, kv_heads, head_dim) * QWEN35_LLM_PLANNED_CONTEXT + layout.overlay_bytes(layers, kv_heads, head_dim, 256, 1)
+    else:
+        kv_bytes = layers * 2 * kv_heads * head_dim * 2 * QWEN35_LLM_PLANNED_CONTEXT
+    model._mm_cpu_compute_reserve = kv_bytes + (2 << 30)  # KV cache, activations, vision tower
     if QWEN35_LLM_MAX_PRELOAD_MB:
         model._budget = model._auto_preload_max = QWEN35_LLM_MAX_PRELOAD_MB << 20
     model._mm_graph_keys = 32  # its decoding passes: one token, then 2 to 9 for the speculative verifications
@@ -1369,7 +1431,7 @@ def load_qwen35_text_prompt_enhancer(
         block._mm_graph_keys = 32
     reset_attention_backend_logs()
     speculative = f"{block_draft_method} drafts" if block_draft_method else ("native MTP" if enable_mtp else "")
-    print(f"[Qwen3.5VL][{spec['display_name']}] LLM engine: {_describe_llm_features(features, kv_cache_int8, speculative)}")
+    print(f"[Qwen3.5VL][{spec['display_name']}] LLM engine: {_describe_llm_features(features, kv_cache_int8, speculative, model._deepy_kv_cache_layout)}")
     model.generate_messages = types.MethodType(_generate_messages, model)
     model.unload = types.MethodType(_unload_prompt_enhancer_text_runtime, model)
     model._offload_hooks = ["forward"]

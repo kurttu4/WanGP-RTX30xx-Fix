@@ -72,7 +72,9 @@ def supported(q, k, v, cos, sin):
 
 
 def apply_rope_cache(q, k, v, cos, sin, attention, slots):
-    write_cache = attention.k_cache.numel() > 0 and attention.v_cache.numel() > 0 and slots is not None
+    layout = getattr(attention, "kv_layout", None)
+    # the fused write knows the BF16 and Q8 caches; a mixed-precision body (kv_formats) is written by the attention's own store
+    write_cache = attention.k_cache.numel() > 0 and attention.v_cache.numel() > 0 and slots is not None and not (layout is not None and layout.mixed)
     _rope_cache_kernel[(q.shape[0] * q.shape[1], q.shape[2] + k.shape[2])](
         q, k, v, cos, sin, attention.k_cache, attention.v_cache, attention.k_scale, attention.v_scale, slots,
         q.shape[1], q.shape[2], k.shape[2], q.shape[3], cos.shape[-1],

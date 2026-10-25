@@ -1445,7 +1445,9 @@ class Qwen3_5Block(nn.Module):
         hidden_states = None
         gate_up_list = [gate_up]
         gate_up = None
-        if self.mlp_act_fn.use_triton and getattr(self.ffn_down, "_fuse_silu_mul", False) and gate_up_list[0].numel() == gate_up_list[0].shape[-1]:
+        # Decode and speculative verification (up to 8 rows): the package quantizes silu(gate) * up itself, same arithmetic as the
+        # Triton kernel (round the SiLU, round the product, then Q8), one launch and a BF16 round trip fewer per layer.
+        if self.mlp_act_fn.use_triton and getattr(self.ffn_down, "_fuse_silu_mul", False) and gate_up_list[0].numel() <= 8 * gate_up_list[0].shape[-1]:
             hidden_states = self.ffn_down(gate_up_list)
         else:
             hidden_states = self.ffn_down(self.mlp_act_fn.forward_list(gate_up_list))

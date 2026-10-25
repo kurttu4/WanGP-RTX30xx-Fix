@@ -1,5 +1,5 @@
 # Copyright (c) 2024-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-# ------------------ Memory Management 4.2.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 4.3.0 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -67,6 +67,7 @@ import inspect
 import psutil
 import builtins
 import math
+import re
 import fnmatch
 import traceback
 from contextlib import contextmanager
@@ -86,7 +87,7 @@ import inspect
 
 from mmgp import safetensors2, runtime, row_views
 from .read_ahead import MAX_RANGES, COLD_PIECE, cold_ranges, prefetch_ranges
-from mmgp import profile_type
+from mmgp import __version__, profile_type
 from .quant_router import (
     apply_pre_quantization,
     cache_quantization_for_file,
@@ -193,11 +194,6 @@ _pinned_bytes_lock = threading.Lock()
 _failed_host_registrations = {} # keep backing allocations alive after an unregister/synchronization failure
 
 physical_memory= psutil.virtual_memory().total
-
-HEADER = '\033[95m'
-ENDC = '\033[0m'
-BOLD ='\033[1m'
-UNBOLD ='\033[0m'
 
 class clock:
     def __init__(self):
@@ -595,6 +591,22 @@ if not hasattr(QTensor, "get_quantized_subtensors"):
 if not hasattr(QTensor, "set_quantized_subtensors"):
     QTensor.set_quantized_subtensors = _qtensor_set_quantized_subtensors
 
+def _cpu_modules(model):
+    # The modules kept in RAM: those computed on the CPU (runtime.lookup_on_cpu) whose tensors are plain, a quantized table keeping the
+    # GPU path of its qtype, whose kernels and rotations need not run on the CPU; and those that never run (runtime.unused). A tensor they
+    # share with a module computed on the GPU would be moved there by its loads: an error, not a silent table in VRAM or a head run on the CPU.
+    plain = lambda tensor: type(tensor.data) is torch.Tensor
+    names = tuple(name for name, module in model.named_modules() if getattr(module, "_mm_unused", False)
+                  or getattr(module, "_mm_on_cpu", False) and builtins.all(map(plain, itertools.chain(module.parameters(), module.buffers()))))
+    if not names:
+        return names
+    cpu_objects = {id(module) for name in names for module in model.get_submodule(name).modules()}
+    shared = {p.data_ptr() for name in names for p in model.get_submodule(name).parameters() if p.numel()}
+    tied = [name for name, module in model.named_modules() if id(module) not in cpu_objects and any(plain(p) and p.data_ptr() in shared for p in module.parameters(recurse=False))]
+    if tied:
+        raise ValueError(f"Module(s) {tied} share the weights of a module kept in RAM: mark them with runtime.lookup_on_cpu or runtime.unused as well")
+    return names
+
 def _get_quantized_subtensors(p):
     getter = getattr(p, "get_quantized_subtensors", None)
     if getter is None:
@@ -894,6 +906,8 @@ CPU_COMPUTE_RECHECK = 256 # cpuCompute: short calls after which a settled choice
 BASE_SMALL_MODULE_SIZE = STAGING_MIN_SIZE # modules of the blocks of the towers with fewer bytes of their own join the base of their model (0: none)
 BASE_SMALL_MODULES_SHARE = 0.05 # unless they weigh more than this share of the towers
 BASE_BLOCKS_OUTSIDE_TOWERS = False # in a model with main towers, the blocks outside them (a Sequential, a list of fewer layers than a tower) join its base
+COVERING_BUDGET_BLOCKS = True # a budget covering a model with towers preloads every block, released under pressure (False: loaded whole, as a budget of 0)
+PRELOAD_BLOCKS_OUTSIDE_TOWERS = True # a fixed budget preloads the blocks outside the towers first, as the dynamic preload ranks them (False: streamed at every pass)
 _pcie_bytes_per_second = None
 
 
@@ -1037,6 +1051,58 @@ def _copy_runs(base, runs, helpers):
         for future in futures:
             future.result()
 
+PRELOAD_PRIORITY = ("transformer", "transformer2") # the co-tenants that take the VRAM preload first (then the others in their order)
+
+
+def _cotenant_groups(model_ids, cotenants):
+    """The groups of models kept in VRAM together: the maximal sets whose models are all co-tenants of each other (both ways; a model that
+    may stay beside any other, "*", joins none), of two models or more."""
+    friends = {a: {b for b in model_ids if b != a and isinstance(cotenants.get(a), (list, tuple)) and b in cotenants[a]
+                   and isinstance(cotenants.get(b), (list, tuple)) and a in cotenants[b]} for a in model_ids}
+    groups = []
+
+    def extend(group, candidates, excluded): # Bron-Kerbosch: a handful of models
+        if not candidates and not excluded:
+            if len(group) > 1:
+                groups.append(group)
+            return
+        for model_id in list(candidates):
+            extend(group | {model_id}, candidates & friends[model_id], excluded & friends[model_id])
+            candidates = candidates - {model_id}
+            excluded = excluded | {model_id}
+
+    extend(set(), set(model_ids), set())
+    return groups
+
+
+def _preload_floors(model_ids, sizes, requested, preload, cotenants, priority):
+    """The budget of each model once the VRAM preload applies (bytes; 0: the whole model). A model alone gets the larger of its budget
+    and the preload (0 stays 0). The models of a group kept in VRAM together (_cotenant_groups) share the preload as a total instead: each
+    keeps its own budget, and what the preload leaves beyond those goes to them in priority order (priority, else PRELOAD_PRIORITY, then
+    their order), each up to its size; the first one also gets what remains beyond its size (every block preloaded: room for state kept
+    in VRAM, mmgp.state_ring). A model in several groups gets the smallest of its shares."""
+    floors = {model_id: requested[model_id] if requested[model_id] == 0 or preload == 0 else max(requested[model_id], preload) for model_id in model_ids}
+    if preload == 0:
+        return floors
+    order = list(priority or PRELOAD_PRIORITY)
+    shares = {}
+    for group in _cotenant_groups(model_ids, cotenants):
+        members = sorted(group, key=lambda model_id: (order.index(model_id) if model_id in order else len(order), model_ids.index(model_id)))
+        held = {model_id: sizes[model_id] if requested[model_id] == 0 else min(requested[model_id], sizes[model_id]) for model_id in members}
+        remaining = preload - builtins.sum(held.values())
+        for model_id in members:
+            extra = max(0, min(remaining, sizes[model_id] - held[model_id]))
+            held[model_id] += extra
+            remaining -= extra
+        if remaining > 0:
+            held[members[0]] += remaining
+        for model_id in members:
+            shares[model_id] = min(shares.get(model_id, held[model_id]), held[model_id])
+    for model_id, share in shares.items():
+        floors[model_id] = 0 if requested[model_id] == 0 else max(requested[model_id], share)
+    return floors
+
+
 def _spread(entries, ratio):
     # an even share of each run of numbered blocks: the n-th block of a run is kept iff int((n + 1) * ratio) > int(n * ratio)
     runs = {}
@@ -1116,18 +1182,29 @@ class _StagingRing:
                     finally:
                         self.cond.acquire()
 
-    def _stage(self, items, layout, pooled=None):
+    def _stage(self, items, layout, pooled=None, state=()):
         if pooled is not None and pooled.result():
             return None, items, layout # it entered the pinned pool instead, its transfers read it there
-        runs, _, nbytes = layout
+        nbytes = 0 if layout is None else layout[2]
+        # the pageable state records attached to the block (mmgp.state_ring) follow its parameters in its region: region[3] says where
+        runs = []
+        for ring, block, source, generation in state:
+            runs.append((source.data_ptr(), source.numel(), -(-nbytes // BLOCK_ALIGN) * BLOCK_ALIGN, (ring, block, generation)))
+            nbytes = runs[-1][2] + source.numel()
         region = self._reserve(nbytes)
-        _copy_runs(self.buffer.data_ptr() + region[0], runs, self.helpers)
+        if layout is not None:
+            _copy_runs(self.buffer.data_ptr() + region[0], layout[0], self.helpers)
+        if runs:
+            _copy_runs(self.buffer.data_ptr() + region[0], runs, self.helpers)
+            region.append([(ring, block, generation, offset, size) for _, size, offset, (ring, block, generation) in runs])
         return region, items, layout
 
-    def schedule(self, entry_name, items, layout, pooled=None):
-        # pooled: the future of the block's entry into the pinned pool, which replaces its copy into the ring (made if it could not enter)
+    def schedule(self, entry_name, items, layout, pooled=None, state=()):
+        # pooled: the future of the block's entry into the pinned pool, which replaces its copy into the ring (made if it could not enter);
+        # state: the pageable state records attached to the block, staged after its parameters (layout None: the state alone, its
+        # parameters being pinned)
         if entry_name not in self.jobs:
-            self.jobs[entry_name] = self.copier.submit(self._stage, items, layout, pooled)
+            self.jobs[entry_name] = self.copier.submit(self._stage, items, layout, pooled, state)
 
     def take(self, entry_name):
         # the region (None for a block now in the pinned pool), parameters and layout of a block about to be transferred, None if it was not
@@ -1886,15 +1963,6 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
 
 
     return 
-welcome_displayed = False
-
-def _welcome():
-    global welcome_displayed
-    if welcome_displayed:
-         return 
-    welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 4.2.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
-
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
         if hasattr(submodule, "_lock_dtype"):
@@ -2436,7 +2504,23 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
         fail = False
         skip = False
         tied_weights = None
-        state_dict = safetensors2.torch_load_file(path, writable_tensors= False)
+        state_dict, metadata = _safetensors_load_file(path, writable_tensors=False)
+        if metadata is not None and "alpha" in metadata:
+            try:
+                header_alpha = float(metadata["alpha"])
+                if not math.isfinite(header_alpha):
+                    raise ValueError("Non-finite alpha")
+            except (TypeError, ValueError, OverflowError):
+                tqdm.write(f"Ignoring invalid LoRA header alpha in '{path}'.")
+            else:
+                # Preprocessors may fuse projections and bake alpha into their factors.
+                # Supply missing scalars first, preserving explicit per-module values.
+                for key in list(state_dict):
+                    match = re.fullmatch(r"(.*)\.lora[._](?:[AB]|down|up)(?:(?:\.[^.]+)?\.weight)?", key)
+                    if match is not None:
+                        alpha_key = match[1] + ".alpha"
+                        if alpha_key not in state_dict:
+                            state_dict[alpha_key] = torch.tensor(header_alpha, dtype=torch.float64, device="cpu")
         if preprocess_sd != None:
             state_dict = preprocess_sd(state_dict)
 
@@ -3760,6 +3844,9 @@ class offload:
         self.max_reservable_memory = 0
         self.stager = _PinnedStager()
         self.staged_entries = {}
+        self.state_records = {} # block entry -> [(state ring, block index)]: pageable state records staged in the ring with the block (mmgp.state_ring)
+        self.state_rings = weakref.WeakSet() # the state rings that may keep state in VRAM (made with resident=True)
+        self.state_rooms = {} # model id -> VRAM its budget leaves beyond the blocks it preloads (tune_preloading): room for state kept in VRAM
         self.prefetch_executor = None
         self.prefetch_futures = {}
         self.main_waiting = False
@@ -3874,6 +3961,31 @@ class offload:
             needs = self.staged_entries[entry_name] = builtins.any(tied_param is None and _pageable_nbytes(p) >= STAGING_MIN_SIZE for _, _, p, _, tied_param in self.blocks_of_modules[entry_name])
         return needs
 
+    def state_room(self, model_id):
+        # the VRAM the model's preload leaves to the state its rings keep in VRAM (mmgp.state_ring), weights first: with a dynamic preload,
+        # what its plan leaves once every block is kept (nothing until measured, or while blocks stream); with a budget, what it leaves beyond
+        # the blocks it preloads; nothing without a preload
+        plan = self.auto_preload.plans.get(model_id) if self.auto_preload is not None else None
+        return plan.state_room if plan is not None else self.state_rooms.get(model_id, 0)
+
+    def state_bytes(self, model_id):
+        # the VRAM of the state the model's rings keep in VRAM: counted with its weights by the dynamic preload
+        return builtins.sum(ring.resident_bytes for ring in self.state_rings if ring.model_id == model_id)
+
+    def state_changed(self, model_id):
+        # the state the model's rings keep in VRAM changed: the dynamic preload's cycle running does not measure the activations
+        if self.auto_preload is not None:
+            self.auto_preload.on_state_change(model_id)
+
+    def state_pressure(self, model_id, released):
+        # the state the model's rings kept in VRAM was released under VRAM pressure: the room of the next plans shrinks by as much (the
+        # dynamic preload's state penalty of the workload; a budget's room, until the model is profiled again), not the weights' room
+        plan = self.auto_preload.plans.get(model_id) if self.auto_preload is not None else None
+        if plan is not None:
+            self.auto_preload.on_state_pressure(plan, released)
+        else:
+            self.state_rooms[model_id] = max(0, self.state_rooms.get(model_id, 0) - released)
+
     def model_prefetch_window(self, model_id):
         # pipelining applies to the models with pinned blocks or a staging ring for the others (without a ring, the blocks of a partially
         # pinned model that are not pinned are staged by the prefetch thread); one block ahead takes no more VRAM than the shuttle
@@ -3951,7 +4063,7 @@ class offload:
         staged = None if self.ring is None else self.ring.take(entry_name)
         if staged is not None and staged[0] is None: # it entered the pinned pool: moved from there
             staged = None
-        moved = self._move_block(stream, entry_name, staged)
+        moved = self._move_block(stream, entry_name, staged if staged is not None and staged[1] else None) # no items: its state alone was staged
         if moved is None and self.ring is None and stream is self.transfer_stream and self.needs_staging(entry_name):
             blocks_params = self.blocks_of_modules[entry_name]
             def staged_transfer():
@@ -3962,6 +4074,9 @@ class offload:
         cpu_to_gpu(stream, self.blocks_of_modules[entry_name], moved=moved)
         if staged is None:
             return stream.record_event()
+        region = staged[0]
+        for ring, block, generation, offset, size in region[3] if len(region) > 3 else (): # the block's staged state into its slots
+            ring.transfer_staged(block, generation, self.ring.buffer[region[0] + offset:region[0] + offset + size], stream)
         event = torch.cuda.Event(blocking=True) # the copier thread sleeps while it waits for the region to be free
         event.record(stream)
         self.ring.release(staged[0], event)
@@ -4087,13 +4202,22 @@ class offload:
             seen.add(entry)
             if entry not in self.inflight:
                 items, layout, sources = self._block_items(entry)
+                # the pageable state attached to the block (mmgp.state_ring) is staged with it, or alone for a block whose parameters are pinned
+                state = [(ring, block, ring.records[block][0], ring.generation) for ring, block in self.state_records.get(entry, ()) if block in ring.stored]
+                state_bytes = builtins.sum(-(-source.numel() // BLOCK_ALIGN) * BLOCK_ALIGN for _, _, source, _ in state)
                 if items and sources is None and entry in wanted and not _pool.pending:
                     self.ring.schedule(entry, items, layout, _pool.prepare(self, model_id, entry, self._pool_plan(entry)))
                 elif items and sources is None and layout[2] <= self.ring.size:
-                    budget -= layout[2]
+                    state = state if layout[2] + state_bytes <= self.ring.size else ()
+                    budget -= layout[2] + (state_bytes if state else 0)
                     if budget < 0:
                         break
-                    self.ring.schedule(entry, items, layout)
+                    self.ring.schedule(entry, items, layout, state=state)
+                elif state and state_bytes <= self.ring.size:
+                    budget -= state_bytes
+                    if budget < 0:
+                        break
+                    self.ring.schedule(entry, [], None, state=state)
             entry = self.next_blocks_names.get(entry, None)
 
     def _pool_ranked(self, model_id):
@@ -4643,6 +4767,9 @@ class offload:
     def unload_all(self, *, keep=()):
         self.wait_prefetch()
         torch.cuda.synchronize() # blocks may still be read or written by queued work
+        for ring in list(self.state_rings): # the state kept in VRAM leaves with the weights of its model (streamed from RAM when it comes back)
+            if ring.model_id in self.active_models_ids and ring.model_id not in keep:
+                ring.drop_resident()
         for model_id, residency in self.expert_residency.items():
             if model_id not in keep:
                 residency.unload()
@@ -5441,6 +5568,22 @@ def {fname}(module, *args, **kwargs):
         # target_module.register_forward_pre_hook(check_empty_cuda_cache)
 
         
+    def hook_cpu_module(self, module):
+        """A module marked by runtime.lookup_on_cpu: its forward runs on the CPU (tensor inputs copied there, blocking) and its tensor output goes
+        to the execution device. One marked by runtime.unused raises if it runs."""
+        if hasattr(module, "_mm_cpu_forward"):
+            return
+        previous = module._mm_cpu_forward = module.forward
+        to_cpu = lambda value: value.to("cpu") if torch.is_tensor(value) else value
+
+        def forward(*args, **kwargs):
+            if getattr(module, "_mm_unused", False):
+                raise RuntimeError(f"{type(module).__name__} was marked by runtime.unused as never running: its weights are not loaded to the GPU")
+            out = previous(*[to_cpu(arg) for arg in args], **{key: to_cpu(value) for key, value in kwargs.items()})
+            return out.to(torch.device("cuda", torch.cuda.current_device()))
+
+        module.forward = functools.update_wrapper(forward, previous)
+
     def hook_change_module(self, target_module, model, model_id, module_id, previous_method, previous_method_name ):
         if hasattr(target_module, "_lock_dtype"):
             dtype = target_module._lock_dtype 
@@ -5470,7 +5613,8 @@ def {fname}(module, *args, **kwargs):
 
 
 
-    def tune_preloading(self, model_id, current_budget, towers_names):
+    def tune_preloading(self, model_id, current_budget, towers_names, covers=False):
+        # covers: the budget covers the model (by its size): every block is preloaded
         preloaded_blocks = {}
         preload_total = 0
         max_blocks_fetch = 0
@@ -5512,7 +5656,27 @@ def {fname}(module, *args, **kwargs):
         if window is None:
             window = 2 if builtins.sum(preload_counts(current_budget - 3 * largest)) > 0 else 1
         self.planned_windows[model_id] = window
-        counts = preload_counts(current_budget - (window + 1) * largest)
+        # the other blocks of the model (a Sequential, a list of fewer layers than a tower: refiners, embeddings, heads), but those it loads
+        # only while they run: each runs at every pass as a block of the towers does, and keeping it frees no slot. Preloaded first, as the
+        # dynamic preload ranks them: the longest run of them that the budget holds beside the shuttle, then the blocks of the towers. A budget
+        # covering the model preloads every block (no shuttle until the VRAM pressure releases some)
+        separate = tuple(model_id + "/" + name for name in getattr(self.models[model_id], "_offload_separate_blocks", ()))
+        others = [(name, size) for name, size in self.blocks_of_modules_sizes.items() if size and name.startswith(model_id + "/")
+                  and not name.startswith(tuple(model_id + "/" + tower_name for tower_name in towers_names)) and not name.startswith(separate)]
+        if covers or current_budget >= total_size + builtins.sum(size for _, size in others):
+            counts = [len(floors) for floors, _, _ in towers]
+        else:
+            room, kept = current_budget - (window + 1) * largest, 0
+            while PRELOAD_BLOCKS_OUTSIDE_TOWERS and kept < len(others) and others[kept][1] <= room:
+                room -= others[kept][1]
+                kept += 1
+            others, counts = others[:kept], preload_counts(room)
+        for name, size in others:
+            self.next_blocks_names[name] = None
+            self.prev_blocks_names[name] = None
+            preloaded_blocks[name[len(model_id) + 1:]] = size
+            preload_total += size
+        others_total = preload_total
 
         for (floors, max_floor_size, tower_size), preload_blocks_count in zip(towers, counts):
             max_blocks_fetch = max(max_floor_size, max_blocks_fetch)
@@ -5550,13 +5714,19 @@ def {fname}(module, *args, **kwargs):
             else:
                 self.next_blocks_names[prev_non_preloaded] = None
 
+        towers_total = preload_total - others_total
+        for entry, target in self.next_blocks_names.items(): # no link towards a preloaded block: it would be transferred again while it runs
+            if target is not None and target.startswith(model_id + "/") and target[len(model_id) + 1:] in preloaded_blocks:
+                self.next_blocks_names[entry] = None
         self.preloaded_blocks_per_model[model_id] = preloaded_blocks
+        # what the budget leaves beyond the base, the preloaded blocks and the shuttle of the streamed ones: room for state kept in VRAM
+        self.state_rooms[model_id] = max(0, current_budget - preload_total - (0 if towers_total == total_size else (window + 1) * largest))
 
         if self.verboseLevel >=1:
             if preload_total == 0:
                 print(f"Async loading plan for model '{model_id}' : base size of {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + f" shuttle, prefetch window {window}")
             else:
-                print(f"Async loading plan for model '{model_id}' : {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded (base size of {base_size/ONE_MB:0.2f} MB + {preload_total/total_size*100:0.1f}% of recurrent layers data) with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + f" shuttle, prefetch window {window}")
+                print(f"Async loading plan for model '{model_id}' : {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded (base size of {base_size/ONE_MB:0.2f} MB + {towers_total/total_size*100:0.1f}% of recurrent layers data" + (f" + {others_total/ONE_MB:0.2f} MB of other blocks" if others_total else "") + f") with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + f" shuttle, prefetch window {window}")
 
     def release(self):
         global last_offload_obj, total_pinned_bytes
@@ -5667,7 +5837,7 @@ class LoadingCallback:
         self.check_abort()
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False, preloadPriority = None):
     """Configure offloading, optionally reporting phases and accepting cancellation."""
     global total_pinned_bytes, max_pinnable_bytes, last_offload_obj
     kwargs = locals().copy()
@@ -5688,16 +5858,21 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
         raise error from None
 
 
-def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False):
+def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False, preloadPriority = None):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
     pinnedMemory: move models in reserved memor. This allows very fast performance but requires 50% extra RAM (usually >=64 GB)
     extraModelsToQuantize: a list of models to be also quantized on the fly (e.g the text_encoder), useful to reduce bith RAM and VRAM consumption
     convertWeightsFloatTo: default dtype for remaining FP32 parameters. A model-level _convertWeightsFloatTo overrides it; None preserves FP32.
-    budgets: 0 by default (unlimited). If non 0, it corresponds to the maximum size in MB that every model will occupy at any moment
+    budgets: 0 by default (unlimited). If non 0, it corresponds to the maximum size in MB that every model will occupy at any moment.
+        0 loads a model whole; a budget at least its size preloads every block of its towers, which leave the VRAM under pressure as any
+        preload instead of spilling (a model without towers is loaded whole)
     minimumBudget: 0 by default (none). The least budget in MB of every model, also of those given one in budgets or by a _budget
-        attribute (in bytes): a smaller budget is raised to it, 0 (the whole model) stays. At most vram_safety_coefficient of the VRAM
+        attribute (in bytes): a smaller budget is raised to it, 0 (the whole model) stays. Models kept in VRAM together (co-tenants of
+        each other, coTenantsMap) share it as a total instead: each keeps its own budget, and what it leaves beyond those goes to them in
+        the order of preloadPriority (default: transformer, transformer2, then the others), each up to its size; what remains then is room
+        for state kept in VRAM (mmgp.state_ring). At most vram_safety_coefficient of the VRAM
     preloadExperts: with an explicit budget, use its remaining space for individual GPU experts after ordinary blocks. Dynamic
         preload applies the same priority independently. False keeps experts on CPU for fixed-budget execution. With pinnedMemory=True,
         the reserved RAM the models leave also holds pinned copies of the experts that can go to the GPU, most used first, so that
@@ -5778,7 +5953,7 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         else:
             budget = get_parsed_budget(budgets)
     minimum_budget = min(get_parsed_budget(minimumBudget), vram_safety_coefficient * self.device_mem_capacity)
-    raise_budget = lambda b: b if b == 0 else max(b, minimum_budget)
+    model_sizes = {} # model id -> bytes of its weights (beyond its expert copies): the co-tenants' shares of the preload need them all
 
     self.async_transfers = asyncTransfers
     self.prefetch_window = prefetchWindow
@@ -5812,7 +5987,6 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
     
     verboseLevel = _compute_verbose_level(verboseLevel)
 
-    _welcome()        
     if coTenantsMap != None:
         self.cotenants_map = coTenantsMap 
     if loras != None and isinstance(loras, str):
@@ -5874,6 +6048,7 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
     expert_exclusions = {model_id: experts.excluded_names(model) for model_id, model in models.items() if expert_banks[model_id]}
     expert_budgets = {}
     listed = {model_id: pinAllModels or model_id in modelsToPin for model_id in models} # the models to pin, as far as the reserved RAM allows
+    self.pinned_models = {model_id for model_id, pin in listed.items() if pin} | set(self.pool_models) # their state rings may lock RAM too
     if not asyncTransfers:
         smartPinning = None # the staging ring needs asynchronous transfers
     elif self.pool_models and smartPinning is None:
@@ -5899,14 +6074,16 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         # if model_dtype == None:
         #     model_dtype = getattr(current_model, "dtype", None)
         counted = set() # a tensor held by several parameters (e.g. an embedding shared by two heads) is counted once
-        for _ , m in current_model.named_modules():
+        cpu_modules = _cpu_modules(current_model)
+        for module_name, m in current_model.named_modules():
             ignore_dtype = hasattr(m, "_lock_dtype")
+            on_cpu = any(module_name == name or module_name.startswith(name + ".") for name in cpu_modules) # never in VRAM
             for n, p in m.named_parameters(recurse = False):
                 p.requires_grad = False
                 sub_tensors = _get_quantized_subtensors(p)
                 if sub_tensors:
                     ref = _get_tensor_ref(p)
-                    if ref not in counted:
+                    if ref not in counted and not on_cpu:
                         counted.add(ref)
                         current_model_size += _subtensors_nbytes(sub_tensors)
                     del sub_tensors
@@ -5924,20 +6101,30 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
                             if model_dtype != dtype:
                                 pass
                             assert model_dtype == dtype
-                    if p.data_ptr() not in counted: # after a conversion, which gives the parameter a copy of its own
+                    if p.data_ptr() not in counted and not on_cpu: # after a conversion, which gives the parameter a copy of its own
                         counted.add(p.data_ptr())
                         current_model_size +=  torch.numel(p.data) * p.data.element_size()
         if model_dtype is None:
             model_dtype = model_convertWeightsFloatTo if model_convertWeightsFloatTo is not None else torch.bfloat16
         current_model._dtype = model_dtype
+        cpu_buffers = {id(b) for name in cpu_modules for b in current_model.get_submodule(name).buffers()}
         for b in current_model.buffers():
             # do not convert 32 bits float to 16 bits since buffers are few (and potential gain low) and usually they are needed for precision calculation (for instance Rope)
-            current_model_size +=  torch.numel(b.data) * b.data.element_size()
+            if id(b) not in cpu_buffers:
+                current_model_size +=  torch.numel(b.data) * b.data.element_size()
 
         # Optional GPU expert copies have their own, lower-priority residency budget.
         current_model_size -= builtins.sum(bank.num_experts * bank.expert_nbytes for bank in expert_banks[model_id].values())
+        model_sizes[model_id] = current_model_size
 
-        model_budget = raise_budget(model_budgets[model_id] if model_id in model_budgets else budget)
+    # the VRAM preload: the least budget of each model (its own: budgets, or a _budget attribute in bytes), shared by the models kept in VRAM
+    # together
+    requested = {model_id: models[model_id]._budget if hasattr(models[model_id], "_budget") else model_budgets[model_id] if model_id in model_budgets else budget
+                 for model_id in models}
+    preload_floors = _preload_floors(list(models), model_sizes, requested, minimum_budget, self.cotenants_map, preloadPriority)
+    for model_id in models:
+        current_model_size = model_sizes[model_id]
+        model_budget = preload_floors[model_id]
         if workingVRAM != None:
             model_minimumVRAM = -1
             if isinstance(workingVRAM, dict):
@@ -5953,15 +6140,19 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
                 new_budget = 1 if new_budget  < 0 else new_budget
                 model_budget =  new_budget if model_budget == 0 or new_budget < model_budget else model_budget
         expert_budgets[model_id] = model_budget if preloadExperts else 0
-        if  model_budget > 0 and model_budget > current_model_size:
-            model_budget = 0
         coef =vram_safety_coefficient
+        self.state_rooms[model_id] = 0 # room for state kept in VRAM (mmgp.state_ring): what a budget leaves (here, or tune_preloading)
+        if  model_budget > 0 and current_model_size <= model_budget:
+            # the budget covers the model: every block preloaded, released under VRAM pressure as any preload (a model without towers is
+            # loaded whole); the rest, within the VRAM the models may use, is room for state (a model larger than that streams the rest)
+            model_budget = min(model_budget, coef * self.device_mem_capacity)
+            self.state_rooms[model_id] = max(0, model_budget - current_model_size)
         if current_model_size > coef * self.device_mem_capacity and model_budget == 0 or model_budget > coef * self.device_mem_capacity:
             if verboseLevel >= 1:
                 if model_budget == 0:
                     print(f"Model '{model_id}' is too large ({current_model_size/ONE_MB:0.1f} MB) to fit entirely in {coef * 100:.0f}% of the VRAM (max capacity is {coef * self.device_mem_capacity/ONE_MB:0.1f}) MB)")
                 else:
-                    print(f"Budget ({budget/ONE_MB:0.1f} MB) for Model '{model_id}' is too important so that this model can fit in the VRAM (max capacity is {self.device_mem_capacity/ONE_MB}) MB)")
+                    print(f"Budget ({model_budget/ONE_MB:0.1f} MB) for Model '{model_id}' is too important so that this model can fit in the VRAM (max capacity is {self.device_mem_capacity/ONE_MB}) MB)")
                 print(f"Budget allocation for this model has been consequently reduced to the {coef * 100:.0f}% of max GPU Memory ({coef * self.device_mem_capacity/ONE_MB:0.1f} MB). This may not leave enough working VRAM and you will probably need to define manually a lower budget for this model.")
                 model_budget = coef * self.device_mem_capacity 
                 
@@ -6003,7 +6194,10 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
             towers_set = set(towers_modules)
 
         loading_phase("Hooks and LoRA Slots", model_id)
-        current_budget = raise_budget(current_model._budget) if hasattr(current_model, "_budget") else model_budgets[model_id]
+        current_budget = model_budgets[model_id] # with the preload (its _budget attribute included)
+        covers = current_budget >= model_sizes[model_id] > 0
+        if covers and (not towers_names or not COVERING_BUDGET_BLOCKS):
+            current_budget = 0 # a budget covering a model without towers (or COVERING_BUDGET_BLOCKS off): loaded whole
         cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq, is_mod_seq = None, None, None, -1, False
         # BASE_BLOCKS_OUTSIDE_TOWERS: the blocks outside the main towers of a model that has some (a Sequential, a list of fewer layers than a
         # tower: embeddings, heads, refiners) join its base, loaded with the model rather than streamed at each pass
@@ -6017,9 +6211,20 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         modules_to_be_compiled, modules_names_to_be_compiled = [], []
         # modules that the model loads only while they run (e.g. an LLM's token embedding and output head, used for a prompt but not to denoise)
         separate_blocks = tuple(getattr(current_model, "_offload_separate_blocks", ())) if current_budget > 0 else ()
+        # modules computed on the CPU (runtime.lookup_on_cpu), whose weights never go to VRAM (e.g. a large token table looked up for a
+        # prompt: a row gather, the same values): outside the blocks and the base, never pinned nor counted in budgets
+        cpu_modules = _cpu_modules(current_model)
+        for name in cpu_modules: # the modules that hold one report the execution device, as the model does, not their table's
+            for depth in range(1, name.count(".") + 1):
+                current_model.get_submodule(name.rsplit(".", depth)[0])._force_device = "cuda"
         cpu_roots = set(towers_modules) if model_id in cpu_models and current_budget > 0 else set()
         for submodule_name, submodule in current_model.named_modules():
             if submodule_name in expert_exclusions.get(model_id, ()):
+                continue
+            cpu_module = next((name for name in cpu_modules if submodule_name == name or submodule_name.startswith(name + ".")), None)
+            if cpu_module is not None:
+                if submodule_name == cpu_module:
+                    self.hook_cpu_module(submodule)
                 continue
             # create a fake 'accelerate' parameter so that the _execution_device property returns always "cuda" 
             # (it is queried in many pipelines even if offloading is not properly implemented)  
@@ -6103,7 +6308,7 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
             self._small_modules_to_base(model_id, towers_names)
         if cpu_roots:
             self._split_cpu_compute(model_id, towers_names)
-        self.tune_preloading(model_id, current_budget, towers_names)
+        self.tune_preloading(model_id, current_budget, towers_names, covers)
         if self.preload_plans and current_budget > 0 and towers_names and self.async_transfers and not compilationInThisOne:
             (auto_models if self.auto_preload_requested else fixed_models).append(model_id)
         self.parameters_ref  = {} 
@@ -6202,7 +6407,8 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
         For instance set quantizeTransformer = False to disable transformer quantization which is by default in every profile
     """      
 
-    _welcome()
+    message = f" Applying MMGP Memory Profile {int(profile_no)} - {profile_type.tostr(profile_no)} (v{__version__}) "
+    tqdm.write(f"\033[1m\033[95m{message:*^100}\033[0m")
 
     verboseLevel = _compute_verbose_level(verboseLevel)
 

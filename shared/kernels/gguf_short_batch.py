@@ -13,6 +13,7 @@ are cached on disk per GPU, driver and package.
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -122,11 +123,11 @@ def _measure(native, qtype, shape, peers, x, dtype, warm_seconds=0.):
         graphs.clear()
 
 
-def _gguf_weights(model):
-    """Resident Q4_K/PTQ1_0 weights grouped by (device, qtype, shape), de-duplicated by storage."""
+def _gguf_weights(model, extra=()):
+    """Resident Q4_K/PTQ1_0 weights grouped by (device, qtype, shape), de-duplicated by storage; extra: weights held outside the parameters."""
     groups = {}
     for module in model.modules():
-        for tensor in module._parameters.values():
+        for tensor in (*module._parameters.values(), *(extra if module is model else ())):
             tensor_type, raw = getattr(tensor, "_tensor_type", None), getattr(tensor, "_data", None)
             if tensor_type is None or tensor_type.name not in QTYPES or not torch.is_tensor(raw) or not raw.is_cuda or not raw.is_contiguous():
                 continue
@@ -136,12 +137,15 @@ def _gguf_weights(model):
     return groups
 
 
-def prepare(model, native):
-    """Record short-batch kernel choices for the model's Q4_K/PTQ1_0 weights. Call before CUDA graph capture."""
+def prepare(model, native, extra=()):
+    """Record short-batch kernel choices for the model's Q4_K/PTQ1_0 weights. Call before CUDA graph capture. extra: weights the model holds
+    outside its parameters (a token table read in place from RAM), timed from temporary VRAM copies as when they were resident."""
     if native is None or not getattr(native, "has_short_batch_policy", lambda: False)() or native.short_batch_mode() != "auto":
         return
     measured, lines, started = 0, [], time.perf_counter()
-    for (device, qtype, shape), weights in _gguf_weights(model).items():
+    extra = [SimpleNamespace(_tensor_type=tensor._tensor_type, _data=tensor._data.clone(), _tensor_shape=tensor._tensor_shape, _gguf_default_dtype=tensor._gguf_default_dtype)
+             for tensor in extra if getattr(tensor, "_tensor_type", None) is not None]
+    for (device, qtype, shape), weights in _gguf_weights(model, extra).items():
         props = torch.cuda.get_device_properties(device)
         if props.major < 8:
             return

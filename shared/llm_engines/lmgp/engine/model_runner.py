@@ -3,10 +3,13 @@
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import gc
 import time
+import itertools
+import math
 import torch
 
 from ..config import Config
 from .sequence import Sequence
+from ..layers import kv_formats as kvf
 from .speculative_sampling import bounded_support, draft_probabilities
 from ..layers.sampler import Sampler, _REPETITION_INCREMENT_LIMIT, apply_min_p_mask_, apply_sparse_repetition_penalty_
 from ..utils.context import set_context, get_context, reset_context
@@ -31,6 +34,27 @@ def _state_tensors(value, depth=0):
     return [tensor for item in items for tensor in _state_tensors(item, depth + 1)]
 
 
+def _kv_page_tensors(runner) -> list[tuple[str, torch.Tensor, int]]:
+    """(attribute name, tensor, page axis) of the runner's paged cache tensors."""
+    layout = getattr(runner, "kv_layout", None)
+    if layout is not None and layout.mixed and getattr(runner, "kv_views", None) is not None:
+        tensors = [("kv_cache", runner.kv_views[0], 1), ("kv_cache", runner.kv_views[1], 1), ("kv_cache_scales", runner.kv_cache_scales, 2)]
+        if getattr(runner, "kv_cache_mins", None) is not None:
+            tensors.append(("kv_cache_mins", runner.kv_cache_mins, 2))
+        return tensors
+    tensors = [("kv_cache", runner.kv_cache, 2)]
+    if runner.config.kv_cache_int8:
+        tensors.append(("kv_cache_scales", runner.kv_cache_scales, 2))
+    return tensors
+
+
+def _copy_pages(tensor: torch.Tensor, saved: torch.Tensor, axis: int) -> None:
+    """saved's pages into the first pages of tensor, one contiguous destination at a time."""
+    count = saved.shape[axis]
+    for index in itertools.product(*(range(n) for n in tensor.shape[:axis])):
+        tensor[index].narrow(0, 0, count).copy_(saved[index])
+
+
 class ModelRunner:
 
     _MAX_SPECULATIVE_DRAFT_TOKENS = 8
@@ -44,6 +68,7 @@ class ModelRunner:
         hf_config = config.hf_config
         self.use_triton_sampling = not bool(getattr(hf_config, "_prompt_enhancer_safe_legacy", False) or getattr(hf_config, "_prompt_enhancer_safe_fused_kernels", False))
         self.block_size = config.kvcache_block_size
+        self.kv_layout = kvf.layout_of(config)  # None: BF16 cache; otherwise the body formats and exact overlays
         self.enforce_eager = config.enforce_eager
         self.world_size, self.rank = 1, 0  # one process on one GPU
         if torch.cuda.is_available():
@@ -168,7 +193,7 @@ class ModelRunner:
         if not self.mmgp_graphs or self.enforce_eager:
             return
         from mmgp import cuda_graphs
-        tensors = [getattr(self, "kv_cache", None), getattr(self, "kv_cache_scales", None)]
+        tensors = [getattr(self, name, None) for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_overlay", "kv_overlay_scales")]
         for graph_vars in (getattr(self, "graph_vars", None) or {}, *(getattr(self, "speculative_graph_vars", None) or {}).values()):
             tensors.extend(graph_vars.values())
         for module in self.model.modules():
@@ -186,7 +211,8 @@ class ModelRunner:
         if draft_features is not None:
             self.model._draft_features = draft_features
 
-    def _capture_target_stages(self, slot_mapping: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor) -> None:
+    def _capture_target_stages(self, slot_mapping: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor, overlay_mapping: torch.Tensor, overlay_base: torch.Tensor,
+                               ring_start: torch.Tensor) -> None:
         """MMGP mode, the model in VRAM: the decoding passes run once on dummy pages (as the engine's own graphs are captured), which
         records their MMGP graphs before the first request instead of during its decoding."""
         from mmgp import runtime
@@ -197,11 +223,13 @@ class ModelRunner:
             return  # the runs of resident blocks change with the dynamic preload: their graphs are recorded as they run
         graph_vars = self.graph_vars
         for bs in reversed(self.graph_bs):
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+                        overlay_mapping=overlay_mapping[:bs], overlay_base=overlay_base[:bs], ring_start=ring_start[:bs])
             self._run_target_stage(graph_vars["input_ids"][:bs], graph_vars["positions"][:bs], graph_vars["outputs"][:bs], self._draft_feature_buffer(graph_vars, bs))
             reset_context()
         for verify_length, graph_vars in sorted(self.speculative_graph_vars.items(), reverse=True):
-            set_context(True, graph_vars["cu_seqlens_q"], graph_vars["cu_seqlens_k"], verify_length, self.config.max_model_len, graph_vars["slot_mapping"], None, graph_vars["block_tables"], has_previous_state=True, speculative_verify=True)
+            set_context(True, graph_vars["cu_seqlens_q"], graph_vars["cu_seqlens_k"], verify_length, self.config.max_model_len, graph_vars["slot_mapping"], None, graph_vars["block_tables"], has_previous_state=True, speculative_verify=True,
+                        overlay_mapping=graph_vars["overlay_mapping"], overlay_base=graph_vars["overlay_base"], ring_start=graph_vars["ring_start"])
             self._run_target_stage(graph_vars["input_ids"], graph_vars["positions"], graph_vars["outputs"], self._draft_feature_buffer(graph_vars, verify_length))
             reset_context()
         torch.cuda.synchronize()
@@ -532,7 +560,12 @@ class ModelRunner:
         model_ptr = -1
         kv_ptr = -1
         try:
-            first_param = next(self.model.parameters())
+            if getattr(self.model, "_lm_engine_token_table_mapped", False):  # the table held outside the parameters: a base one, not a streamed block's
+                first_param = self.__dict__.get("_signature_param")
+                if first_param is None:
+                    first_param = self._signature_param = next(param for name, param in self.model.named_parameters() if not name.startswith(self.model._lm_engine_tower_prefix))
+            else:
+                first_param = next(self.model.parameters())
             if first_param.is_cuda:
                 model_ptr = int(first_param.data_ptr())
         except Exception:
@@ -660,9 +693,13 @@ class ModelRunner:
         # Pre-allocate decode buffers on CPU with pinned memory
         self._cpu_input_ids = torch.zeros(max_bs, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
         self._cpu_speculative_input_ids = torch.zeros(self._max_speculative_draft_tokens + 1, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
+        self._cpu_speculative_overlay_mapping = torch.full((self._max_speculative_draft_tokens + 1,), -1, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
         self._cpu_positions = torch.zeros(max_bs, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
         self._cpu_slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
         self._cpu_context_lens = torch.zeros(max_bs, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
+        self._cpu_overlay_mapping = torch.full((max_bs,), -1, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
+        self._cpu_overlay_base = torch.full((max_bs,), -1, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
+        self._cpu_ring_start = torch.full((max_bs,), 1 << 30, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
         
         # Pre-allocate prefill buffers on CPU with pinned memory (optimization to avoid repeated tensor creation)
         self._cpu_prefill_input_ids = torch.zeros(max_tokens, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
@@ -687,9 +724,13 @@ class ModelRunner:
             "_cpu_repetition_penalties",
             "_cpu_input_ids",
             "_cpu_speculative_input_ids",
+            "_cpu_speculative_overlay_mapping",
             "_cpu_positions",
             "_cpu_slot_mapping",
             "_cpu_context_lens",
+            "_cpu_overlay_mapping",
+            "_cpu_overlay_base",
+            "_cpu_ring_start",
             "_cpu_prefill_input_ids",
             "_cpu_prefill_positions",
             "_cpu_prefill_cu_seqlens",
@@ -748,6 +789,138 @@ class ModelRunner:
             return []
         return [module for module in self.model.modules() if hasattr(module, "k_cache") and hasattr(module, "v_cache") and not bool(getattr(module, "_exclude_paged_kv_cache", False))]
 
+    def _allocate_kv_tensors(self, layers: int, num_kv_heads: int, head_dim: int, scale_elements: int, runtime_device) -> None:
+        """The cache tensors (zeros, as vLLM: the attention reads the unwritten slots of a sequence's last page with a zero weight, and 0 * NaN
+        is NaN). A BF16 or Q8 cache is one [2, layers, pages, ...] tensor; a mixed layout keeps the two bodies in one byte buffer with a
+        view per component (keys then values, their widths differ), plus the exact Q8 overlays allocated once per runtime."""
+        config, layout = self.config, self.kv_layout
+        blocks = config.num_kvcache_blocks
+        if layout is None or not layout.mixed:
+            self.kv_cache = torch.zeros(2, layers, blocks, self.block_size, num_kv_heads, head_dim, device=runtime_device, dtype=torch.int8 if config.kv_cache_int8 else self.dtype)
+            self.kv_views = (self.kv_cache[0], self.kv_cache[1])
+            self.kv_min_views = (None, None)
+            if config.kv_cache_int8:
+                self.kv_cache_scales = torch.zeros(2, layers, blocks, self.block_size, num_kv_heads, scale_elements, device=runtime_device, dtype=torch.float16)
+            return
+        shape = lambda width: (layers, blocks, self.block_size, num_kv_heads, width)
+        widths = (layout.k.width(head_dim), layout.v.width(head_dim))
+        sizes = [math.prod(shape(width)) for width in widths]
+        self.kv_cache = torch.zeros(sum(sizes), device=runtime_device, dtype=torch.uint8)
+        self.kv_views = tuple(self.kv_cache[offset:offset + size].view(fmt.dtype).view(shape(width))
+                              for fmt, width, size, offset in zip((layout.k, layout.v), widths, sizes, (0, sizes[0])))
+        self.kv_cache_scales = torch.zeros(2, *shape(scale_elements), device=runtime_device, dtype=torch.float16)
+        asymmetric = [fmt.asymmetric for fmt in (layout.k, layout.v)]
+        self.kv_cache_mins = torch.zeros(sum(asymmetric), *shape(scale_elements), device=runtime_device, dtype=torch.float16) if any(asymmetric) else None
+        mins = iter(self.kv_cache_mins) if self.kv_cache_mins is not None else None
+        self.kv_min_views = tuple(next(mins) if flag else None for flag in asymmetric)
+        if layout.overlay and getattr(self, "kv_overlay", None) is None:
+            rows = config.max_num_seqs * layout.overlay_rows(self.block_size) + 1  # plus a scratch row for tokens without an overlay (PyTorch store path)
+            self.kv_overlay = torch.zeros(2, layers, rows, num_kv_heads, head_dim, device=runtime_device, dtype=torch.int8)
+            self.kv_overlay_scales = torch.zeros(2, layers, rows, num_kv_heads, scale_elements, device=runtime_device, dtype=torch.float16)
+
+    def _bind_kv_modules(self, modules) -> None:
+        config, layout = self.config, self.kv_layout
+        for layer_id, module in enumerate(modules):
+            module.k_cache, module.v_cache = self.kv_views[0][layer_id], self.kv_views[1][layer_id]
+            if not config.kv_cache_int8:
+                continue
+            module.k_scale, module.v_scale = self.kv_cache_scales[0, layer_id], self.kv_cache_scales[1, layer_id]
+            module.kv_layout = layout
+            module.k_min = None if self.kv_min_views[0] is None else self.kv_min_views[0][layer_id]
+            module.v_min = None if self.kv_min_views[1] is None else self.kv_min_views[1][layer_id]
+            if layout.overlay:
+                module.k_overlay, module.v_overlay = self.kv_overlay[0, layer_id], self.kv_overlay[1, layer_id]
+                module.k_overlay_scale, module.v_overlay_scale = self.kv_overlay_scales[0, layer_id], self.kv_overlay_scales[1, layer_id]
+
+    def kv_snapshot_items(self) -> dict:
+        """name -> (tensor, page axis) of the paged cache tensors, for page-range snapshots."""
+        items = {}
+        if self.kv_layout is not None and self.kv_layout.mixed:
+            items["k_body"], items["v_body"] = (self.kv_views[0], 1), (self.kv_views[1], 1)
+        else:
+            items["kv_cache"] = (self.kv_cache, 2)
+        if getattr(self, "kv_cache_scales", None) is not None:
+            items["kv_cache_scales"] = (self.kv_cache_scales, 2)
+        if getattr(self, "kv_cache_mins", None) is not None:
+            items["kv_cache_mins"] = (self.kv_cache_mins, 2)
+        return items
+
+    def snapshot_overlay(self, seq: Sequence) -> dict | None:
+        if getattr(self, "kv_overlay", None) is None or seq.overlay_slot < 0:
+            return None
+        rows = self.kv_layout.overlay_rows(self.block_size)
+        base = seq.overlay_slot * rows
+        return {"data": self.kv_overlay[:, :, base:base + rows].to("cpu", copy=True), "scales": self.kv_overlay_scales[:, :, base:base + rows].to("cpu", copy=True), "ring_high": int(seq.ring_high)}
+
+    def restore_overlay(self, seq: Sequence, saved: dict | None) -> None:
+        if saved is None or getattr(self, "kv_overlay", None) is None or seq.overlay_slot < 0:
+            return
+        rows = self.kv_layout.overlay_rows(self.block_size)
+        base = seq.overlay_slot * rows
+        self.kv_overlay[:, :, base:base + rows].copy_(saved["data"])
+        self.kv_overlay_scales[:, :, base:base + rows].copy_(saved["scales"])
+        seq.ring_high = int(saved["ring_high"])
+
+    def _fill_overlays_from_body(self, seq: Sequence, count: int) -> None:
+        """The exact overlays of positions [0, count) that were cached from other sequences (prefix cache): requantized from the body."""
+        layout, page = self.kv_layout, self.block_size
+        sink = layout.sink_tokens(page)
+        positions = torch.cat((torch.arange(0, min(count, sink)), torch.arange(max(count - layout.recent_tokens, sink), count)))
+        seq.ring_high = max(seq.ring_high, count)
+        if positions.numel() == 0:
+            return
+        device = self.kv_overlay.device
+        table = torch.tensor(seq.block_table, dtype=torch.long)
+        pages, slots = table[positions // page].to(device), (positions % page).to(device)
+        rows = (seq.overlay_slot * layout.overlay_rows(page) + torch.where(positions < sink, positions, sink + (positions & (layout.recent_tokens - 1)))).to(device)
+        for component, fmt in enumerate((layout.k, layout.v)):
+            mins = self.kv_min_views[component]
+            values = kvf.dequantize_heads(self.kv_views[component][:, pages, slots], self.kv_cache_scales[component][:, pages, slots], None if mins is None else mins[:, pages, slots], fmt)
+            data, scale, _ = kvf.quantize_heads(values, kvf.Q8)
+            self.kv_overlay[component][:, rows] = data
+            self.kv_overlay_scales[component][:, rows] = scale
+
+    def _fill_overlay_buffers(self, seq: Sequence, start: int, count: int) -> bool:
+        """The overlay rows of positions [start, start + count) of one sequence into the pinned speculative buffers, its base and ring start
+        into the first decode buffers; False without overlays."""
+        layout = self.kv_layout
+        if layout is None or not layout.overlay:
+            return False
+        page = self.block_size
+        base = seq.overlay_slot * layout.overlay_rows(page) if seq.overlay_slot >= 0 and seq.block_table else -1
+        if base >= 0 and seq.ring_high < start:
+            self._fill_overlays_from_body(seq, start)
+        buffer = self._cpu_speculative_overlay_mapping
+        for index in range(count):
+            buffer[index] = base + layout.overlay_row(start + index, page) if base >= 0 else -1
+        seq.ring_high = max(seq.ring_high, start + count)
+        self._cpu_overlay_base[0] = base
+        self._cpu_ring_start[0] = layout.ring_start(seq.ring_high, page)
+        return True
+
+    def _overlay_context(self, seqs: list[Sequence], ranges: list[tuple[int, int]]):
+        """(overlay_mapping, overlay_base, ring_start) tensors of a pass writing the positions [start, end) of each sequence; Nones without
+        overlays. Advances each sequence's ring_high."""
+        layout = self.kv_layout
+        if layout is None or not layout.overlay:
+            return None, None, None
+        page = self.block_size
+        rows, sink = layout.overlay_rows(page), layout.sink_tokens(page)
+        mapping, bases, starts = [], [], []
+        for seq, (start, end) in zip(seqs, ranges):
+            base = seq.overlay_slot * rows if seq.overlay_slot >= 0 and seq.block_table else -1
+            if base >= 0:
+                if seq.ring_high < start:
+                    self._fill_overlays_from_body(seq, start)
+                positions = torch.arange(start, end, dtype=torch.int32)
+                mapping.append(base + torch.where(positions < sink, positions, sink + (positions & (layout.recent_tokens - 1))))
+                seq.ring_high = max(seq.ring_high, end)
+            else:
+                mapping.append(torch.full((end - start,), -1, dtype=torch.int32))
+            bases.append(base)
+            starts.append(layout.ring_start(seq.ring_high, page))
+        return (self._to_runtime_device(torch.cat(mapping)), self._to_runtime_device(torch.tensor(bases, dtype=torch.int32)), self._to_runtime_device(torch.tensor(starts, dtype=torch.int32)))
+
     def allocate_kv_cache(self, generation_tokens=None):
         config = self.config
         hf_config = config.hf_config
@@ -762,7 +935,10 @@ class ModelRunner:
         cache_element_size = torch.empty((), dtype=torch.int8 if config.kv_cache_int8 else self.dtype).element_size()
         scale_elements = head_dim // 32 if config.kv_cache_int8 else 0
         scale_element_size = torch.float16.itemsize if config.kv_cache_int8 else 0
-        block_bytes = 2 * kv_cache_layer_count * self.block_size * num_kv_heads * (head_dim * cache_element_size + scale_elements * scale_element_size)
+        if config.kv_cache_int8:
+            block_bytes = self.block_size * self.kv_layout.body_bytes_per_token(kv_cache_layer_count, num_kv_heads, head_dim)
+        else:
+            block_bytes = 2 * kv_cache_layer_count * self.block_size * num_kv_heads * head_dim * cache_element_size
 
         # Default consumers reserve the full limit; token generators can opt into growth.
         cache_length = config.max_model_len
@@ -789,28 +965,7 @@ class ModelRunner:
                     f"Requested max_model_len={config.max_model_len}, max_num_seqs={config.max_num_seqs}."
                 )
         try:
-            # zeros, as vLLM: the attention reads the unwritten slots of a sequence's last page with a zero weight, and 0 * NaN is NaN
-            self.kv_cache = torch.zeros(
-                2,
-                kv_cache_layer_count,
-                config.num_kvcache_blocks,
-                self.block_size,
-                num_kv_heads,
-                head_dim,
-                device=runtime_device,
-                dtype=torch.int8 if config.kv_cache_int8 else self.dtype,
-            )
-            if config.kv_cache_int8:
-                self.kv_cache_scales = torch.zeros(
-                    2,
-                    kv_cache_layer_count,
-                    config.num_kvcache_blocks,
-                    self.block_size,
-                    num_kv_heads,
-                    scale_elements,
-                    device=runtime_device,
-                    dtype=torch.float16,
-                )
+            self._allocate_kv_tensors(kv_cache_layer_count, num_kv_heads, head_dim, scale_elements, runtime_device)
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
                 extra = ""
@@ -822,12 +977,7 @@ class ModelRunner:
                     f"max_model_len={config.max_model_len}, max_num_seqs={config.max_num_seqs} on {runtime_device}.{extra}"
                 ) from exc
             raise
-        for layer_id, module in enumerate(kv_cache_modules):
-            module.k_cache = self.kv_cache[0, layer_id]
-            module.v_cache = self.kv_cache[1, layer_id]
-            if config.kv_cache_int8:
-                module.k_scale = self.kv_cache_scales[0, layer_id]
-                module.v_scale = self.kv_cache_scales[1, layer_id]
+        self._bind_kv_modules(kv_cache_modules)
 
         if config.kv_cache_initial_tokens and generation_tokens is None:
             print(f"[LM Engine] KV cache: {self._kv_cache_generation_tokens}/{config.kv_cache_max_tokens} generation tokens + {config.kv_cache_prompt_tokens} prompt tokens per branch; {config.num_kvcache_blocks} pages ({required_kv_bytes / 1024**2:.1f} MiB).")
@@ -849,27 +999,25 @@ class ModelRunner:
             self.graphs.clear()
             self.graph_vars.clear()
             self.graph_pool = None
-        # Stage live pages in RAM before allocating their larger GPU replacement.
-        old_cache = self.kv_cache.cpu()
-        old_scales = self.kv_cache_scales.cpu() if config.kv_cache_int8 else None
+        # Stage live pages in RAM before allocating their larger GPU replacement (the exact overlays are not paged and stay in place).
+        page_tensors = _kv_page_tensors(self)
+        staged = [tensor.cpu() for _name, tensor, _axis in page_tensors]
         for module in self._get_kv_cache_modules():
             module.k_cache = module.v_cache = torch.empty(0, device="cpu")
             if config.kv_cache_int8:
                 module.k_scale = module.v_scale = torch.empty(0, device="cpu")
-        del self.kv_cache
-        if config.kv_cache_int8:
-            del self.kv_cache_scales
+                module.k_min = module.v_min = None
+        for name in {name for name, _tensor, _axis in page_tensors}:
+            delattr(self, name)
+        self.kv_views = None
         self.allocate_kv_cache(tokens)
         if not self.enforce_eager:
             # Capture writes dummy KV slots. Restore live pages only AFTER capture.
             self.capture_cudagraph()
         # Each destination is contiguous, avoiding a full-cache GPU staging copy.
-        for kind in range(2):
-            for layer in range(old_cache.shape[1]):
-                self.kv_cache[kind, layer, :old_cache.shape[2]].copy_(old_cache[kind, layer])
-                if config.kv_cache_int8:
-                    self.kv_cache_scales[kind, layer, :old_scales.shape[2]].copy_(old_scales[kind, layer])
-        del old_cache, old_scales
+        for (_name, tensor, axis), saved in zip(_kv_page_tensors(self), staged):
+            _copy_pages(tensor, saved, axis)
+        del staged
         self._runtime_signature = self._get_graph_capture_signature()
         print(f"[LM Engine] KV cache grew: {old_tokens} -> {tokens}/{config.kv_cache_max_tokens} generation tokens per branch; {config.num_kvcache_blocks} pages.")
         return config.num_kvcache_blocks
@@ -945,6 +1093,7 @@ class ModelRunner:
                     slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        overlay_mapping, overlay_base, ring_start = self._overlay_context(seqs, [(seq.num_cached_tokens, len(seq)) for seq in seqs])
         if use_prompt_embeds:
             input_ids = None
             positions = self._to_runtime_device(torch.cat(prompt_position_ids, dim=1).unsqueeze(1).contiguous())
@@ -958,7 +1107,8 @@ class ModelRunner:
         cu_seqlens_q = self._to_runtime_device(torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=pin_memory))
         cu_seqlens_k = self._to_runtime_device(torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=pin_memory))
         slot_mapping = self._to_runtime_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=pin_memory))
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, has_previous_state=has_previous_state)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, has_previous_state=has_previous_state,
+                    overlay_mapping=overlay_mapping, overlay_base=overlay_base, ring_start=ring_start)
         return input_ids, positions, inputs_embeds
 
     @torch.inference_mode()
@@ -997,6 +1147,18 @@ class ModelRunner:
             self._cpu_positions[i] = len(seq) - 1 + int(getattr(seq, "position_offset", 0) or 0)
             self._cpu_context_lens[i] = len(seq)
             self._cpu_slot_mapping[i] = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+        layout = self.kv_layout
+        overlay = layout is not None and layout.overlay
+        if overlay:
+            rows = layout.overlay_rows(self.block_size)
+            for i, seq in enumerate(seqs):
+                base = seq.overlay_slot * rows if seq.overlay_slot >= 0 else -1
+                if base >= 0 and seq.ring_high < len(seq) - 1:
+                    self._fill_overlays_from_body(seq, len(seq) - 1)
+                seq.ring_high = max(seq.ring_high, len(seq))
+                self._cpu_overlay_mapping[i] = base + layout.overlay_row(len(seq) - 1, self.block_size) if base >= 0 else -1
+                self._cpu_overlay_base[i] = base
+                self._cpu_ring_start[i] = layout.ring_start(seq.ring_high, self.block_size)
         
         # Transfer to the runtime device using sliced views
         input_ids = self._to_runtime_device(self._cpu_input_ids[:bs])
@@ -1004,7 +1166,8 @@ class ModelRunner:
         slot_mapping = self._to_runtime_device(self._cpu_slot_mapping[:bs])
         context_lens = self._to_runtime_device(self._cpu_context_lens[:bs])
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        overlay_tensors = (self._to_runtime_device(self._cpu_overlay_mapping[:bs]), self._to_runtime_device(self._cpu_overlay_base[:bs]), self._to_runtime_device(self._cpu_ring_start[:bs])) if overlay else (None, None, None)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, overlay_mapping=overlay_tensors[0], overlay_base=overlay_tensors[1], ring_start=overlay_tensors[2])
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence], is_cfg_batch: bool = False):
@@ -1410,8 +1573,14 @@ class ModelRunner:
             cu_seqlens_q = torch.tensor([0, verify_length], dtype=torch.int32, device=self._get_runtime_device())
             cu_seqlens_k = torch.tensor([0, len(seq) + len(draft_tokens)], dtype=torch.int32, device=self._get_runtime_device())
             block_tables = self.prepare_block_tables([seq])
+            overlay_mapping, overlay_base, ring_start = self._overlay_context([seq], [(len(seq) - 1, len(seq) - 1 + verify_length)])
         else:
             graph_vars = self.speculative_graph_vars[verify_length]
+            overlay_mapping, overlay_base, ring_start = graph_vars["overlay_mapping"], graph_vars["overlay_base"], graph_vars["ring_start"]
+            if self._fill_overlay_buffers(seq, len(seq) - 1, verify_length):  # pinned CPU buffers: no host synchronization in the MTP loop
+                overlay_mapping.copy_(self._cpu_speculative_overlay_mapping[:verify_length], non_blocking=True)
+                overlay_base.copy_(self._cpu_overlay_base[:1], non_blocking=True)
+                ring_start.copy_(self._cpu_ring_start[:1], non_blocking=True)
             input_ids = graph_vars["input_ids"]
             if torch.is_tensor(draft_tokens):
                 input_ids[0].fill_(seq.last_token)
@@ -1439,7 +1608,8 @@ class ModelRunner:
                 graph_vars["block_table_signature"] = block_table_signature
         # an MMGP graph keeps the bound of its capture, as the engine's graphs of the verification do
         max_seqlen_k = self.config.max_model_len if self.mmgp_graphs and not self.enforce_eager else len(seq) + len(draft_tokens)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, verify_length, max_seqlen_k, slot_mapping, None, block_tables, has_previous_state=True, speculative_verify=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, verify_length, max_seqlen_k, slot_mapping, None, block_tables, has_previous_state=True, speculative_verify=True,
+                    overlay_mapping=overlay_mapping, overlay_base=overlay_base, ring_start=ring_start)
         return input_ids, positions
 
     def _run_mtp_forward(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor, inputs_embeds: torch.Tensor | None = None, compute_logits: bool = True, last_logits_only: bool = False):
@@ -1704,10 +1874,18 @@ class ModelRunner:
         graph_vars["slot_mapping"][:bs] = context.slot_mapping
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph_vars["overlay_mapping"][:graph_bs].fill_(-1)
+        graph_vars["overlay_base"][:graph_bs].fill_(-1)
+        graph_vars["ring_start"][:graph_bs].fill_(1 << 30)
+        if context.overlay_mapping is not None:
+            graph_vars["overlay_mapping"][:bs] = context.overlay_mapping
+            graph_vars["overlay_base"][:bs] = context.overlay_base
+            graph_vars["ring_start"][:bs] = context.ring_start
         if self.mmgp_graphs:
             # the graphs read the context from the buffers registered with the model's graph state (whole buffers when they are the size)
             rows = (lambda t: t) if graph_bs == graph_vars["input_ids"].shape[0] else (lambda t: t[:graph_bs])
-            set_context(False, slot_mapping=rows(graph_vars["slot_mapping"]), context_lens=rows(graph_vars["context_lens"]), block_tables=rows(graph_vars["block_tables"]))
+            set_context(False, slot_mapping=rows(graph_vars["slot_mapping"]), context_lens=rows(graph_vars["context_lens"]), block_tables=rows(graph_vars["block_tables"]),
+                        overlay_mapping=rows(graph_vars["overlay_mapping"]), overlay_base=rows(graph_vars["overlay_base"]), ring_start=rows(graph_vars["ring_start"]))
             self._run_target_stage(rows(graph_vars["input_ids"]), rows(graph_vars["positions"]), rows(graph_vars["outputs"]), self._draft_feature_buffer(graph_vars, graph_bs))
             return graph_vars["outputs"][:bs]
         self.graphs[graph_bs].replay()
@@ -1966,6 +2144,9 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=model_device)
         context_lens = torch.zeros(max_bs, dtype=torch.int32, device=model_device)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=model_device)
+        overlay_mapping = torch.full((max_bs,), -1, dtype=torch.int32, device=model_device)
+        overlay_base = torch.full((max_bs,), -1, dtype=torch.int32, device=model_device)
+        ring_start = torch.full((max_bs,), 1 << 30, dtype=torch.int32, device=model_device)
         outputs = torch.zeros(max_bs, hf_config.hidden_size, device=model_device, dtype=self.dtype)
         base_graph_bs = [1, 2, 4, 8]
         self.graph_bs = [bs for bs in base_graph_bs if bs <= max_bs]
@@ -1988,7 +2169,9 @@ class ModelRunner:
             if prepare_runtime_buffers is not None:
                 prepare_runtime_buffers(model_device)
             from shared.kernels import gguf_short_batch
-            choose_short_batch_kernels = lambda: gguf_short_batch.prepare(self.model, llamacpp_gguf_cuda)
+            # a token table read in place from RAM (outside the parameters) is timed as before: its shape may be the head's (Bonsai)
+            extra = (self.model.embed_tokens.weight,) if getattr(self.model, "_lm_engine_token_table_mapped", False) else ()
+            choose_short_batch_kernels = lambda: gguf_short_batch.prepare(self.model, llamacpp_gguf_cuda, extra)
         except ImportError:
             pass
 
@@ -1999,7 +2182,8 @@ class ModelRunner:
             choose_short_batch_kernels = None
         for bs in reversed(self.graph_bs if not self.mmgp_graphs else ()):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+                        overlay_mapping=overlay_mapping[:bs], overlay_base=overlay_base[:bs], ring_start=ring_start[:bs])
             capture_stream.wait_stream(torch.cuda.current_stream(model_device))
             with torch.cuda.stream(capture_stream):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
@@ -2023,6 +2207,9 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            overlay_mapping=overlay_mapping,
+            overlay_base=overlay_base,
+            ring_start=ring_start,
             outputs=outputs,
         )
         if getattr(self.model, "mtp", None) is not None and bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False)):
@@ -2048,9 +2235,13 @@ class ModelRunner:
                 speculative_block_tables = torch.full((1, max_num_blocks), -1, dtype=torch.int32, device=model_device)
                 speculative_block_tables[0, 0] = dummy_block
                 speculative_outputs = torch.zeros(1, verify_length, hf_config.hidden_size, device=model_device, dtype=self.dtype)
+                speculative_overlay_mapping = torch.full((verify_length,), -1, dtype=torch.int32, device=model_device)
+                speculative_overlay_base = torch.full((1,), -1, dtype=torch.int32, device=model_device)
+                speculative_ring_start = torch.full((1,), 1 << 30, dtype=torch.int32, device=model_device)
                 if not self.mmgp_graphs:
                     graph = torch.cuda.CUDAGraph()
-                    set_context(True, speculative_cu_seqlens_q, speculative_cu_seqlens_k, verify_length, config.max_model_len, speculative_slot_mapping, None, speculative_block_tables, has_previous_state=True, speculative_verify=True)
+                    set_context(True, speculative_cu_seqlens_q, speculative_cu_seqlens_k, verify_length, config.max_model_len, speculative_slot_mapping, None, speculative_block_tables, has_previous_state=True, speculative_verify=True,
+                                overlay_mapping=speculative_overlay_mapping, overlay_base=speculative_overlay_base, ring_start=speculative_ring_start)
                     capture_stream.wait_stream(torch.cuda.current_stream(model_device))
                     with torch.cuda.stream(capture_stream):
                         speculative_outputs[:] = self.model(speculative_input_ids, speculative_positions)
@@ -2066,6 +2257,9 @@ class ModelRunner:
                     "cu_seqlens_q": speculative_cu_seqlens_q,
                     "cu_seqlens_k": speculative_cu_seqlens_k,
                     "block_tables": speculative_block_tables,
+                    "overlay_mapping": speculative_overlay_mapping,
+                    "overlay_base": speculative_overlay_base,
+                    "ring_start": speculative_ring_start,
                     "outputs": speculative_outputs,
                 }
                 if getattr(self.model, "_block_draft", False) and not self.mmgp_graphs:
@@ -2137,7 +2331,7 @@ class ModelRunner:
                 if self._speculative_replay_modules and defer_commits:
                     capture_commits(self.mtp_graph_pool)
         if self.mmgp_graphs:
-            self._capture_target_stages(slot_mapping, context_lens, block_tables)
+            self._capture_target_stages(slot_mapping, context_lens, block_tables, overlay_mapping, overlay_base, ring_start)
         self._graph_cache[cache_key] = {
             "graphs": self.graphs,
             "pool": self.graph_pool,

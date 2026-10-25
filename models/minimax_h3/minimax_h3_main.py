@@ -8,7 +8,7 @@ import torch
 from accelerate import init_empty_weights
 from safetensors import safe_open
 
-from mmgp import offload, quant_router
+from mmgp import offload, quant_router, runtime
 from shared.utils import files_locator as fl
 
 from .audio_vae import MiniMaxH3AudioVAE
@@ -80,7 +80,8 @@ def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pd
 
     state_dict = strip(state_dict)
     if pdd:  # stacked PDD heads [num_steps, out, in]: head 0 is the base projection, the others are stored relative to it (FP32)
-        for key in [key for key in state_dict if key.startswith(("final_layer.video_out.", "final_layer.audio_out."))]:
+        for key in [f"final_layer.{head}.{suffix}" for head in ("video_out", "audio_out")
+                    for suffix in ("weight", "bias") if f"final_layer.{head}.{suffix}" in state_dict]:
             head, suffix = key.rsplit(".", 1)
             stacked = state_dict.pop(key)
             base = stacked[0].float()
@@ -107,11 +108,12 @@ def probe_h3_checkpoint(filename):
                 key = key[len(prefix):]
                 break
         normalized[key] = value
+    separate_qkv = any(key.endswith(".attn.q_proj.weight") for key in normalized)
     table = next((tensor for key, tensor in normalized.items() if key == "adaln_t_table"), None)
     if table is None:
         if hybrid_ref2va_blocks is not None:
             raise ValueError("MiniMax H3 FL2VA/Ref2VA hybrid checkpoints require compressed AdaLN tables")
-        return {"compressed_modulation": False, "adaln_curve_grid": None, "time_embed_dim": 2688, "adaln_dtype": None}
+        return {"compressed_modulation": False, "adaln_curve_grid": None, "time_embed_dim": 2688, "adaln_dtype": None, "separate_qkv": separate_qkv}
     if not table.dtype.is_floating_point:
         raise ValueError(f"H3 AdaLN curve table must use an unquantized floating-point GGUF qtype, got {table.dtype}")
     if len(table.shape) != 2 or table.shape[0] < 2:
@@ -123,7 +125,7 @@ def probe_h3_checkpoint(filename):
             "This file may be incompatible with MiniMax H3 LoRAs. Delete it and retry so WanGP can automatically download the official replacement."
         )
     return {"compressed_modulation": True, "adaln_curve_grid": int(table.shape[0]), "time_embed_dim": rank, "adaln_dtype": table.dtype,
-            "hybrid_ref2va_blocks": hybrid_ref2va_blocks}
+            "hybrid_ref2va_blocks": hybrid_ref2va_blocks, "separate_qkv": separate_qkv}
 
 
 def probe_h3_control_module(filenames, time_embed_dim):
@@ -167,6 +169,8 @@ def _qkv_layout(filenames, qkv_layout):
 def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleaved", pdd=False,
                       pdd_num_steps=None, pdd_block_size=None, vdn=False, veda=False, vsa=False):
     checkpoint = probe_h3_checkpoint(filename)
+    # Checkpoints with separate projections require split modules even with the Lower RAM preference.
+    qkv_splitting = qkv_splitting or checkpoint["separate_qkv"]
     hybrid_ref2va_blocks = checkpoint.get("hybrid_ref2va_blocks")
     filenames = list(filename) if isinstance(filename, (list, tuple)) else [filename]
     ref2va_adaln_t_table = None
@@ -227,6 +231,7 @@ def _load_text_encoder(filename, dtype):
     text_encoder.requires_grad_(False)
     offload.load_model_data(text_encoder, filename, writable_tensors=False, default_dtype=dtype,
                             preprocess_sd=_strip_text_encoder_wrapper, ignore_unused_weights=True)
+    runtime.lookup_on_cpu(text_encoder.language_model.embed_tokens)  # the 1.5 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
     text_encoder.set_tokenizer(os.path.dirname(config_path))
     text_encoder.eval().requires_grad_(False)
     return text_encoder
