@@ -469,6 +469,8 @@ class ModelRunner:
                     if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                         module.k_cache = module.v_cache = torch.tensor([])
                         module.k_scale = module.v_scale = torch.tensor([])
+                    if hasattr(module, "k_overlay"):  # the mixed layouts' exact overlays and asymmetric minimums, views of the runner's tensors
+                        module.k_overlay = module.v_overlay = module.k_overlay_scale = module.v_overlay_scale = module.k_min = module.v_min = None
                     if hasattr(module, "_q8_speculative_metadata"):
                         module._q8_speculative_metadata.clear()
                     release_sequence_state = getattr(module, "release_sequence_state", None)
@@ -485,16 +487,10 @@ class ModelRunner:
                             module.recurrent_state = None
         except Exception:
             pass
-        if hasattr(self, "kv_cache"):
-            try:
-                del self.kv_cache
-            except Exception:
-                pass
-        if hasattr(self, "kv_cache_scales"):
-            try:
-                del self.kv_cache_scales
-            except Exception:
-                pass
+        # the cache and every view of it (kv_views keep the whole cache alive), the minimums and the exact overlays
+        for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_views", "kv_min_views", "kv_overlay", "kv_overlay_scales"):
+            if hasattr(self, name):
+                delattr(self, name)
         # CUDA graphs captured against previous model/KV pointers are unsafe after runtime reset.
         # Force recapture on next prepare to avoid stale-pointer illegal memory access.
         try:
@@ -560,12 +556,7 @@ class ModelRunner:
         model_ptr = -1
         kv_ptr = -1
         try:
-            if getattr(self.model, "_lm_engine_token_table_mapped", False):  # the table held outside the parameters: a base one, not a streamed block's
-                first_param = self.__dict__.get("_signature_param")
-                if first_param is None:
-                    first_param = self._signature_param = next(param for name, param in self.model.named_parameters() if not name.startswith(self.model._lm_engine_tower_prefix))
-            else:
-                first_param = next(self.model.parameters())
+            first_param = next(self.model.parameters())
             if first_param.is_cuda:
                 model_ptr = int(first_param.data_ptr())
         except Exception:
@@ -2169,9 +2160,7 @@ class ModelRunner:
             if prepare_runtime_buffers is not None:
                 prepare_runtime_buffers(model_device)
             from shared.kernels import gguf_short_batch
-            # a token table read in place from RAM (outside the parameters) is timed as before: its shape may be the head's (Bonsai)
-            extra = (self.model.embed_tokens.weight,) if getattr(self.model, "_lm_engine_token_table_mapped", False) else ()
-            choose_short_batch_kernels = lambda: gguf_short_batch.prepare(self.model, llamacpp_gguf_cuda, extra)
+            choose_short_batch_kernels = lambda: gguf_short_batch.prepare(self.model, llamacpp_gguf_cuda)
         except ImportError:
             pass
 

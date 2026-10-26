@@ -1,5 +1,5 @@
 # Copyright (c) 2024-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-# ------------------ Memory Management 4.3.0 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 4.4.0 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -45,11 +45,7 @@
 # 
 # You may contact me on twitter @deepbeepmeep
 #
-# Thanks to
-# ---------
-# Huggingface / accelerate for the hooking examples
-# Huggingface / quanto for their very useful quantizer
-# gau-nernst for his Pinnig RAM samples
+
 
 
 #
@@ -591,6 +587,21 @@ if not hasattr(QTensor, "get_quantized_subtensors"):
 if not hasattr(QTensor, "set_quantized_subtensors"):
     QTensor.set_quantized_subtensors = _qtensor_set_quantized_subtensors
 
+def _is_mapped(tensor):
+    # a parameter kept in mapped RAM (runtime.map_in_ram, mapped.py): outside the blocks, the base, the budgets and the pinning
+    return getattr(tensor, "_mm_mapped", False)
+
+def _to_cpu(model):
+    # model.to("cpu"), the mapped parameters (CUDA views of their RAM) left in place
+    held = [(module, name, p) for module in model.modules() for name, p in module._parameters.items() if p is not None and _is_mapped(p)]
+    for module, name, _ in held:
+        module._parameters[name] = None
+    try:
+        return model.to("cpu")
+    finally:
+        for module, name, p in held:
+            module._parameters[name] = p
+
 def _cpu_modules(model):
     # The modules kept in RAM: those computed on the CPU (runtime.lookup_on_cpu) whose tensors are plain, a quantized table keeping the
     # GPU path of its qtype, whose kernels and rotations need not run on the CPU; and those that never run (runtime.unused). A tensor they
@@ -649,9 +660,10 @@ PIN_LOCKS_RAM = True # pinned tensors live in normal RAM locked in place once fi
                      # pinned memory allocated by the CUDA driver (cudaHostAlloc, used if False: tens of ms per 256 MB, or seconds per GB)
 
 class _HostRegistration:
-    """Own the backing RAM until CUDA has finished using it and successfully unregistered it."""
-    def __init__(self, buffer, pointer, size, device):
-        self.buffer, self.pointer, self.size, self.device = buffer, pointer, size, device
+    """Own the backing RAM until CUDA has finished using it and successfully unregistered it. flags: cudaHostRegister's (2 maps the RAM in
+    the GPU's address space, mapped.py)."""
+    def __init__(self, buffer, pointer, size, device, flags=0):
+        self.buffer, self.pointer, self.size, self.device, self.flags = buffer, pointer, size, device, flags
         self.registered, self.error = False, None
         self.guard = threading.Lock()
         self.failures, self.is_finalizing = _failed_host_registrations, sys.is_finalizing
@@ -661,7 +673,7 @@ class _HostRegistration:
         with self.guard:
             if self.registered:
                 raise RuntimeError("Host memory is already registered")
-            error = torch.cuda.cudart().cudaHostRegister(self.pointer, self.size, 0)
+            error = torch.cuda.cudart().cudaHostRegister(self.pointer, self.size, self.flags)
             if int(error) == 0:
                 self.registered = True
                 with _pinned_bytes_lock:
@@ -1758,7 +1770,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
             include = False
 
         if include:
-            params_dict.update( { k + '.' + n : (p,  False) for n, p in sub_module.named_parameters(recurse=False) if ranks is None or id(p) in ranks }  )
+            params_dict.update( { k + '.' + n : (p,  False) for n, p in sub_module.named_parameters(recurse=False) if (ranks is None or id(p) in ranks) and not _is_mapped(p) }  )
             params_dict.update( { k + '.' + n : (b,  True) for n, b in sub_module.named_buffers(recurse=False) if ranks is None or id(b) in ranks }  )
     if ranks is not None:
         params_dict = dict(sorted(params_dict.items(), key=lambda item: ranks[id(item[1][0])]))
@@ -1968,7 +1980,7 @@ def change_dtype(model, new_dtype, exclude_buffers = False):
         if hasattr(submodule, "_lock_dtype"):
             continue
         for n, p in submodule.named_parameters(recurse = False):
-            if isinstance(p, QTensor):
+            if isinstance(p, QTensor) or _is_mapped(p):
                 continue
             if p.data.dtype != new_dtype:
                 p.data = p.data.to(new_dtype)
@@ -2230,6 +2242,8 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
 
 
     user_exclude_list = _quantize_exclude_modules(model_to_quantize, quantize_exclude, verboseLevel=verboseLevel)
+    # the modules read in place from mapped RAM keep their tensors
+    user_exclude_list += [name for name, module in model_to_quantize.named_modules() if builtins.any(_is_mapped(p) for p in module.parameters(recurse=False))]
     if exclude_list is None:
         exclude_list = list(tied_weights) + user_exclude_list
     else:
@@ -2257,7 +2271,8 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
         else:
             tied_w = tied_weights.get(module_name, None)
             for n, p in module.named_parameters(recurse = False):
-
+                if _is_mapped(p): # already in its own RAM (a copy would end in VRAM)
+                    continue
                 if tied_w != None and n == tied_w[0]:
                     if isinstance( named_modules[tied_w[1]], QModuleMixin) :
                         setattr(module, n, None) # release refs of tied weights if source is going to be quantized
@@ -3916,6 +3931,8 @@ class offload:
         bef = blocks_params_size
 
         for k,p in submodule.named_parameters(recurse=False):
+            if _is_mapped(p): # never moved: the GPU reads it in mapped RAM
+                continue
             param_size = 0
             ref = _get_tensor_ref(p)
             tied_param =  self.parameters_ref.get(ref, None)
@@ -4745,6 +4762,8 @@ class offload:
 
     # @torch.compiler.disable()
     def gpu_load(self, model_id):
+        from .auto_preload import end_open_cycles
+        end_open_cycles(self, model_id)  # the VRAM this model takes is not the activations of the cycles other models left open
         need, whole = self._pool_need(model_id)
         if whole and self.ring is not None and not self.active_models_ids and not self.ring.jobs and self.ring.size < 2 * self._ring_bound(model_id):
             self._release_ring(on_demand=True) # made for the smaller blocks of another model: made again for this one's if it needs one
@@ -5419,7 +5438,7 @@ class offload:
             computed += kept
             blocks.append((entry, kept))
         self.blocks_of_modules_sizes[model_id] = self.blocks_of_modules_sizes.get(model_id, 0) + moved_size
-        if self.verboseLevel >= 1:
+        if self.verboseLevel >= 2:
             print(f"CPU compute of model '{model_id}': {len(computed)} weights ({builtins.sum(nbytes(p) for _, _, p, _, _ in computed)/ONE_MB:0.1f} MB) computed on the CPU "
                   f"for short calls of the blocks not in VRAM, {moved_size/ONE_MB:0.1f} MB of other block parameters kept in VRAM with the model")
 
@@ -6054,13 +6073,17 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
     elif self.pool_models and smartPinning is None:
         smartPinning = 0 # the blocks the pinned pool cannot take cross a staging ring
     self.ring_on_demand = None if smartPinning is None else (max_reservable_memory, verboseLevel)
+    # the modules marked by runtime.map_in_ram (and their aliases in any of these models) go to mapped RAM first: in reserved RAM before the
+    # pinning, and out of the models' blocks and base whatever their order
+    from . import mapped
+    mapped.map_parameters(models, max_reservable_memory, self.verboseLevel)
     for model_id in models: 
         if loading_callback is not None: loading_callback.check_abort()
         current_model: torch.nn.Module = models[model_id] 
         loading_phase("Preparing", model_id)
         model_convertWeightsFloatTo = getattr(current_model, "_convertWeightsFloatTo", convertWeightsFloatTo)
         # make sure that no RAM or GPU memory is not allocated for gradiant / training
-        current_model.to("cpu").eval()
+        _to_cpu(current_model).eval()
         
         # if the model has just been quantized so there is no need to quantize it again
         if model_id in models_to_quantize:
@@ -6080,6 +6103,8 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
             on_cpu = any(module_name == name or module_name.startswith(name + ".") for name in cpu_modules) # never in VRAM
             for n, p in m.named_parameters(recurse = False):
                 p.requires_grad = False
+                if _is_mapped(p): # read in place from mapped RAM: no VRAM, no conversion
+                    continue
                 sub_tensors = _get_quantized_subtensors(p)
                 if sub_tensors:
                     ref = _get_tensor_ref(p)

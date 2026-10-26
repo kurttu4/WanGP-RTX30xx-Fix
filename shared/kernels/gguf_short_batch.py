@@ -13,9 +13,9 @@ are cached on disk per GPU, driver and package.
 import json
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
+from mmgp import runtime
 
 QTYPES = ("Q4_K", "PTQ1_0")
 ROWS = range(2, 9)
@@ -123,29 +123,27 @@ def _measure(native, qtype, shape, peers, x, dtype, warm_seconds=0.):
         graphs.clear()
 
 
-def _gguf_weights(model, extra=()):
-    """Resident Q4_K/PTQ1_0 weights grouped by (device, qtype, shape), de-duplicated by storage; extra: weights held outside the parameters."""
+def _gguf_weights(model):
+    """Resident Q4_K/PTQ1_0 weights grouped by (device, qtype, shape), de-duplicated by storage: (raw, dtype, mapped), mapped for a weight that
+    the GPU reads in place from RAM (MMGP map_in_ram), counted as resident and timed from a temporary VRAM copy."""
     groups = {}
     for module in model.modules():
-        for tensor in (*module._parameters.values(), *(extra if module is model else ())):
+        for tensor in module._parameters.values():
             tensor_type, raw = getattr(tensor, "_tensor_type", None), getattr(tensor, "_data", None)
             if tensor_type is None or tensor_type.name not in QTYPES or not torch.is_tensor(raw) or not raw.is_cuda or not raw.is_contiguous():
                 continue
             shape = tuple(int(size) for size in tensor._tensor_shape)
             if shape[1] % 256 == 0:
-                groups.setdefault((raw.device, tensor_type.name, shape), {}).setdefault(raw.data_ptr(), (raw, tensor._gguf_default_dtype))
+                groups.setdefault((raw.device, tensor_type.name, shape), {}).setdefault(raw.data_ptr(), (raw, tensor._gguf_default_dtype, runtime.is_mapped(tensor)))
     return groups
 
 
-def prepare(model, native, extra=()):
-    """Record short-batch kernel choices for the model's Q4_K/PTQ1_0 weights. Call before CUDA graph capture. extra: weights the model holds
-    outside its parameters (a token table read in place from RAM), timed from temporary VRAM copies as when they were resident."""
+def prepare(model, native):
+    """Record short-batch kernel choices for the model's Q4_K/PTQ1_0 weights. Call before CUDA graph capture."""
     if native is None or not getattr(native, "has_short_batch_policy", lambda: False)() or native.short_batch_mode() != "auto":
         return
     measured, lines, started = 0, [], time.perf_counter()
-    extra = [SimpleNamespace(_tensor_type=tensor._tensor_type, _data=tensor._data.clone(), _tensor_shape=tensor._tensor_shape, _gguf_default_dtype=tensor._gguf_default_dtype)
-             for tensor in extra if getattr(tensor, "_tensor_type", None) is not None]
-    for (device, qtype, shape), weights in _gguf_weights(model, extra).items():
+    for (device, qtype, shape), weights in _gguf_weights(model).items():
         props = torch.cuda.get_device_properties(device)
         if props.major < 8:
             return
@@ -155,10 +153,10 @@ def prepare(model, native, extra=()):
         device_key = _device_key(device, native)
         entries = _load_disk().setdefault(device_key, {})
         peers, total, dtype = [], 0, next(iter(weights.values()))[1]
-        for raw, _ in weights.values():
+        for raw, _, mapped in weights.values():
             if len(peers) == MAX_WEIGHTS or total >= _cold_bytes(device):
                 break
-            peers.append(raw)
+            peers.append((raw, mapped))
             total += raw.numel()
         if total < _cold_bytes(device):
             # Too few bytes of this shape to time cache-cold: keep the architecture default (not cached,
@@ -166,14 +164,16 @@ def prepare(model, native, extra=()):
             for rows in ROWS:
                 _choices[(device, qtype, rows, shape)] = default_mma
             continue
-        speedups, enabled = [], []
+        speedups, enabled, timed = [], [], None
         for rows in ROWS:
             shape_key = f"{qtype}|{rows}|{shape[0]}|{shape[1]}"
             record = entries.get(shape_key)
             if record is None:
+                if timed is None:  # the weights read from RAM are timed from VRAM copies, as when they were resident
+                    timed = [raw.clone() if mapped else raw for raw, mapped in peers]
                 with torch.inference_mode(), torch.cuda.device(device):
                     x = torch.randn((rows, shape[1]), device=device, dtype=dtype)
-                    timings, error = _measure(native, qtype, shape, peers, x, dtype, warm_seconds=0. if measured else .05)
+                    timings, error = _measure(native, qtype, shape, timed, x, dtype, warm_seconds=0. if measured else .05)
                 measured += 1
                 if timings is None:
                     record = {"mma": False, "error": error}

@@ -20,7 +20,7 @@ from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_
 from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
                               VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
-from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_PROMPT_INFOS, PTD_DEEPY_INFOS, PTD_DEEPY_PROMPT_INFOS
+from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
 from .vae_upsampler import X2_VAE_DESCRIPTION, X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_METHOD, X2_VAE_VALUE, query_x2_vae_files
 from .viggle import VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REPO_ID
 from .prompt_enhancer import (FL2VA_DEEPY_PROMPT_INFOS, FL2VA_IMAGE_SYSTEM_PROMPT, FL2VA_PROMPT_INFOS, FL2VA_TEXT_SYSTEM_PROMPT,
@@ -316,7 +316,7 @@ H3_VIDEO_VAE_INFOS = """Choose the decoder used to turn generated video into fra
 Selecting **MiniMax H3 VAE** spatial upsampling replaces the selected decoder, including LightVAE, with the X2 decoder.
 """
 
-H3_DENOISING_PRIORITY_INFOS = """Choose which memory limit matters most during denoising.
+H3_DENOISING_PRIORITY_INFOS = """Choose which memory limit matters most during denoising and video decoding.
 
 - **Lower VRAM (default):** use all memory optimizations to greatly reduce GPU memory consumption, including optimizations that need extra system RAM.
 - **Lower RAM:** use only the GPU memory optimizations that do not need extra system RAM.
@@ -946,33 +946,17 @@ class family_handler:
         result["deepy_prompt_infos"] += still_prompt_infos
         if ptd:
             result.update({
-                "infos": PTD_INFOS, "prompt_infos": PTD_PROMPT_INFOS,
-                "deepy_infos": PTD_DEEPY_INFOS, "deepy_prompt_infos": PTD_DEEPY_PROMPT_INFOS,
+                "infos": PTD_INFOS + "\n\n" + result["infos"],
+                "deepy_infos": PTD_DEEPY_INFOS + "\n\n" + result["deepy_infos"],
                 "profiles_dir": ["minimax_h3_pruned_ptd" if pruned else "minimax_h3_ptd"],
-                "specialities": [{"name": "character consistency", "aliases": ["identity preservation"]}],
                 "spectrum_cache": False, "first_block_cache": False, "flow_shift": False,
-                "sliding_window": False, "video_continuation": False, "v2i_switch_supported": False, "image_outputs": False,
-                "image_prompt_types_allowed": "T", "end_frames_always_enabled": False, "custom_frames_injection": False,
-                "one_image_ref_needed": True,
-                "image_ref_choices": {**result["image_ref_choices"], "choices": result["image_ref_choices"]["choices"][1:3],
-                                      "letters_filter": "KI", "default": "I"},
-                "guide_custom_choices": {"choices": [("No Video Input", "")], "default": "", "letters_filter": "V", "label": "Video Input"},
-                "reference_video_enabled": False, "preprocess_video_guide2": False, "mask_preprocessing": {"selection": [""]},
-                "any_audio_prompt": False, "audio_prompt_choices": False, "reference_audio_enabled": False,
-                "audio_prompt_type_sources": {"selection": [""], "letters_filter": "ABDKS1", "default": ""}, "custom_settings": [],
-                "prompt_enhancer_def": {**result["prompt_enhancer_def"], "selection": ["TI"], "default": ""},
+                "custom_settings": [setting for setting in result["custom_settings"] if setting["id"] != H3_AUDIO_REFINEMENT_SETTING],
             })
         return result
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
         if model_def.get("ptd", False):
-            if int(inputs["image_mode"]) != 0 or inputs["video_prompt_type"] not in ("I", "KI") or inputs["audio_prompt_type"]:
-                return "PTD RefAsymOPD supports video generation from image references only"
-            if not 1 <= len(inputs.get("image_refs") or []) <= 9:
-                return "PTD RefAsymOPD requires one to nine reference images"
-            if any(inputs.get(name) is not None for name in ("image_start", "image_end", "video_source", "video_guide", "audio_guide")):
-                return "PTD RefAsymOPD accepts reference images, not start/end frames, video or audio inputs"
             inputs.update({"flow_shift": 12.0, "guidance_scale": 1.0, "guidance_phases": 1, "skip_steps_cache_type": ""})
         if model_def.get("veda", False):
             inputs["overrides"] = set_override(inputs["overrides"], "attention_mode", "veda")

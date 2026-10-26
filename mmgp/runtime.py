@@ -119,6 +119,23 @@ def lookup_on_cpu(*modules):
         module._mm_on_cpu = True
 
 
+def map_in_ram(*modules):
+    """Mark modules whose parameters MMGP keeps in reserved RAM mapped in the GPU's address space, never in VRAM: their kernels read the
+    rows they need in place, over the bus, inside CUDA graphs too and with indices computed on the GPU (a token table read for a few tokens
+    at each step). The parameters stay the modules' own, as CUDA views of their RAM, outside the blocks, base and budgets; the RAM is
+    charged to the reserved RAM while it exists. Parameters of other modules sharing their tensors follow them: never mark a table that a
+    module reads whole at each call (a head tied to it), which would read it over the bus. Call it on the loaded modules, before the offload
+    profile; without CUDA, or without reserved RAM left, the modules keep their usual placement."""
+    for module in modules:
+        module._mm_mapped = True
+
+
+def is_mapped(tensor):
+    """True for a parameter kept in mapped RAM (map_in_ram): a CUDA view of RAM, whose reads cross the bus."""
+    from .mapped import is_mapped
+    return is_mapped(tensor)
+
+
 def unused(*modules):
     """Mark modules that never run, such as the output head of a language model whose hidden states condition a generator (called through
     its base model): MMGP keeps their weights in RAM, out of VRAM, pinning and budgets, quantized or not, and raises if one runs. Call it on

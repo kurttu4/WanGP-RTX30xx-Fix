@@ -151,6 +151,8 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
         return 0, f"Speculative Decoding disabled automatically for Bonsai PTQ1: {detected_vram:.2f} GiB VRAM detected (10 GiB or less)."
     detected_vram_gb = max(0, int(float(total_vram_gb) + 0.5))
     model_label = {4: "Qwen3.5-9B", 6: "Qwen3.8-9B"}.get(enhancer_no, "Qwen3.8-27B")
+    if float(total_vram_gb) <= 8:  # 8 GB GPUs: the drafter, its caches and graphs would take room from the model's blocks
+        return 0, f"Speculative Decoding disabled automatically for {model_label}: {max(0.0, float(total_vram_gb)):.2f} GiB VRAM detected (8 GiB or less)."
     if detected_vram_gb >= required_vram_gb:
         return 1, f"Speculative Decoding enabled automatically for {model_label}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."
     return 0, f"Speculative Decoding disabled automatically for {model_label}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."

@@ -397,11 +397,7 @@ def alias_qwen35_text_embedding_for_mmgp(text_model: torch.nn.Module) -> torch.n
             optimizer=getattr(source_embedding, "optimizer", None),
         )
     embedding_model = cls(source_embedding.num_embeddings, source_embedding.embedding_dim, **kwargs)
-    if getattr(text_model, "_lm_engine_token_table_mapped", False):  # a table pinned in RAM and read in place (qwen35_text): outside MMGP too
-        del embedding_model._parameters["weight"]
-        embedding_model.__dict__["weight"] = source_embedding.weight
-    else:
-        embedding_model.weight = source_embedding.weight
+    embedding_model.weight = source_embedding.weight
     for name, buffer in source_embedding._buffers.items():
         embedding_model._buffers[name] = buffer
     if hasattr(source_embedding, "prism_transform"):

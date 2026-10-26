@@ -17,7 +17,7 @@ from .latent_upscaler import MiniMaxH3LatentUpscaler
 from .pipeline import MiniMaxH3Pipeline
 from .text_encoder import MiniMaxH3TextEncoder, load_h3_qwen_config
 from .transformer import MiniMaxH3Model, get_linear_split_map
-from .video_vae import MiniMaxH3VideoVAE, get_video_vae_linear_split_map
+from .video_vae import MiniMaxH3VideoVAE, get_video_vae_linear_split_map, group_qkv_rows
 from .viggle import load_fixed_prompt
 from .vae_upsampler import X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_VALUE
 
@@ -27,6 +27,7 @@ VIDEO_VAE_FP8MIX_FILE = "minimax_h3_video_vae_fp8mix.safetensors"
 VIDEO_VAE_INT8_FILE = "minimax_h3/minimax_h3_video_vae_int8_convrot.safetensors"
 VIDEO_VAE_LIGHT_FILE = "minimax_h3/minimax_h3_lightvae_lite_bf16.safetensors"
 VIDEO_VAE_LIGHT_INT8_FILE = "minimax_h3/minimax_h3_lightvae_lite_int8_convrot.safetensors"
+VIDEO_VAE_SPLIT_INT8 = True  # comparison switch: the INT8 VAEs split their q / k / v projections too (decoder attention through the attention kit)
 AUDIO_VAE_FILE = "MiniMax-H3-audio_vae_fp32.safetensors"
 LATENT_UPSCALER_FOLDER = "minimax_h3"
 LATENT_UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_bf16.safetensors"
@@ -249,6 +250,8 @@ def _load_video_vae(filename, qkv_splitting=True, upsampling=False):
     if split_map is not None:
         offload.split_linear_modules(vae, split_map)
     def preprocess(state_dict):
+        if split_map is not None:  # q / k / v rows grouped, as MMGP splits them (quantized ones included)
+            group_qkv_rows(state_dict)
         for name in ("latents_mean", "latents_std"):
             if upsampling:
                 state_dict["_" + name] = state_dict.pop(name)
@@ -312,7 +315,8 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
     transformer = _load_transformer(model_filename, dtype, qkv_splitting, qkv_layout, pdd, pdd_num_steps, pdd_block_size, vdn, veda, vsa)
     if shared_h3_pipeline is None:
         text_encoder = _load_text_encoder(text_encoder_filename, dtype) if fixed_prompt_filename is None else None
-        video_vae_qkv_splitting = qkv_splitting and video_vae_filename in (VIDEO_VAE_FILE, VIDEO_VAE_LIGHT_FILE, X2_VAE_FILE)
+        video_vae_qkv_splitting = qkv_splitting and video_vae_filename in (VIDEO_VAE_FILE, VIDEO_VAE_LIGHT_FILE, X2_VAE_FILE) + (
+            (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_INT8_FILE, X2_VAE_INT8_FILE) if VIDEO_VAE_SPLIT_INT8 else ())
         video_vae = _load_video_vae(video_vae_filename, video_vae_qkv_splitting, upsampling=video_vae_filename in (X2_VAE_FILE, X2_VAE_INT8_FILE))
         audio_vae = _load_audio_vae(audio_vae_filename)
         latent_upscaler = _load_latent_upscaler(latent_upscaler_filename) if fixed_prompt_filename is None else None

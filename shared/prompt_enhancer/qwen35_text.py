@@ -11,7 +11,7 @@ from collections import OrderedDict
 
 import numpy as np
 import torch
-from mmgp import offload
+from mmgp import offload, runtime
 from tqdm.auto import tqdm
 from shared.kernels.dispatch import triton_dtype_supported
 
@@ -49,8 +49,8 @@ from .qwen35_vl import (
 QWEN35_LLM_DISABLE_ENV = "WGP_LLM_DISABLE"
 QWEN35_LLM_PLANNED_CONTEXT = 32768  # tokens of KV cache planned beside the LLM's weights (MMGP cpuCompute pinning share)
 QWEN35_LLM_MAX_PRELOAD_MB = 0  # tests of partial residency: most VRAM the LLM's weights may keep (base, blocks, slots of the streamed ones); 0: all that fit
-# Prototype: the input token table (not tied to the head) pinned in RAM and read by the GPU over the bus, out of VRAM (see _map_qwen35_token_table)
-QWEN35_LLM_MAPPED_TOKEN_TABLE = False
+# the input token table, unless the head shares it, in reserved RAM read by the GPU in place (MMGP runtime.map_in_ram): out of VRAM, same outputs
+QWEN35_LLM_MAPPED_TOKEN_TABLE = True
 
 QWEN35_GGUF_LLAMACPP_ENV = "WGP_GGUF_LLAMACPP_CUDA"
 QWEN35_PROMPT_MIN_NEW_TOKENS = 4
@@ -131,42 +131,14 @@ def _resolve_gguf_linear_attention_layout_from_filename(model_path: str) -> tupl
     return False, False, True
 
 
-class _HostMapping:
-    """A pinned CPU tensor seen as CUDA memory: with unified addressing its host address is a device address (zero-copy reads)."""
-
-    def __init__(self, tensor: torch.Tensor):
-        self.tensor = tensor
-        self.__cuda_array_interface__ = dict(shape=(tensor.numel() * tensor.element_size(),), typestr="|u1", data=(tensor.data_ptr(), False), version=3)
-
-
-def _host_mapped(tensor: torch.Tensor) -> torch.Tensor:
-    pinned = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
-    pinned.copy_(tensor.as_subclass(torch.Tensor))
-    return torch.as_tensor(_HostMapping(pinned), device=torch.device("cuda", torch.cuda.current_device())).view(tensor.dtype).view(tensor.shape)
-
-
 def _map_qwen35_token_table(model) -> None:
-    """The input token table (and the MTP drafter's alias of it) pinned in RAM and read by the GPU in place: the lookups, inside the engine's
-    graphs and with token ids sampled on the GPU too, gather their packed rows over the bus and dequantize them with the same kernels, bit for
-    bit. Held outside the modules' parameters, MMGP neither moves it to VRAM nor counts it in budgets; the engine registers it as graph state.
-    A head tied to the table reads all of it at each pass: it stays with MMGP."""
-    weight = model.token_embd.weight
-    data_ptr = lambda tensor: (tensor._data if isinstance(tensor, GGUFWeightTensor) else tensor).data_ptr()
-    if data_ptr(model.output.weight) == data_ptr(weight):
+    """MMGP keeps the input token table (and the MTP drafter's alias of it) in reserved RAM mapped in the GPU's address space: the lookups,
+    inside the engine's graphs and with token ids sampled on the GPU too, read their rows over the bus and dequantize them with the same
+    kernels, bit for bit, the table out of VRAM. A head tied to the table reads all of it at each pass: it stays in VRAM."""
+    raw = lambda tensor: tensor._data if hasattr(tensor, "_data") else tensor
+    if raw(model.output.weight).data_ptr() == raw(model.token_embd.weight).data_ptr():
         return
-    modules = [model.token_embd] + ([model.mtp.embed_tokens] if model.mtp is not None else [])
-    if any(data_ptr(module.weight) != data_ptr(weight) for module in modules):
-        raise RuntimeError("The MTP token table is not the target's.")
-    if isinstance(weight, GGUFWeightTensor):
-        weight._data = _host_mapped(weight._data)
-    elif type(weight.data) is torch.Tensor:
-        weight = _host_mapped(weight.data)
-    else:  # other quantized tables (Quanto) keep the GPU path of their qtype
-        return
-    for module in modules:
-        del module._parameters["weight"]
-        module.__dict__["weight"] = weight
-    model._lm_engine_token_table_mapped = True
+    runtime.map_in_ram(model.token_embd, *([] if model.mtp is None else [model.mtp.embed_tokens]))
 
 
 def _load_text_config(config_path: str) -> Qwen3_5TextConfig:
@@ -1405,7 +1377,7 @@ def load_qwen35_text_prompt_enhancer(
     # MMGP manages the weights: its graphs replay the decoding passes, its dynamic preload keeps in VRAM all the blocks that fit beside the
     # KV cache and the activations (all of them at first: without its VRAM allocator, the budgets of the profile apply)
     model._lm_engine_mmgp_graphs = features["graphs"]
-    if QWEN35_LLM_MAPPED_TOKEN_TABLE and features["cuda"]:
+    if QWEN35_LLM_MAPPED_TOKEN_TABLE:
         _map_qwen35_token_table(model)
     from mmgp import allocator
     if allocator.active == "vmm":

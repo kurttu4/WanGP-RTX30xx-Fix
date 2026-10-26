@@ -4,6 +4,7 @@ each such model keeps in VRAM as many of its blocks as the VRAM left by its curr
 MMGP Optimized VRAM Allocator (mmgp.allocator)."""
 import dataclasses
 import threading
+import weakref
 
 import torch
 from tqdm import tqdm
@@ -19,6 +20,21 @@ PENALTY_PATIENCE_MAX = 1024  # a shortage after such a decrease doubles the cycl
 PENALTY_MIN = 64 * ONE_MB  # a smaller penalty is dropped when it halves
 _process_measures = {}  # with autoPreload=True: (model class, model id, structure, workload) -> peak of the activations measured, and
 # (..., workload, "penalty") -> its penalty (_penalty)
+END_OTHER_CYCLES = True  # comparison switch: another model's load or cycle ends the cycles left open (end_open_cycles)
+_planners = weakref.WeakSet()  # the AutoPreload objects of the process
+
+
+def end_open_cycles(manager=None, model_id=None):
+    """A model is loaded or starts a cycle: the cycles the other models left open end here (all offload objects). A cycle's measure is
+    the process' allocation peak since it started, and a measure only grows: left open, the VRAM of the next model's work (a
+    generation beside a language model kept loaded, a vision tower) would count as their activations for good, and their next plans
+    would keep fewer blocks."""
+    if not END_OTHER_CYCLES:
+        return
+    for planner in list(_planners):
+        for plan in list(planner.plans.values()):
+            if plan.workload is not None and not (planner.manager is manager and plan.model_id == model_id):
+                planner._end_cycle(plan)
 
 
 def _van_der_corput(n):
@@ -144,6 +160,7 @@ class AutoPreload:
             if plan is not None and manager.preloaded_blocks_per_model.get(model_id):
                 plan.manual = dict(manager.preloaded_blocks_per_model[model_id])
                 self.fixed[model_id] = plan
+        _planners.add(self)
         if self.plans or self.fixed:
             memory_pressure.register(self)
             if self.plans and self.verbose >= 1:
@@ -275,6 +292,7 @@ class AutoPreload:
         if block_name != plan.first or last == block_name:
             return
         self.thread = threading.get_ident()
+        end_open_cycles(self.manager, model_id)
         self._end_cycle(plan)
         loaded = self.manager.loaded_blocks[model_id]
         if loaded is not None and self.keep(model_id, loaded):  # the last block streamed to grow a plan: no streamed block retires it any more
