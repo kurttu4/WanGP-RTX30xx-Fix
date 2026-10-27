@@ -7,9 +7,15 @@ the region's loads and one online softmax carried across them.
 A group of 32 head dimensions is read as two halves of 16 lanes (kv_formats: values 0..15 in the low nibbles of 16 contiguous bytes,
 16..31 in their high nibbles; a Q8 record keeps its 32 bytes), each half loaded straight into the layout its dot needs, so no reorder
 follows a load; every product over the head dimension is two half-depth dots. The earlier loads with tl.interleave and permutes, and
-lane-indexed byte gathers, measured 1.4-2.7x slower (specs/KV_MIXED_PRECISION_STUDY_20261022.md)."""
+lane-indexed byte gathers, measured 1.4-2.7x slower (specs/KV_MIXED_PRECISION_STUDY_20261022.md).
+
+Turing (compute capability 7.5, shared.kernels.bf16_bits.applies): Triton has no BF16 conversion or BF16 tensor-core product there, so
+the decoding / verification kernel reads BF16 queries as bits and computes its products in FP32 (IEEE, CUDA cores; decoding is bound by
+the cache reads), and the reduction writes the BF16 output as bits. The prefill kernel keeps the GPUs with BF16 support (Turing prefills
+through the dense SDPA path, which is not captured in a CUDA graph)."""
 import torch
 
+from shared.kernels import bf16_bits, dispatch
 from . import kv_formats as kvf
 
 try:
@@ -73,27 +79,36 @@ if triton is not None:
 
     @triton.jit
     def _grouped_tile(q_a, q_b, k_ptr, v_ptr, ks_ptr, vs_ptr, km_ptr, vm_ptr, k_records, v_records, scale_records, columns, valid_rows, valid_columns, rows_limit,
-                      maximum, denominator, acc_a, acc_b, D: tl.constexpr, SCALE: tl.constexpr, K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr):
-        """One tile of the grouped kernel (the Q8 kernel's arithmetic: FP32 values, high/low BF16 pairs on the tensor cores), the head
-        dimension split in the two lane halves a and b."""
+                      maximum, denominator, acc_a, acc_b, D: tl.constexpr, SCALE: tl.constexpr, K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr,
+                      IEEE: tl.constexpr = False):
+        """One tile of the grouped kernel (the Q8 kernel's arithmetic: FP32 values, high/low BF16 pairs on the tensor cores; IEEE: FP32
+        queries and FP32 products for GPUs without BF16 in Triton), the head dimension split in the two lane halves a and b."""
         k_a, k_b = _grouped_halves(k_ptr, ks_ptr, km_ptr, k_records, scale_records, valid_columns, D, K_BITS, K_ASYM, True)
-        k_hi = k_a.to(q_a.dtype)
-        k_lo = (k_a - k_hi.to(tl.float32)).to(q_a.dtype)
-        scores = tl.dot(q_a, k_hi)
-        scores = tl.dot(q_a, k_lo, scores)
-        k_hi = k_b.to(q_a.dtype)
-        k_lo = (k_b - k_hi.to(tl.float32)).to(q_a.dtype)
-        scores = tl.dot(q_b, k_hi, scores)
-        scores = tl.dot(q_b, k_lo, scores) * SCALE
+        if IEEE:
+            scores = tl.dot(q_a, k_a, input_precision="ieee")
+            scores = tl.dot(q_b, k_b, scores, input_precision="ieee") * SCALE
+        else:
+            k_hi = k_a.to(q_a.dtype)
+            k_lo = (k_a - k_hi.to(tl.float32)).to(q_a.dtype)
+            scores = tl.dot(q_a, k_hi)
+            scores = tl.dot(q_a, k_lo, scores)
+            k_hi = k_b.to(q_a.dtype)
+            k_lo = (k_b - k_hi.to(tl.float32)).to(q_a.dtype)
+            scores = tl.dot(q_b, k_hi, scores)
+            scores = tl.dot(q_b, k_lo, scores) * SCALE
         valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= rows_limit[:, None])
         scores = tl.where(valid, scores, -1.0e20)
         new_maximum = tl.maximum(maximum, tl.max(scores, 1))
         correction = tl.exp2((maximum - new_maximum) * 1.4426950408889634)
         p = tl.where(valid, tl.exp2((scores - new_maximum[:, None]) * 1.4426950408889634), 0.0)
         denominator = denominator * correction + tl.sum(p, 1)
+        v_a, v_b = _grouped_halves(v_ptr, vs_ptr, vm_ptr, v_records, scale_records, valid_columns, D, V_BITS, V_ASYM, False)
+        if IEEE:
+            acc_a = tl.dot(p, v_a, acc_a * correction[:, None], input_precision="ieee")
+            acc_b = tl.dot(p, v_b, acc_b * correction[:, None], input_precision="ieee")
+            return new_maximum, denominator, acc_a, acc_b
         p_hi = p.to(q_a.dtype)
         p_lo = (p - p_hi.to(tl.float32)).to(q_a.dtype)
-        v_a, v_b = _grouped_halves(v_ptr, vs_ptr, vm_ptr, v_records, scale_records, valid_columns, D, V_BITS, V_ASYM, False)
         v_hi = v_a.to(q_a.dtype)
         v_lo = (v_a - v_hi.to(tl.float32)).to(q_a.dtype)
         acc_a *= correction[:, None]
@@ -115,8 +130,10 @@ if triton is not None:
     def mixed_grouped_partials_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, km_ptr, vm_ptr, ko_ptr, vo_ptr, kos_ptr, vos_ptr, tables_ptr, lengths_ptr, base_ptr, ring_ptr,
                                       partial_ptr, maximum_ptr, sum_ptr, Q_PER_SEQ, H_Q: tl.constexpr, H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr, TABLE_WIDTH,
                                       SPLITS: tl.constexpr, M: tl.constexpr, N: tl.constexpr, SCALE: tl.constexpr,
-                                      K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr, OVERLAY: tl.constexpr, SINK: tl.constexpr, RING: tl.constexpr):
-        """Decoding and verification: the queries of a sequence that share a KV head attend together; the context is split across programs."""
+                                      K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr, OVERLAY: tl.constexpr, SINK: tl.constexpr, RING: tl.constexpr,
+                                      Q_BITS: tl.constexpr = False):
+        """Decoding and verification: the queries of a sequence that share a KV head attend together; the context is split across programs.
+        Q_BITS: BF16 queries read as bits (an int16 pointer), FP32 products (Turing)."""
         sequence, kv_head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         split, query_block = tile % SPLITS, tile // SPLITS
         group: tl.constexpr = H_Q // H_KV
@@ -130,8 +147,12 @@ if triton is not None:
         half = tl.arange(0, D // 2)
         dims_a = (half // 16) * 32 + half % 16  # the head dimensions of lane half a; b is 16 further
         q_base = (query_index[:, None] * H_Q + query_head[:, None]) * D + dims_a[None, :]
-        q_a = tl.load(q_ptr + q_base, mask=valid_rows[:, None], other=0.0)
-        q_b = tl.load(q_ptr + q_base + 16, mask=valid_rows[:, None], other=0.0)
+        if Q_BITS:
+            q_a = bf16_bits.bf16_bits_to_fp32(tl.load(q_ptr + q_base, mask=valid_rows[:, None], other=0))
+            q_b = bf16_bits.bf16_bits_to_fp32(tl.load(q_ptr + q_base + 16, mask=valid_rows[:, None], other=0))
+        else:
+            q_a = tl.load(q_ptr + q_base, mask=valid_rows[:, None], other=0.0)
+            q_b = tl.load(q_ptr + q_base + 16, mask=valid_rows[:, None], other=0.0)
         context_len = tl.load(lengths_ptr + sequence)
         prefix_len = context_len - Q_PER_SEQ
         rows_limit = prefix_len + rows // group
@@ -157,21 +178,21 @@ if triton is not None:
                 valid_columns = columns < sink_end
                 records = (base + columns) * H_KV + kv_head
                 maximum, denominator, acc_a, acc_b = _grouped_tile(q_a, q_b, ko_ptr, vo_ptr, kos_ptr, vos_ptr, kos_ptr, vos_ptr, records * D, records * D, records * QB, columns, valid_rows, valid_columns, rows_limit,
-                                                                   maximum, denominator, acc_a, acc_b, D, SCALE, 8, False, 8, False)
+                                                                   maximum, denominator, acc_a, acc_b, D, SCALE, 8, False, 8, False, Q_BITS)
         for start in tl.range(sink_end, ring_begin, N):
             columns = start + tl.arange(0, N)
             valid_columns = columns < ring_begin
             page = tl.load(tables_ptr + sequence * TABLE_WIDTH + columns // PAGE, mask=valid_columns, other=0)
             records = (page * PAGE + columns % PAGE) * H_KV + kv_head
             maximum, denominator, acc_a, acc_b = _grouped_tile(q_a, q_b, k_ptr, v_ptr, ks_ptr, vs_ptr, km_ptr, vm_ptr, records * K_WIDTH, records * V_WIDTH, records * QB, columns, valid_rows, valid_columns, rows_limit,
-                                                               maximum, denominator, acc_a, acc_b, D, SCALE, K_BITS, K_ASYM, V_BITS, V_ASYM)
+                                                               maximum, denominator, acc_a, acc_b, D, SCALE, K_BITS, K_ASYM, V_BITS, V_ASYM, Q_BITS)
         if OVERLAY:
             for start in tl.range(ring_begin, end, N):
                 columns = start + tl.arange(0, N)
                 valid_columns = columns < end
                 records = (base + SINK + (columns & (RING - 1))) * H_KV + kv_head
                 maximum, denominator, acc_a, acc_b = _grouped_tile(q_a, q_b, ko_ptr, vo_ptr, kos_ptr, vos_ptr, kos_ptr, vos_ptr, records * D, records * D, records * QB, columns, valid_rows, valid_columns, rows_limit,
-                                                                   maximum, denominator, acc_a, acc_b, D, SCALE, 8, False, 8, False)
+                                                                   maximum, denominator, acc_a, acc_b, D, SCALE, 8, False, 8, False, Q_BITS)
         index = (query_index * H_Q + query_head) * SPLITS + split
         tl.store(partial_ptr + index[:, None] * D + dims_a[None, :], acc_a, mask=valid_rows[:, None])
         tl.store(partial_ptr + index[:, None] * D + dims_a[None, :] + 16, acc_b, mask=valid_rows[:, None])
@@ -320,8 +341,9 @@ def grouped_attention(q: torch.Tensor, module, context, softmax_scale: float, bl
     queries_per_sequence = q.shape[0] // context_lens.numel()
     groups = q.shape[1] // kv_heads
     query_rows = queries_per_sequence * groups
-    if block_m is None:
-        block_m = 32 if query_rows > 16 else 16
+    bits = bf16_bits.applies(q)  # Turing: BF16 q read as bits, FP32 products, BF16 output written as bits
+    if block_m is None:  # Turing's FP32 operands of 32 rows exceed its 64 KiB of shared memory: 16 rows there
+        block_m = 32 if query_rows > 16 and not bits else 16
     query_blocks = triton.cdiv(query_rows, block_m)
     blocks = context_lens.numel() * kv_heads * triton.cdiv(query_rows, 16)
     splits = min(128, triton.next_power_of_2(triton.cdiv(4 * torch.cuda.get_device_properties(q.device).multi_processor_count, blocks)))
@@ -331,11 +353,14 @@ def grouped_attention(q: torch.Tensor, module, context, softmax_scale: float, bl
     output = torch.empty_like(q)
     has_overlay, base, ring = _overlay_context(context, layout, q.device)
     mixed_grouped_partials_kernel[(context_lens.numel(), kv_heads, query_blocks * splits)](
-        q, k_cache, v_cache, module.k_scale, module.v_scale, k_min, v_min, *overlay, context.block_tables, context_lens, base, ring, partial, maximum, denominator,
+        q.view(torch.int16) if bits else q, k_cache, v_cache, module.k_scale, module.v_scale, k_min, v_min, *overlay, context.block_tables, context_lens, base, ring, partial, maximum, denominator,
         queries_per_sequence, q.shape[1], kv_heads, head_dim, k_cache.shape[1], context.block_tables.shape[1], splits, block_m, 32, softmax_scale,
         layout.k.bits, layout.k.asymmetric, layout.v.bits, layout.v.asymmetric, has_overlay, layout.sink_tokens(k_cache.shape[1]), max(layout.recent_tokens, 32),
-        num_warps=num_warps, num_stages=num_stages)
-    q8_grouped_reduce_kernel[(q.shape[0] * q.shape[1],)](partial, maximum, denominator, output, splits, head_dim, num_warps=4)
+        Q_BITS=bits, num_warps=num_warps, num_stages=num_stages)
+    if bits:
+        bf16_bits._q8_attention_reduce_kernel[(q.shape[0] * q.shape[1],)](partial, maximum, denominator, output.view(torch.int16), splits, head_dim, num_warps=4)
+    else:
+        q8_grouped_reduce_kernel[(q.shape[0] * q.shape[1],)](partial, maximum, denominator, output, splits, head_dim, num_warps=4)
     return output
 
 
@@ -356,10 +381,11 @@ def prefill(q: torch.Tensor, module, context, softmax_scale: float, num_warps: i
     return output
 
 
-def available(q: torch.Tensor, module) -> bool:
-    """The Triton kernels serve this call: CUDA (not HIP), Triton with BF16/FP16 conversions, a supported head size, no Turing bit path."""
+def available(q: torch.Tensor, module, prefill: bool = False) -> bool:
+    """The Triton kernels serve this call: CUDA (not HIP), a supported head size, and Triton with q's dtype conversions, or on Turing
+    (bf16_bits.applies) a decoding / verification call with BF16 queries (read as bits); Turing prefills through the dense path."""
     return (triton is not None and q.is_cuda and torch.version.hip is None and q.dtype in (torch.float16, torch.bfloat16) and q.is_contiguous()
-            and module.head_dim in (32, 64, 128, 256) and not module.use_bf16_bits)
+            and module.head_dim in (32, 64, 128, 256) and (dispatch.triton_dtype_supported(q.device, q.dtype) or not prefill and bf16_bits.applies(q)))
 
 
 if triton is not None:

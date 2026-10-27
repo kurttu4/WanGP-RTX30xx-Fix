@@ -751,9 +751,8 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.flash_attn_varlen_func = _DEFAULT_FLASH_ATTN_VARLEN_FUNC
         self.flash_attn_with_kvcache = _DEFAULT_FLASH_ATTN_WITH_KVCACHE
+        # the LM features' Triton switch: each call then takes the Triton kernels the GPU runs for q's dtype (native, or BF16 read as bits on Turing)
         self.use_triton_kv_cache = _DEFAULT_USE_TRITON_KV_CACHE
-        self.efficient_prefill = False  # set by the model on GPUs without FlashAttention: one memory-efficient FP32 SDPA per sequence
-        self.use_bf16_bits = False  # set by models on GPUs that run Triton without BF16 conversions: Q8 decode/verification of shared.kernels.bf16_bits
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = torch.tensor([])
         self._q8_speculative_metadata = {}
@@ -765,7 +764,7 @@ class Attention(nn.Module):
     def prepare_speculative_metadata(self, max_query_count: int, max_num_blocks: int) -> None:
         if self.k_cache.dtype != torch.int8 or not self.k_cache.is_cuda or _Q8_PAGED_ATTENTION is None:
             return
-        if self.use_triton_kv_cache and triton is not None and self.head_dim in (32, 64, 128, 256):
+        if self.use_triton_kv_cache and triton is not None and self.head_dim in (32, 64, 128, 256) and dispatch.triton_dtype_supported(self.k_cache.device, torch.bfloat16):
             return
         # Allocate before graph-state registration; eager and captured calls share fixed-width tables.
         self._q8_speculative_metadata = {
@@ -789,16 +788,17 @@ class Attention(nn.Module):
         q8_kernels = quantized_cache and not mixed  # the Q8 kernels never read a mixed body: attention_mixed or the dense fallbacks do
         reads_cache = context.speculative_verify or not context.is_prefill or context.block_tables is not None
         q8_attention = _Q8_PAGED_ATTENTION if q8_kernels and not mixed and not context.speculative_verify and not context.is_prefill else None
-        use_triton = self.use_triton_kv_cache and triton is not None
+        use_triton = self.use_triton_kv_cache and triton is not None and dispatch.triton_dtype_supported(q.device, q.dtype)
+        bits = self.use_triton_kv_cache and triton is not None and bf16_bits.applies(q)  # Turing: the kernels reading BF16 q as bits
         q8_grouped = q8_kernels and use_triton and self.head_dim in (32, 64, 128, 256) and (context.speculative_verify or not context.is_prefill)
         q8_prefill = q8_kernels and context.is_prefill and context.block_tables is not None and use_triton
         q8_speculative = q8_kernels and not mixed and context.speculative_verify and _Q8_PAGED_ATTENTION is not None
-        if self.use_bf16_bits and quantized_cache and not mixed and (context.speculative_verify or not context.is_prefill) and q.dtype == torch.bfloat16 and self.head_dim == 256 and q.is_contiguous():
+        if bits and quantized_cache and not mixed and (context.speculative_verify or not context.is_prefill) and q.dtype == torch.bfloat16 and self.head_dim == 256 and q.is_contiguous():
             _log_kv_attention_backend_once("bf16_bits_q8", "[Deepy][KV cache] decode/verification backend=grouped Q8 paged attention for Turing (BF16 read as bits, FP16 tensor cores, FP32 accumulation).")
             context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
             output = bf16_bits.q8_paged_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale)
             return output if context.speculative_verify else output.unsqueeze(1)
-        if mixed and _MIXED_KERNELS and use_triton and attention_mixed.available(q, self):
+        if mixed and _MIXED_KERNELS and (use_triton or bits) and attention_mixed.available(q, self, prefill=context.is_prefill and not context.speculative_verify):
             if context.speculative_verify or not context.is_prefill:
                 _log_kv_attention_backend_once("mixed_grouped", f"[Deepy][KV cache] decode/verification backend=grouped paged attention over the {self.kv_layout.value} cache (Triton, FP32 accumulation).")
                 output = attention_mixed.grouped_attention(q, self, context, self.scale)
@@ -829,8 +829,9 @@ class Attention(nn.Module):
             context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
             output = q8_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale)
             return output.squeeze(1) if context.speculative_verify else output
-        if (self.efficient_prefill and context.is_prefill and not context.speculative_verify
-                and self.flash_attn_varlen_func is None):
+        # GPUs without BF16 arithmetic (pre-Ampere NVIDIA) and without FlashAttention: one memory-efficient FP32 SDPA per sequence
+        if (context.is_prefill and not context.speculative_verify and self.flash_attn_varlen_func is None
+                and q.is_cuda and not dispatch.triton_dtype_supported(q.device, q.dtype)):
             # Gather occupied pages before dequantizing on the hardware-selected
             # SDPA route, rather than expanding the entire reserved Q8 cache.
             if mixed:

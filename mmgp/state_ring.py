@@ -44,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from tqdm import tqdm
 
-from . import allocator, cuda_graphs, memory_pressure, offload
+from . import allocator, cuda_graphs, memory_pressure, offload, pinned
 
 SLOTS = 2  # GPU slots without a managed model: the block running and the next one (window + 1 with MMGP's prefetch window)
 STAGING = 2  # locked buffers of pageable records (window + 1 with MMGP), one per record transferred or being copied ahead
@@ -54,8 +54,8 @@ _ALIGN = offload.BLOCK_ALIGN
 
 def _locked(size, device):
     """size bytes of RAM of its own, locked, and its registration (None when it could not be locked)."""
-    ram, owner = offload._pinned_block(size)
-    registration = offload._HostRegistration(owner, ram.data_ptr(), size, device)
+    ram, owner = pinned.block(size)
+    registration = pinned.Registration(owner, ram.data_ptr(), size, device, kind="state")
     return (ram, registration) if int(registration.register()) == 0 else (ram, None)
 
 
@@ -189,7 +189,7 @@ class StateRing:
             self.staging_count = self.count
             self.held, self.ready = [None] * self.count, [None] * self.count
         budget = getattr(self.manager, "max_reservable_memory", 0)
-        room = budget - offload.total_pinned_bytes - offload._pool.reserved() if budget > 0 else 0
+        room = budget - pinned.total_bytes - offload._pool.reserved() if budget > 0 else 0
         # with MMGP's staging ring, the pageable records cross it with their blocks' weights while MMGP streams them (fetch decides per block)
         mmgp_staging = self.entries is not None and getattr(self.manager, "ring", None) is not None
         # buffers of the ring's own for the records MMGP does not stage, but for a model MMGP does not pin (profile 5): without MMGP's ring

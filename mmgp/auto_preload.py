@@ -19,8 +19,9 @@ PENALTY_PATIENCE = 8  # cycles without VRAM shortage or allocator recovery after
 PENALTY_PATIENCE_MAX = 1024  # a shortage after such a decrease doubles the cycles waited before the next one, up to this
 PENALTY_MIN = 64 * ONE_MB  # a smaller penalty is dropped when it halves
 _process_measures = {}  # with autoPreload=True: (model class, model id, structure, workload) -> peak of the activations measured, and
-# (..., workload, "penalty") -> its penalty (_penalty)
+# (..., workload, "penalty") -> its penalty (_penalty), (..., workload, "unmeasured") -> True while its measure is the 0 set by a shortage
 END_OTHER_CYCLES = True  # comparison switch: another model's load or cycle ends the cycles left open (end_open_cycles)
+FIRST_MEASURE_CLEARS_PENALTY = True  # comparison switch: a workload's first measure drops the penalty of the shortages met before it (_end_cycle)
 _planners = weakref.WeakSet()  # the AutoPreload objects of the process
 
 
@@ -127,6 +128,7 @@ class _Plan:
         self.measuring = False  # the cycle running measures a new workload with the budget's preload: the next one may keep other blocks
         self.workload_of = workload  # or the model's _auto_preload_workload(args, kwargs): its own grouping of the inputs into workloads
         self.cap = None  # or the model's _auto_preload_max: the most VRAM its weights may hold (base, blocks kept, slots of the streamed ones)
+        self.margin = MARGIN  # or the model's _auto_preload_margin: left free beyond its measured peaks (e.g. passes replayed by CUDA graphs vary less)
         self.state_room = 0  # VRAM left to the state its rings keep in VRAM (mmgp.state_ring) once every block is kept, nothing otherwise
         self.state_short = False  # the state its rings kept in VRAM was released under pressure during the cycle
 
@@ -194,6 +196,7 @@ class AutoPreload:
         plan = _Plan(model_id, type(m.models[model_id]).__name__, towers, m.blocks_of_modules_sizes.get(model_id, 0), others)
         plan.workload_of = getattr(m.models[model_id], "_auto_preload_workload", None) or workload
         plan.cap = getattr(m.models[model_id], "_auto_preload_max", None)
+        plan.margin = getattr(m.models[model_id], "_auto_preload_margin", MARGIN)
         return plan
 
     def _penalty(self, key):
@@ -225,7 +228,7 @@ class AutoPreload:
         state the model's rings keep in VRAM gets what remains once every block fits (plan.state_room), less its own penalty for the workload
         (_state_penalty): weights first, and a shortage of the state shrinks only the state's room."""
         stats = allocator.stats()
-        target = stats["reserved"] + allocator.room() - peak - MARGIN - int(MARGIN_SHARE * peak)
+        target = stats["reserved"] + allocator.room() - peak - plan.margin - int(MARGIN_SHARE * peak)
         if plan.cap is not None:
             target = min(target, plan.cap)
         whole = plan.base + sum(plan.sizes.values())
@@ -397,7 +400,7 @@ class AutoPreload:
                 continue
             plan.pending = set()
             preloaded = m.preloaded_blocks_per_model[model_id]
-            victims = [name for name in reversed(plan.ranking) if name in preloaded and name != plan.last]
+            victims = [name for name in reversed(plan.ranking) if name in preloaded and name != plan.last and model_id + "/" + name not in m.prefetch_futures]
             if not victims:
                 continue
             m.transfer_stream.wait_stream(torch.cuda.current_stream())  # their memory may still be read by the work queued
@@ -414,7 +417,8 @@ class AutoPreload:
             plan.relink = True  # back in the chain of the streamed blocks at the next cycle, not inside an allocation
             if plan.workload is not None:  # the plan was too large for this workload: its next plans leave the memory released free
                 key = (*plan.structure, plan.workload)
-                self.measures.setdefault(key, 0)  # measured from now on: not the budget's preload again (its cycles keep blocks, unmeasured)
+                if key not in self.measures:  # measured from now on: not the budget's preload again (its cycles keep blocks, unmeasured)
+                    self.measures[key], self.measures[(*key, "unmeasured")] = 0, True
                 self._penalty(key)[0] += released
                 plan.short = True
             if freed >= need:
@@ -437,9 +441,13 @@ class AutoPreload:
                     state_penalty[0] = 0 if state_penalty[0] < 2 * PENALTY_MIN else state_penalty[0] // 2
                     state_penalty[1] = 0
             plan.state_short = False
+            penalty = self._penalty(key)
             if not plan.grew and not plan.short:  # a cycle that ran short peaked with the blocks it released still counted (the penalty has it)
                 self.measures[key] = max(self.measures.get(key, 0), allocator.mark_peak() - plan.min_weights)
-            penalty = self._penalty(key)
+                if self.measures.pop((*key, "unmeasured"), False) and FIRST_MEASURE_CLEARS_PENALTY:
+                    # the shortages before it came from plans that left no room for the activations, which this measure now leaves: their
+                    # penalty would count them twice (e.g. a 27B LLM decoding at 11 GiB kept 53 instead of 60 of its 64 blocks)
+                    penalty[0], penalty[1], penalty[3] = 0, 0, False
             recovered = plan.recoveries is not None and allocator.stats()["recoveries"] > plan.recoveries
             if recovered:
                 # the allocator found the VRAM short and waited for other streams or synchronized the device to reuse memory, which stalls the

@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from tqdm import tqdm
 
-from . import offload
+from . import offload, pinned
 
 _REGISTER_MAPPED = 2  # cudaHostRegisterMapped
 _driver = None
@@ -56,9 +56,9 @@ def _mapped_copy(tensor, device, executor):
     """A CUDA view of a copy of tensor in mapped RAM, whole pages of its own (registration rounds to pages)."""
     nbytes = tensor.numel() * tensor.element_size()
     size = -(-nbytes // mmap.PAGESIZE) * mmap.PAGESIZE
-    ram, owner = offload._pinned_block(size)
+    ram, owner = pinned.block(size)
     ram[:nbytes].view(tensor.dtype).view(tensor.shape).copy_(tensor.as_subclass(torch.Tensor))
-    owner.registration = offload._HostRegistration(owner.base, ram.data_ptr(), size, device.index, flags=_REGISTER_MAPPED)
+    owner.registration = pinned.Registration(owner.base, ram.data_ptr(), size, device.index, flags=_REGISTER_MAPPED, kind="mapped")
     error = executor.submit(owner.registration.register).result()  # a failure leaves no CUDA error pending on this thread
     if int(error) != 0:
         raise MemoryError(f"cudaHostRegister returned {error}")
@@ -93,7 +93,7 @@ def map_parameters(models, max_reservable_memory, verboseLevel=1):
         return
     sources = {tensor.data_ptr(): tensor.numel() * tensor.element_size() for parameter in parameters for _, tensor in _tensors(parameter)}
     nbytes = sum(-(-size // mmap.PAGESIZE) * mmap.PAGESIZE for size in sources.values())
-    if 0 < max_reservable_memory < offload.total_pinned_bytes + nbytes or 0 < offload.max_pinnable_bytes < offload.total_pinned_bytes + nbytes:
+    if not pinned.fits(nbytes, max_reservable_memory):
         tqdm.write(f"[MMGP] Not enough reserved RAM left to map {names} ({nbytes / offload.ONE_MB:.0f} MB): they keep their usual placement.")
         return
     # the parameters of the other modules sharing these tensors (e.g. an MTP drafter's alias of a table) follow them

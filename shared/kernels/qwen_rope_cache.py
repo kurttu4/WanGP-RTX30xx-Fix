@@ -61,8 +61,11 @@ def _rope_cache_kernel(Q, K, V, COS, SIN, KC, VC, KS, VS, SLOTS,
                     tl.store(VC + offset, v)
 
 
+from shared.kernels.dispatch import triton_dtype_supported  # after the kernels: their line numbers key Triton's cache
+
+
 def supported(q, k, v, cos, sin):
-    return (q.is_cuda and torch.version.hip is None and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    return (q.is_cuda and torch.version.hip is None and q.dtype in (torch.float16, torch.bfloat16, torch.float32) and triton_dtype_supported(q.device, q.dtype)
             and q.dtype == k.dtype == v.dtype == cos.dtype == sin.dtype
             and q.shape[:2] == k.shape[:2] == v.shape[:2] == cos.shape[:2]
             and q.shape[-1] == k.shape[-1] == v.shape[-1] and k.shape[2] == v.shape[2]

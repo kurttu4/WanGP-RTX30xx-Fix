@@ -64,7 +64,7 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 ## 🔥 Latest Updates : 
 
-## 25th of October 2026: WanGP v18.81 - The One World Generator
+## 27th of October 2026: WanGP v18.84 - The One World Generator
 
 ###  New World Generators
 Create a world, then walk through it with the keyboard in the new **Worlds gallery**. Save your exploration to continue later, record the journey as a video, or capture a view for another generation. You don't need a 24 GB card to join in: **8 GB is enough to get started** and almost at **NO SPEED COST** thanks to **MMGPv4**. Don't expect miracles, though: near-real-time exploration depends on the model and a fast, recent GPU.

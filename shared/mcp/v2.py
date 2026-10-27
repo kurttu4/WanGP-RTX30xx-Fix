@@ -1021,7 +1021,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
             return present_job(initial)
         job = jobs.get(initial["job_id"])
         try:
-            job.job.result(timeout=args.get("timeout_s"))
+            job.wait(timeout=args.get("timeout_s"))
         except TimeoutError:
             result = job.snapshot(event_limit=args.get("event_limit", 0))
             result.update({key: initial[key] for key in ("request_id", "reused") if key in initial})
@@ -1209,10 +1209,10 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
         if action in {"get_job", "wait_jobs"} and extended:
             records = [jobs.get(job_id) for job_id in (arguments["job_ids"] if action == "wait_jobs" else [arguments["job_id"]])]
             finished = any if action == "wait_jobs" and arguments.get("mode", "any") == "any" else all
-            done = lambda: finished(isinstance(record, RecoveredJob) or record.job.done for record in records)  # recovered receipts have no live job
+            done = lambda: finished(isinstance(record, RecoveredJob) or record.done for record in records)  # recovered receipts have no live job
             deadline = time.monotonic() + arguments.get("wait_s", 60 if action == "wait_jobs" else 0)
             while not done() and time.monotonic() < deadline:
-                time.sleep(0.2)
+                time.sleep(min(0.2, max(0, deadline - time.monotonic())))
             if action == "get_job":
                 return present_job(records[0].snapshot(event_limit=arguments.get("event_limit", 0)))
             return {"status": "done" if done() else "timeout", "jobs": [present_job(record.snapshot(event_limit=0)) for record in records]}

@@ -1388,10 +1388,19 @@ class _JobRecord:
         self.progress: dict[str, Any] | None = None
         self.result: dict[str, Any] | None = None
         self._lock = threading.Lock()
+        self._done = threading.Event()
         self._watcher = threading.Thread(target=self._watch, daemon=True, name=f"wangp-mcp-job-{job_id}")
 
     def start(self) -> None:
         self._watcher.start()
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def wait(self, timeout: float | None = None) -> None:
+        if not self._done.wait(timeout):
+            raise TimeoutError("WanGP job result timed out")
 
     def _watch(self) -> None:
         for event in self.job.events.iter(timeout=0.2):
@@ -1403,23 +1412,20 @@ class _JobRecord:
                 self.updated_at = time.time()
                 if event.kind == "progress":
                     self.progress = event_dict["data"]
-                if event.kind == "completed" and type(event.data).__name__ == "GenerationResult" and self.result is None:
-                    self.result = self._completed_result(event.data)
-        self._capture_result_if_done()
+        # Only the watcher builds the result. Media analysis must not hold the
+        # snapshot lock or run on a polling request's thread.
+        try:
+            result = self._completed_result(self.job.result(timeout=0))
+        except Exception as error:
+            result = {"error": str(error)}
+        with self._lock:
+            self.result = result
+            self.updated_at = time.time()
+            self._done.set()
         if self.state is not None:
             saved = self.snapshot(event_limit=0)
+            saved["status"] = _compact_job_snapshot(saved)["status"]
             self.state.save_job(self.job_id, saved)
-
-    def _capture_result_if_done(self) -> None:
-        with self._lock:
-            if not self.job.done or self.result is not None:
-                return
-            try:
-                completed = self.job.result(timeout=0)
-            except Exception:
-                return
-            self.result = self._completed_result(completed)
-            self.updated_at = time.time()
 
     def _completed_result(self, completed) -> dict[str, Any]:
         result = _result_to_dict(completed, self.file_store, self.job_id)
@@ -1454,7 +1460,6 @@ class _JobRecord:
         return result
 
     def snapshot(self, event_limit: int = 20) -> dict[str, Any]:
-        self._capture_result_if_done()
         event_limit = 20 if event_limit is None else event_limit
         event_limit = max(0, min(int(event_limit), _MAX_STORED_EVENTS))
         with self._lock:
@@ -1466,7 +1471,7 @@ class _JobRecord:
             "job_id": self.job_id,
             "workspace_id": getattr(self.session, '_workspace_id', None),
             "agent_context": getattr(self.session, '_agent_context', None),
-            "done": self.job.done,
+            "done": result is not None,
             "cancel_requested": self.job.cancel_requested,
             "webui_submission_ready": self.job.webui_submission_ready,
             "webui_load_queue_token": self.job.webui_load_queue_token if self.job.webui_submission_ready else "",
@@ -2147,7 +2152,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
         record = jobs.submit(prepare_generation(source))
         if wait:
-            record.job.result(timeout=timeout_s)
+            record.wait(timeout=timeout_s)
         return record.snapshot(event_limit=default_job_event_limit if event_limit is None else event_limit)
 
     @api_tool()

@@ -900,7 +900,7 @@ class DeepyPrimeTools:
             try:
                 if record.job.wait_for_webui_submission_or_completion() and trigger_queue and not record.job.done and not record.job.cancel_requested:
                     self.send_cmd("load_queue_trigger", {"job_id": job_id, "token": record.job.webui_load_queue_token})
-                record.job.result()
+                record.wait()
                 self._remember_generated_media(record.snapshot(event_limit=0))
             finally:
                 self._background_jobs.pop(job_id, None)
