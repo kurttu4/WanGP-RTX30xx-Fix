@@ -235,6 +235,24 @@ Pinned ("reserved") RAM makes the transfers to the GPU fast, but nothing else ca
 
 When the models do not all fit in it, WanGP reserves first the parts used at every step; with [Smart Memory Pinning](#smart-memory-pinning), the rest still reaches the GPU almost as fast, so a smaller share mostly costs speed on short steps.
 
+### Trying a Smaller GPU
+```bash
+--max-vram 8   # WanGP behaves as on a GPU with 8 GB of VRAM
+```
+`--max-vram GB` makes WanGP behave as it would on a GPU with that much VRAM: memory profiles, preloads, VAE tiling and Deepy's choices follow that card, and WanGP uses at most GB - 1.2 GB of VRAM (a real card leaves about that much to the driver and the desktop). Use it to check that settings or a workflow fit a smaller GPU before sharing them. The VRAM other programs use on your GPU does not count, unless they leave less than the emulated card would: then WanGP has only what is really free. The speed stays that of your GPU.
+
+### RAM Budget
+```bash
+--max-ram 24   # WanGP plans its RAM within 24 GB
+```
+`--max-ram GB` gives WanGP a RAM budget, to leave room for the other programs you use beside it: the RAM it reserves for fast transfers, the RAM it keeps free and the moment it gives back the RAM of models that are not running all follow that budget, counting the RAM WanGP already uses. The RAM other programs use does not count, unless they leave WanGP less than its budget. The RAM WanGP may reserve stays a share of your PC's real RAM (see `--perc-reserved-mem-max`), a safeguard that keeps your system responsive, and never exceeds the budget. It guides WanGP's memory planning but is not a hard limit: a generation that needs more RAM than the budget still gets it from your PC.
+
+### Simulating a PC With Less RAM
+```bash
+--ram-stress 32   # WanGP runs as on a PC with 32 GB of RAM
+```
+`--ram-stress GB` makes your PC behave as one with that much RAM: a helper process locks the rest of your RAM, about 6 GB (2 GB on Linux) being left to the system and other programs, so WanGP plans as on that PC and your system slows down and pages as it would there. Use it with `--max-vram` to check that a workflow fits a smaller PC before sharing it. While it runs, your other programs have less RAM too: whenever the available RAM stays under 1 GB for 10 seconds, the helper gives back 1 GB. Locking takes a few seconds per 10 GB at startup, and the RAM comes back when WanGP closes. On Linux, the user must be allowed to lock that much memory (`ulimit -l`).
+
 ### VRAM Allocator
 ```bash
 --vram-allocator vmm_spill  # MMGP Optimized VRAM Allocator with RAM spilling (default)

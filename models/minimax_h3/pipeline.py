@@ -21,7 +21,7 @@ from shared.utils.utils import guide_mask_to_float, guide_to_float
 from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count, normalize_overlap
 from shared.utils.utils import convert_video_tensor_to_uint8_chunked
 from .constants import (H3_AUDIO_REFINEMENT_DENOISE, H3_AUDIO_REFINEMENT_SETTING, H3_AUDIO_REFINEMENT_STEPS, H3_CONTROL_LATENT_CONTINUATION,
-                        H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, h3_grouped_masking_enabled)
+                        H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_LORA, h3_grouped_masking_enabled)
 from .dialogue import H3_DIALOGUE_GENERATION, generate_dialogue, is_dialogue_prompt
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .first_block_cache import MiniMaxH3FirstBlockCache
@@ -762,7 +762,7 @@ class MiniMaxH3Pipeline:
                  video_guide=None, audio_guide=None, audio_guide2=None, audio_guide3=None, prefix_frames_count=0,
                  frame_num=124, height=768, width=1344, shift=12.0, sampling_steps=30, sampling_steps2=3, seed=0,
                  callback=None, VAE_tile_size=None, audio_prompt_type="", video_prompt_type="", fps=24,
-                 sample_solver="euler", attention_sparsity=1.0,
+                 sample_solver="euler", attention_sparsity=1.0, custom_sigmas=None,
                  guide_phases=1, switch_threshold=H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, loras_slists=None, loras_selected=None, set_progress_status=None,
                  starting_sigma=None, preserve_input_mask_values=False, refinement_mode=False,
                  custom_settings=None, duration_seconds=None, verbose_level=0, dialogue_segment=False, image_mode=0,
@@ -777,6 +777,12 @@ class MiniMaxH3Pipeline:
                 loras_slists=loras_slists, loras_selected=loras_selected, custom_settings=custom_settings,
                 set_progress_status=set_progress_status, verbose_level=verbose_level)
         self._use_shared_components()
+        phase_1_sigmas = custom_sigmas[0] if custom_sigmas else None
+        phase_2_sigmas = custom_sigmas[1] if custom_sigmas and len(custom_sigmas) > 1 else None
+        if phase_1_sigmas is not None:
+            sampling_steps = len(phase_1_sigmas)
+        if phase_2_sigmas is not None:
+            sampling_steps2 = len(phase_2_sigmas)
         grouped_masked_denoising = h3_grouped_masking_enabled(custom_settings) and not self.transformer.control_layers  # control rows follow the natural target order
         image_outputs = image_mode > 0 and not self.audio_only
         # Image saving uses 1 FPS, but H3's joint latents retain their native 24 FPS timing.
@@ -1187,6 +1193,11 @@ class MiniMaxH3Pipeline:
             base_sigmas = torch.linspace(base_start, 0.0, int(sampling_steps) + 1, dtype=torch.float32, device=self.device)
         sigmas_video = torch.unique_consecutive(float(shift) * base_sigmas / (1.0 + (float(shift) - 1.0) * base_sigmas))
         sigmas_audio = torch.unique_consecutive(3.0 * base_sigmas / (1.0 + 2.0 * base_sigmas))
+        if phase_1_sigmas is not None:
+            sigmas_video = torch.tensor([*phase_1_sigmas, 0.0], dtype=torch.float32, device=self.device)
+            sigmas_audio = _map_shifted_sigma(sigmas_video, float(shift), 3.0)
+            video[:, :, target_video_condition_frames:].mul_(sigmas_video[0])
+            audio[..., target_audio_condition_latents:].mul_(sigmas_audio[0])
         if sigmas_video.shape != sigmas_audio.shape:
             raise ValueError("The selected H3 flow shift collapses a different number of video and audio schedule points")
         if grid_max_t != 1.0:  # the whole grid scaled to grid_max_t: the first noise level is grid_max_t, so is the initial noise
@@ -1464,6 +1475,22 @@ class MiniMaxH3Pipeline:
 
             apply_phase_2_lora_policy()
             activate_lora_phase(2, int(sampling_steps2))
+            saved_phase_1_audio = None
+            regenerate = False
+            for index, lora in enumerate(loras_selected or ()):
+                if os.path.basename(str(lora).split("|", 1)[0]).lower() != H3_REGENERATE_LORA:
+                    continue
+                multiplier = loras_slists["phase2"][index]
+                regenerate = any(value != 0 for value in (multiplier if isinstance(multiplier, list) else [multiplier]))
+                if regenerate:
+                    break
+            if regenerate:
+                if set_progress_status is not None:
+                    set_progress_status("Encoding Silent Audio for Phase 2")
+                saved_phase_1_audio = audio
+                silence = torch.zeros((1, 2, audio_t * (AUDIO_SAMPLE_RATE // AUDIO_LATENT_FPS)), dtype=torch.float32, device="cpu")
+                audio = self._encode_audio(silence).to(saved_phase_1_audio)
+                del silence
             phase_2_reference_presentation, phase_2_reference_latents = [], []
             phase_2_refs = []
             if self.reference_mode:
@@ -1493,6 +1520,8 @@ class MiniMaxH3Pipeline:
             phase_2_sigmas_video = (torch.tensor((float(switch_threshold), *H3_PHASE_2_SIGMAS[1:]), dtype=torch.float32, device=self.device)
                                    if int(sampling_steps2) == len(H3_PHASE_2_SIGMAS) - 1
                                    else torch.linspace(float(switch_threshold), 0.0, int(sampling_steps2) + 1, dtype=torch.float32, device=self.device))
+            if phase_2_sigmas is not None:
+                phase_2_sigmas_video = torch.tensor([*phase_2_sigmas, 0.0], dtype=torch.float32, device=self.device)
             target_audio_condition_latents = audio_t
             target_video_condition_frames = 0
 
@@ -1673,6 +1702,9 @@ class MiniMaxH3Pipeline:
                 run_denoising(phase_2_sigmas_video, torch.zeros_like(phase_2_sigmas_video), "H3 phase 2 denoising", "Phase 2/2 High Resolution", 2,
                               freeze_audio=True, stage_solver=H3_PHASE_2_SAMPLE_SOLVER, use_cache=False)
             phase_2_presentation = phase_2_visual_latents = phase_2_reference_presentation = phase_2_reference_latents = phase_2_refs = None
+            if saved_phase_1_audio is not None:
+                audio = saved_phase_1_audio
+                saved_phase_1_audio = None
 
         audio_refinement = "none" if self.audio_only or image_outputs else (custom_settings or {}).get(H3_AUDIO_REFINEMENT_SETTING, "none")
         if pdd or soundtrack or not self.reference_mode and any(flag in (audio_prompt_type or "") for flag in "AK"):

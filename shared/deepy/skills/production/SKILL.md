@@ -17,7 +17,7 @@ Users describe what they want; the method is yours. Apply it without being asked
 - Use the configured templates and their fast or accelerated variants; keep video at the template's resolution (720p or below) unless the user asks otherwise.
 - Make shared assets once (master images of recurring people and objects, voices, music) and reuse them; submit independent generations together in one batch.
 - Match the pace to the genre: ads, trailers and music videos change shot every few seconds; a shot held for long must be worth watching that long.
-- Every video gets sound under its whole length, music or narration over ambience, unless the user asks for silence: a measured silent stretch is a defect to fix, not a question for the user.
+- Every video gets sound under its whole length, music or narration over ambience, unless the user asks for silence: a measured silent stretch is a defect to fix, not a question for the user. Sound effects and ambience come from the models with the `sound effects` speciality (`wangp_models` search), not from song templates.
 - Draw designed on-screen text (titles, lower thirds, labels, signs, UI screens, timers, scores) over the finished footage with `draw_svg` `video_id` rather than asking a video model to write it: the drawing is exact and the model never redraws it. Subtitles are never burned in: they go in a subtitle track that viewers can switch off.
 - Give every recurring person and object its master image as start image or reference in each shot that shows it. Make start images in the delivery's aspect ratio: video models keep the shape of their start image. For films, follow wangp://skills/edited-film; for a song-driven video, wangp://skills/music-video.
 

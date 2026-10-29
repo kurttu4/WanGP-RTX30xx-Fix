@@ -12,7 +12,7 @@ from PIL import Image
 
 from shared.utils.hdr import VIDEO_PROMPT_HDR_OUTPUT_FLAG
 from shared.utils.utils import has_image_file_extension
-from postprocessing.spatial_upsamplers import PARAMETER_PREFIX
+from postprocessing import parameter_ui
 
 from .chunk_executor import ChunkExecutor, ChunkProgress, ProcessContext, build_task_settings
 from . import batch_queue
@@ -86,7 +86,7 @@ class RunRequest:
             sliding_window_overlap=sliding_window_overlap,
             start_seconds="" if start_seconds in (None, "") else str(start_seconds),
             end_seconds="" if end_seconds in (None, "") else str(end_seconds),
-            spatial_upsampler_parameters={str(key): value for key, value in dict(spatial_upsampler_parameters or {}).items() if str(key).startswith(PARAMETER_PREFIX)},
+            spatial_upsampler_parameters={parameter_ui.LEGACY_NAMES.get(str(key), str(key)): value for key, value in dict(spatial_upsampler_parameters or {}).items()},
         )
 
 
@@ -284,7 +284,8 @@ class ProcessRunner:
                 settings["video_guide_outpainting_ratio"] = str(target_ratio or "").strip()
         if not self._is_spatial_upsampling_task(settings):
             settings["resolution"] = output_paths.choose_resolution(output_resolution)
-        settings["spatial_upsampler_parameters"] = dict(spatial_upsampler_parameters)
+        spatial = parameter_ui.SETTINGS[parameter_ui.SPATIAL]  # the process's own values completed with the user's
+        settings[spatial] = {**dict(settings.get(spatial) or {}), **dict(spatial_upsampler_parameters)}
         api_settings = settings.get("_api")
         settings["_api"] = dict(api_settings) if isinstance(api_settings, dict) else {}
         for key in ("return_media", "return_video_uint8", "return_audio", "return_flashvsr_continue_cache", "flashvsr_continue_cache"):

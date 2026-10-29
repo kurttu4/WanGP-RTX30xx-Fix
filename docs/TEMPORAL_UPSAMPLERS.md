@@ -89,8 +89,14 @@ lists registered handlers using `description` and any per-method details from
 `method_descriptions`.
 Each `method_parameters` entry is a list of dictionaries with at least `name`;
 it may also define `type`, `description`, `required`, `default`, `enum`, and a
-queue-setting override named `setting`. These fields are optional so older and
-third-party handlers remain compatible.
+keyword override named `setting`. These fields are optional so older and
+third-party handlers remain compatible. Parameters are declared as for spatial
+upsamplers: `name` is the id of the value in the slot's
+`temporal_postprocessing_parameters` setting, `ui` lists the contexts where the
+inputs below the slot's selector show it, an images parameter reads the reference
+images shared with the spatial slot, and the processor receives each value under
+its `setting` name. See
+[Spatial Upsampler Plugin API](SPATIAL_UPSAMPLERS.md).
 
 ## Runtime Contract
 

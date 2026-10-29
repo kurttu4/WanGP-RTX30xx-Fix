@@ -9,6 +9,7 @@ import re
 import time
 import urllib.parse
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from markdown.extensions.tables import TableExtension, TableProcessor
 from shared.deepy import video_tools as deepy_video_tools
 from shared.utils.downloads import registered_download_path
 from shared.utils.gallery_media import gallery_media_ids
-from shared.utils.gallery_sources import MESH_EXTENSIONS
+from shared.utils.gallery_sources import APP_EXTENSIONS, MESH_EXTENSIONS
 from shared.utils.markdown import EscapeHtmlExtension
 from shared.deepy.config import DEEPY_TYPE_PRIME, normalize_deepy_type
 
@@ -235,12 +236,12 @@ def render_settings_launcher_html() -> str:
 
 
 def get_css() -> str:
-    return '\n'.join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ('chat.css', 'workspaces.css', 'workspace_viewer.css'))
+    return '\n'.join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ('chat.css', 'workspaces.css', 'workspace_viewer.css', 'app_player.css'))
 
 
 def get_javascript() -> str:
     shared_scripts = '\n'.join((Path(__file__).parents[1] / 'gradio' / name).read_text(encoding='utf-8') for name in ('form_sync.js', 'generation_state.js'))
-    return shared_scripts + '\n' + "\n".join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ("transport.js", "gradio_transport.js", "chat.js", "compact_actions.js", "voice.js", "workspaces.js", "gallery_selection.js", "media_view.js", "workspace_viewer.js", "hybrid_transport.js"))
+    return shared_scripts + '\n' + "\n".join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ("transport.js", "gradio_transport.js", "chat.js", "compact_actions.js", "voice.js", "workspaces.js", "gallery_selection.js", "media_view.js", "workspace_viewer.js", "app_player.js", "hybrid_transport.js"))
 
 
 def _touch_chat(session) -> int:
@@ -1639,11 +1640,37 @@ def _attachments_from_tool_result(result: dict[str, Any] | None, file_access_pol
         if not output_file or path_key in seen_paths:
             continue
         seen_paths.add(path_key)
-        label = {"image": "Generated image", "video": "Generated video", "audio": "Generated audio", "3d": "Generated 3D asset"}.get(_attachment_kind(output_file), "Generated file")
+        label = {"image": "Generated image", "video": "Generated video", "audio": "Generated audio", "3d": "Generated 3D asset", "app": "Web app"}.get(_attachment_kind(output_file), "Generated file")
         attachment = _attachment_from_path(output_file, label)
         if attachment is not None:
             attachments.append(attachment)
+    for item in result.get("apps") or []:  # web apps a Python run created or changed: played from their sandbox folder
+        folder = _resolved_folder(item.get("folder") if isinstance(item, dict) else None, file_access_policy)
+        if folder:
+            thumbnail = _physical_attachment_path(item.get("thumbnail"), file_access_policy) if item.get("thumbnail") else ""
+            version = str(item.get("version", ""))
+            attachments.append({"kind": "app", "app_kind": "dev", "path": folder, "path_key": f"app:{os.path.normcase(folder)}:{version}", "href": "#", "label": str(item.get("name") or item.get("app") or "Web app"),
+                                "subtitle": "Web app · click to play", "thumb_path": thumbnail, "app_version": version})
+    for preview in result.get("previews") or []:  # Markdown, tables, JSON, SVG (and pages when web apps are on) written under out/
+        path = _physical_attachment_path(preview, file_access_policy)
+        if path and os.path.isfile(path):
+            page = Path(path).suffix.lower() in (".html", ".htm")
+            version = str(int(os.path.getmtime(path)))
+            attachments.append({"kind": "page" if page else "document", "path": path, "path_key": f"preview:{os.path.normcase(path)}:{version}", "href": "#", "label": os.path.basename(path),
+                                "subtitle": "Page · click to open" if page else "Click to preview", "thumb_path": path if path.lower().endswith(".svg") else "", "app_version": version})
     return attachments
+
+
+def _resolved_folder(value: Any, file_access_policy=None) -> str:
+    path = str(value or "").strip()
+    if not path:
+        return ""
+    if file_access_policy is not None:
+        try:
+            path = str(file_access_policy.resolve_path(path))
+        except (OSError, PermissionError, ValueError):
+            return ""
+    return path if os.path.isdir(path) else ""
 
 
 def _attachment_from_tool_result(result: dict[str, Any] | None, file_access_policy=None) -> dict[str, Any] | None:
@@ -1695,7 +1722,7 @@ def _attachment_from_path(path: str, label: str | None = None) -> dict[str, Any]
         thumb_url = _audio_thumbnail_url()
     elif ext in MESH_EXTENSIONS and os.path.isfile(os.path.splitext(normalized_path)[0] + '.png'):
         thumb_url = href + '/thumbnail'
-    return {
+    attachment = {
         "path_key": path_key,
         "path": normalized_path,
         "href": href,
@@ -1704,6 +1731,9 @@ def _attachment_from_path(path: str, label: str | None = None) -> dict[str, Any]
         "kind": kind,
         "thumb_url": thumb_url,
     }
+    if kind == "app":  # a published .wgpapp: played in the app player, its thumbnail beside it
+        attachment.update(app_kind="package", download=os.path.basename(normalized_path), thumb_path=os.path.splitext(normalized_path)[0] + ".png", subtitle="Web app · click to play")
+    return attachment
 
 
 def _attachment_kind(path: str, default: str = "file") -> str:
@@ -1718,6 +1748,8 @@ def _attachment_kind(path: str, default: str = "file") -> str:
         return "audio"
     if ext in MESH_EXTENSIONS:
         return "3d"
+    if ext in APP_EXTENSIONS:
+        return "app"
     return "file" if ext else default
 
 
@@ -1741,6 +1773,9 @@ def _attachment_icon(kind: str) -> str:
         "image": "<rect x='6' y='8' width='36' height='32' rx='4'></rect><circle cx='17' cy='19' r='3'></circle><path d='m10 35 9-9 6 6 5-5 8 8'></path>",
         "video": "<rect x='6' y='10' width='36' height='28' rx='4'></rect><path d='m20 18 11 6-11 6z'></path>",
         "3d": "<path d='m24 6 16 9v18L24 42 8 33V15l16-9ZM8 15l16 9 16-9M24 24v18'></path>",
+        "app": "<rect x='5' y='13' width='38' height='22' rx='11'></rect><path d='M15 20v8M11 24h8'></path><circle cx='31' cy='21' r='1.6'></circle><circle cx='35' cy='27' r='1.6'></circle>",
+        "document": "<path d='M13 5h15l7 7v31H13z'></path><path d='M28 5v8h7M18 21h12M18 27h12M18 33h8'></path>",
+        "page": "<rect x='6' y='8' width='36' height='32' rx='3'></rect><path d='M6 15h36M17 25l-5 4 5 4M31 25l5 4-5 4M26 22l-4 14'></path>",
         "file": "<path d='M13 5h15l7 7v31H13z'></path><path d='M28 5v8h7M19 23h10M19 29h10M19 35h7'></path>",
     }
     icon_kind = kind if kind in icons else "file"
@@ -2069,6 +2104,34 @@ def _render_tool_block(tool_record: dict[str, Any], attachment_html: str = "") -
     return f"<div class='chat__tool-block' data-block-id='{block_id}' data-block-type='tool'>{details}{attachment_html}</div>"
 
 
+def _render_app_attachment(attachment: dict[str, Any]) -> str:
+    """A Play card: the app player opens it in an isolated frame (shared.apps.server). The registration is repeated at each rendering, so the
+    cards of a saved conversation work again after a restart; apps and pages are only shown while web apps are enabled."""
+    from shared.apps import server as apps_server
+    from shared.deepy.config import python_apps_level
+    from shared.utils.downloads import register_file_download
+
+    kind, path = str(attachment["kind"]), Path(str(attachment.get("path") or ""))
+    if kind != "document" and python_apps_level() == "off":
+        return ""
+    try:
+        app_id = apps_server.register_dev(path) if attachment.get("app_kind") == "dev" else apps_server.register_package(path) if kind == "app" else apps_server.register_file(path)
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile):  # moved or deleted since: no card
+        return ""
+    version = html.escape(str(attachment.get("app_version", "")), quote=True)
+    thumb_path = str(attachment.get("thumb_path") or "")
+    thumb_url = register_file_download(thumb_path)["url"] + f"?v={version}" if thumb_path and os.path.isfile(thumb_path) else ""
+    label = html.escape(str(attachment.get("label") or "Web app"))
+    subtitle = html.escape(str(attachment.get("subtitle") or ""))
+    thumb_html = f"<img class='chat__attachment-thumb' loading='lazy' src='{html.escape(thumb_url)}' alt='{label}'>" if thumb_url else _attachment_icon(kind)
+    download = str(attachment.get("download") or "")
+    download_attributes = f" data-download-url='{html.escape(str(attachment.get('href')), quote=True)}' data-download='{html.escape(download, quote=True)}'" if download else ""
+    play = "<span class='chat__attachment-play' aria-hidden='true'><svg viewBox='0 0 24 24'><path d='M8 5v14l11-7z'></path></svg></span>" if kind != "document" else ""
+    subtitle_html = f"<span class='chat__attachment-subtitle'>{subtitle}</span>" if subtitle else ""
+    return (f"<a class='chat__attachment chat__attachment--app' data-media-kind='{kind}' data-app-id='{app_id}' data-app-version='{version}'{download_attributes} href='#' role='button' title='{label}'>"
+            f"{thumb_html}{play}<span class='chat__attachment-meta'><span class='chat__attachment-title'>{label}</span>{subtitle_html}</span></a>")
+
+
 def _render_attachments(attachments: list[dict[str, Any]]) -> str:
     if len(attachments) == 0:
         return ""
@@ -2076,6 +2139,9 @@ def _render_attachments(attachments: list[dict[str, Any]]) -> str:
     for attachment in attachments:
         href = str(attachment.get("href", "")).strip()
         if len(href) == 0:
+            continue
+        if attachment.get("kind") in ("app", "document", "page"):
+            cards.append(_render_app_attachment(attachment))
             continue
         label = html.escape(str(attachment.get("label", "Open file")))
         subtitle = html.escape(str(attachment.get("subtitle", "")))

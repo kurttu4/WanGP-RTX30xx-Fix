@@ -66,7 +66,7 @@ class MyUpsampler:
             "media_descriptions": {"video": "Uses overlapping windows."}, # optional media-specific help
             "method_descriptions": {"myup": "..."},       # optional per-method descriptions
             "method_parameters": {"myup": [{
-                "name": "spatial_upsampler_prompt",       # common prefix for UI parameters
+                "name": "prompt",                         # id in spatial_postprocessing_parameters
                 "setting": "prompt",                      # upscale() keyword
                 "type": "string",
                 "component": "textbox",
@@ -184,11 +184,20 @@ item.
 
 Each `method_parameters` entry is a list of dictionaries with at least `name`,
 `type`, `description`, and `required`. It may also define `default`, `enum`,
-`minimum`, `maximum`, and a runtime keyword override named `setting`. UI-exposed
-parameter names must use the shared `spatial_upsampler_` prefix. Method
-parameters travel in the generic `spatial_upsampler_parameters` task dictionary;
-they are not per-model settings and do not belong in `models/_settings.json`.
-Their defaults are owned by the descriptors. `ui` selects one or more UI
+`minimum`, `maximum`, and a runtime keyword override named `setting`. `name` is
+the parameter's id: its value travels under that id in the slot's dictionary,
+`spatial_postprocessing_parameters` (`temporal_postprocessing_parameters` for the
+temporal slot), like a model's `custom_settings`, and the UI shows it below the
+slot's selector (at most 2 sliders, 2 dropdowns and 1 text input per slot; a number
+is a slider). The two slots never share a value, whatever their ids. Selecting
+another processor resets the slot's values to its defaults, except the normalized
+ids, which keep one meaning for every processor declaring them: `prompt`, a text
+description of the content to process. Give an option its own id when its meaning
+differs from a normalized one (the LTX Detail Refiner's style prompt is
+`refine_prompt`, not H3's source description `prompt`). An `images` parameter
+(`type: "array"`, `media_type: "image"`) reads the reference images input shared by
+both slots, `postprocessing_reference_images`: the object image of the 3D refiner
+and the texturers is given once. Defaults are owned by the descriptors. `ui` selects one or more UI
 contexts: `postprocessing` means the normal generation-time Post Processing
 section, `late_postprocessing` means the Post Processing tab for an existing
 gallery item, and `media_flow` exposes scalar controls for the currently selected
@@ -196,26 +205,28 @@ Media Flow spatial process. A parameter can still be inferred and passed by
 WanGP when it is absent from a UI context; H3, for example, receives generation
 prompt/reference data without showing redundant controls during generation.
 
-The two persisted generic slider slots are `spatial_upsampler_param` and
-`spatial_upsampler_param2`. A refiner declares zero, one or both in its
-`method_parameters`, with its own labels, limits, steps and defaults. Unset slot
-values resolve to that method's defaults. Method selection updates the slider
-metadata and resets these slots to the newly selected method's defaults.
+The UI shows the parameters of the two selected processors (the spatial one's,
+then the temporal one's) in a fixed set of shared inputs, two per line: sliders,
+dropdowns, numbers, a textbox and one images field, their counts set by the
+constants of `postprocessing/parameter_ui.py`. Selecting a processor relabels
+these inputs and fills them from the dictionary or from the defaults. A processor
+that would need more inputs of one kind than the shared set holds is refused when
+it is selected, so raise the matching constant together with it.
 
 Use `label` for the short gallery label and optional `label_long` for a generation
 label with brief guidance. Declare `description` and optional `method_descriptions`
 on the processor so the UI can explain which choice suits the user's input.
 
-Supported generic UI components are `textbox`, `number`, `slider`, `dropdown`,
-`checkbox`, and `images`. Image parameters are rendered by
-`AdvancedMediaGallery`; set `multiple` to `True` for an ordered list or `False`
-for one image. Deepy receives only the call-relevant fields (`name`, `type`,
+Supported UI components are `textbox`, `number`, `slider`, `dropdown`, and
+`images`. The images field is rendered by `AdvancedMediaGallery` and accepts an
+ordered list (`multiple: True`). Deepy receives only the call-relevant fields (`name`, `type`,
 `description`, `required`, `default`, `enum`, `minimum`, `maximum`, and
 `media_type`), so UI/runtime fields such as `component`, `ui`, `label`, `step`,
 and `setting` do not consume assistant context. Parameters with `media_type:
-"image"` are resolved from media ids to paths. Each runtime value remains a flat
-entry in `spatial_upsampler_parameters`; dispatch filters it for the selected
-method and maps it to the `upscale()` keyword named by `setting`.
+"image"` are resolved from media ids to paths. Dispatch reads the selected method's
+parameters from `spatial_postprocessing_parameters` (an images parameter from the
+shared reference images) and maps each to the `upscale()`
+keyword named by `setting`.
 
 Registration is owned by `postprocessing/spatial_upsamplers.py`. Add the handler class path
 to `spatial_upsampler_handlers`:

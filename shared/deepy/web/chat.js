@@ -728,6 +728,7 @@ WAC.trackAttachmentTouch = function (event) {
   if (!touch || touch.id !== event.pointerId) return;
   if (event.type === 'pointercancel' || Math.hypot(event.clientX - touch.x, event.clientY - touch.y) > 10) touch.moved = true;
   if (event.type === 'pointerup' && !touch.moved) {
+    if (window.WanGPAppPlayer && WanGPAppPlayer.open(touch.link)) return;  // web apps and previews play in the app player
     if (WAC.openAttachment && WAC.openAttachment(touch.link)) return;
     const target = touch.link.target || '_blank';
     if (target === '_blank') window.open(touch.link.href, '_blank', 'noopener');
@@ -740,7 +741,7 @@ WAC.handleAttachmentClick = function (event) {
   if (!link) return false;
   const touch = WAC.attachmentTouch;
   WAC.attachmentTouch = null;
-  if ((event.detail !== 0 && touch) || (WAC.openAttachment && WAC.openAttachment(link))) {
+  if ((event.detail !== 0 && touch) || (window.WanGPAppPlayer && WanGPAppPlayer.open(link)) || (WAC.openAttachment && WAC.openAttachment(link))) {
     event.preventDefault();
     event.stopPropagation();
   }
@@ -1915,6 +1916,7 @@ WAC.upsertBlock = function (event) {
     if (existing) WAC.renderStreamingMarkdown(live, initialText);
     else WAC.queueStreamingReveal(live, initialText);
   }
+  window.WanGPAppPlayer?.sync(node);  // Deepy changed the app being played: reload it
   WAC.applyAutoscrollState(scrollState);
 };
 
@@ -2207,6 +2209,7 @@ WAC.upsertMessage = function (message, preserveIncrementalState, messageIndex) {
   WAC.hideEmpty();
   WAC.applyDisclosureState(transcript);
   WAC.syncQueuedRequestEdit();
+  window.WanGPAppPlayer?.sync(existing || node);
   WAC.applyAutoscrollState(scrollState);
 };
 

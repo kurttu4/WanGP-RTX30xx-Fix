@@ -8,7 +8,7 @@ from pathlib import Path
 import gradio as gr
 from PIL import Image
 
-from postprocessing import spatial_upsamplers as spatial_upsampler_api
+from postprocessing import parameter_ui
 from shared.gradio.local_file_picker import IMAGE_FILE_EXTENSIONS, LocalFilePickerTextbox, VIDEO_FILE_EXTENSIONS
 
 from . import common
@@ -55,7 +55,8 @@ def create_config_ui(self, api_session):
     default_batch_source_path = str(saved_ui_settings.get("batch_source_path") or "").strip()
     default_preserve_artifact_count = catalog.normalize_preserve_artifact_count(saved_ui_settings.get(catalog.PRESERVE_ARTIFACTS_STORAGE_KEY))
     default_preview_enabled = catalog.normalize_preview_enabled(saved_ui_settings.get(catalog.PREVIEW_OUTPUT_STORAGE_KEY))
-    initial_spatial_parameter_state = library.spatial_upsampler_parameter_state(default_process_name, self.state.value, initial_user_refs, saved_ui_settings.get("spatial_upsampler_parameters"))
+    initial_spatial_parameters = library.spatial_upsampler_parameters(default_process_name, self.state.value, initial_user_refs)
+    initial_spatial_parameter_values = {parameter_ui.LEGACY_NAMES.get(str(name), str(name)): value for name, value in dict(saved_ui_settings.get("spatial_upsampler_parameters") or {}).items()}
     initial_image_process = default_media_kind == "image"
     active_job = plugin_active_job(self)  # shared with the plugin's agent actions: one process at a time, stoppable from either side
     active_job.update({catalog.PRESERVE_ARTIFACTS_STORAGE_KEY: default_preserve_artifact_count, catalog.PREVIEW_OUTPUT_STORAGE_KEY: default_preview_enabled})
@@ -531,27 +532,10 @@ def create_config_ui(self, api_session):
             chunk_size_seconds = gr.Number(label="Chunk Size (seconds)", value=default_state.chunk_size_seconds, precision=2, visible=initial_form.chunk_size_visible)
             target_ratio = gr.Dropdown(initial_form.target_ratio_choices if initial_form.target_ratio_visible else ui_constants.RATIO_CHOICES_WITH_EMPTY, value=default_state.target_ratio if initial_form.target_ratio_visible else "", label=initial_form.target_ratio_label, visible=initial_form.target_ratio_visible)
             sliding_window_overlap = gr.Slider(label="Sliding Window Overlap", minimum=0 if not initial_form.overlap_visible else 1, maximum=initial_form.overlap_max, step=initial_form.overlap_step, value=default_state.sliding_window_overlap, visible=initial_form.overlap_visible)
-        spatial_parameter_components = {}
-        spatial_parameter_rows = {}
-        for parameter in initial_spatial_parameter_state["definitions"]:
-            name = str(parameter["name"])
-            component_type = spatial_upsampler_api.parameter_component_type(parameter)
-            with gr.Row(visible=name in initial_spatial_parameter_state["active"]) as parameter_row:
-                component_args = {"value": initial_spatial_parameter_state["values"][name], "label": str(parameter.get("label", name)), "info": str(parameter.get("description", "") or "") or None}
-                if component_type == "slider":
-                    component = gr.Slider(minimum=parameter.get("minimum", 0), maximum=parameter.get("maximum", 1), step=parameter.get("step", 1), **component_args)
-                elif component_type == "dropdown":
-                    component = gr.Dropdown(choices=parameter.get("choices", parameter.get("enum", ())), **component_args)
-                elif component_type == "checkbox":
-                    component_args["value"] = bool(component_args["value"])
-                    component = gr.Checkbox(**component_args)
-                elif component_type == "number":
-                    component = gr.Number(**component_args)
-                else:
-                    component = gr.Textbox(lines=int(parameter.get("lines", 1)), **component_args)
-            spatial_parameter_components[name] = component
-            spatial_parameter_rows[name] = parameter_row
-        spatial_upsampler_parameter_state = gr.State(initial_spatial_parameter_state["values"])
+        # the spatial processor's parameters, in the shared post-processing inputs, refreshed with the process
+        spatial_parameter_ui = parameter_ui.create(gr, initial_spatial_parameters, initial_spatial_parameter_values, triggers=[process_name.change], refresh_inputs=[process_name, self.state, user_process_refs],
+                                                   parameters_for=library.spatial_upsampler_parameters, late_postprocessing=True, event_options=form_event_options)
+        spatial_upsampler_parameter_state = spatial_parameter_ui["parameters"]
         with gr.Row():
             start_seconds = gr.Textbox(label="Start (s/MM:SS(.xx)/HH:MM:SS(.xx))", value=default_state.start_seconds, placeholder="seconds, MM:SS(.xx), or HH:MM:SS(.xx)", visible=not initial_image_process)
             end_seconds = gr.Textbox(label="End (s/MM:SS(.xx)/HH:MM:SS(.xx))", value=default_state.end_seconds, placeholder="seconds, MM:SS(.xx), or HH:MM:SS(.xx)", visible=not initial_image_process)
@@ -605,21 +589,6 @@ def create_config_ui(self, api_session):
         queue=False,
         show_progress="hidden",
     )
-
-    def _refresh_spatial_upsampler_parameters(process_name_value, main_state, refs, current_values):
-        parameter_state = library.spatial_upsampler_parameter_state(process_name_value, main_state, refs, current_values)
-        return (
-            *(gr.update(visible=name in parameter_state["active"]) for name in spatial_parameter_components),
-            *(gr.update(value=parameter_state["values"][name]) for name in spatial_parameter_components),
-            parameter_state["values"],
-        )
-
-    def _collect_spatial_upsampler_parameters(*values):
-        return dict(zip(spatial_parameter_components, values))
-
-    if spatial_parameter_components:
-        gr.on([component.change for component in spatial_parameter_components.values()], fn=_collect_spatial_upsampler_parameters, inputs=list(spatial_parameter_components.values()), outputs=[spatial_upsampler_parameter_state], **form_event_options)
-        process_name.change(fn=_refresh_spatial_upsampler_parameters, inputs=[process_name, self.state, user_process_refs, spatial_upsampler_parameter_state], outputs=[*spatial_parameter_rows.values(), *spatial_parameter_components.values(), spatial_upsampler_parameter_state], **form_event_options)
 
     gr.on(
         [

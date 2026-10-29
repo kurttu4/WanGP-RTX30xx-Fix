@@ -35,5 +35,8 @@ Each call costs what the tool costs (a generation takes the GPU, an inspection r
 - `wangp://skills/python-3d`: 3D models built in Python, read it before any of them: diagrams, 3D charts, props, terrains, 3D text and labels (`wangp.text_mesh`), logos, flags, icons and silhouettes extruded from a picture (`wangp.extrude`, `wangp.extrude_parts` per colour); rendered with `render_3d_views`. An exact shape (a logo, a diagram, a chart) is built here; the image-to-3D models suit organic objects, not flat designs.
 - `wangp://skills/python-batch`: loops over many files or generations with WanGP's tools (classify, transcribe, vary, find a person), progress and stopping.
 - `wangp://skills/python-data`: tables, CSV, charts and reports from data, files or web results.
+- `wangp://skills/web-apps`: interactive animations, games, three.js scenes and toys the user plays in WanGP (`app_new`, `app_check`, `app_publish`), when `wangp_python` lists those actions.
+
+Markdown, CSV, JSON, SVG (and HTML pages with web apps) saved under `out/` open as previews in the chat.
 
 No GPU, raw network, processes or ffmpeg inside the sandbox: generate with the models, cut and mix with the toolbox, reach the web with `wangp.download` / `wangp.web` when web search is enabled.

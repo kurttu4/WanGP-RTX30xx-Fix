@@ -109,6 +109,8 @@ Those programs can also call WanGP's own media tools, one by one, as Deepy would
 
 The programs run in a separate interpreter on the CPU, inside a sandbox folder of the session (`documents/sandbox`). They can read Gallery media and the session's documents, write only inside that folder, and have no network, no child processes and no access to the GPU or to WanGP's models. Memory and running time are limited, and Deepy can restart the interpreter when an experiment breaks its state. On Windows the operating system itself refuses writes outside the sandbox folder; reads of other files are refused by the interpreter. Turn the sandbox off with **Configuration > Prompt Enhancer / Deepy > Python > Enable Python Sandbox** if you prefer Deepy to work with its media tools only.
 
+Notes, tables, JSON and SVG files that a program saves as deliverables open as previews in the chat. With **App Development (Advanced)** set to **Web Apps** in the same tab, Deepy can also build interactive animations, games and three.js scenes that you play in WanGP and keep in the Apps gallery: see the Apps documentation.
+
 ## Web search (Prime)
 
 Off by default. With **Configuration > Prompt Enhancer / Deepy > Enable Web Search**, Deepy Prime can search the web for facts, dates, names, current events, references and documentation it does not know, look at news, image and video results, and read the text of a public page before quoting it. This helps with prompts about real subjects (a landmark, a breed, a product, a period style) and with questions whose answer changes over time. Deepy names the pages it used so you can check them.
@@ -473,9 +475,11 @@ This controls how long a local Deepy model stays in GPU memory. It is not shown 
 
 - **Unload from VRAM as soon as possible** frees memory after Deepy becomes idle, but the next request must reload the model and starts more slowly. **Recommended for:** GPUs that need nearly all available VRAM for image or video generation; this is the safest default.
 - **Unload if VRAM is requested by another WanGP component** keeps Deepy responsive between requests but gives its memory back when another operation needs it. **Recommended for:** most systems with enough VRAM to hold Deepy during normal browsing and light generation.
-- **Always loaded in VRAM** gives the fastest Deepy response times but permanently reduces the memory available to generation models. **Recommended for:** high-VRAM systems primarily used for Deepy, or remote/heavily offloaded generation workflows.
+- **Always loaded in VRAM** gives the fastest Deepy response times. A generation still gets the memory it needs: it takes the parts of Deepy it requires, and Deepy's conversation memory only when nothing else is left (it is then saved to RAM, not lost). Deepy's next answer brings them back without starting the conversation over. **Recommended for:** systems where you alternate between Deepy and generations, or where Deepy asks for progress while a generation runs.
 
-If generations fail to fit after changing this setting, move one level toward earlier unloading.
+In every mode, quick tools that need little memory (image and video inspection, transcription, masks, vocal removal) keep Deepy loaded while they run and take from it only the memory they need, so Deepy continues right after them. With **Always loaded in VRAM**, a prompt enhancement runs beside Deepy's conversation instead of interrupting it.
+
+These partial releases need the *MMGP Optimized VRAM Allocator* (the default, see [CLI.md](CLI.md#vram-allocator)); with PyTorch's allocator, Deepy is released whole as described above. If generations fail to fit after changing this setting, move one level toward earlier unloading.
 
 ### Context Window Tokens
 

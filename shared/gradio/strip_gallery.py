@@ -9,6 +9,7 @@ import html
 import json
 import os
 import uuid
+import zipfile
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from urllib.parse import quote
 
 import gradio as gr
 
-from shared.utils.gallery_sources import AUDIO, MESH, WORLD
+from shared.utils.gallery_sources import APP, AUDIO, MESH, WORLD
 
 SHOW_THUMBNAIL_DATES = False  # True: the 3D and World thumbnails also show their date and time (Audio thumbnails always do: no image)
 
@@ -85,7 +86,7 @@ class StripGallery:
     @staticmethod
     def get_javascript():
         """JavaScript for Blocks(js=...): the strip plumbing of every strip gallery, then each gallery's own script."""
-        ids = json.dumps(list(STRIP_GALLERY_CLASSES))
+        ids = json.dumps(list(STRIP_GALLERY_CLASSES))  # the Apps tab too: App Development can be turned on without reloading the page
         return StripGallery._javascript.replace("__STRIP_GALLERY_IDS__", ids) + "".join(gallery._own_javascript for gallery in STRIP_GALLERY_CLASSES.values())
 
     _own_javascript = ""
@@ -437,6 +438,9 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             .mesh-thumbnail {{ padding: 6px; }}
             .mesh-thumbnail .thumbnail-time {{ font-size: 11px; line-height: 1.2; text-align: center; white-space: nowrap; }}
             .mesh-thumbnail .thumbnail-detail {{ margin-top: 0; font-size: 10.5px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }}
+            .app-thumbnail {{ padding: 6px; }}
+            .app-thumbnail .thumbnail-detail {{ margin-top: 0; max-width: 100%; font-size: 10.5px; line-height: 1.25; text-align: center; white-space: normal; overflow-wrap: anywhere;
+                display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }}  /* the app's name on up to two lines */
             @keyframes wangp-mesh-ready {{ from {{ opacity: .99; }} to {{ opacity: 1; }} }}
             .mesh-viewer {{ display: block; position: relative; border-radius: 8px; background: var(--studio-input); }}
             wangp-mesh-viewer {{ animation: wangp-mesh-ready 1ms; }}
@@ -471,7 +475,7 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             .mesh-snapshot-popup button:hover, .mesh-snapshot-popup button[data-snapshot="add"] {{ border-color: var(--studio-accent); }}
             .mesh-snapshot-popup button:disabled {{ cursor: progress; opacity: 0.5; }}
             .mesh-viewer-fallback {{ height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 12px; box-sizing: border-box; }}
-            .world-viewer {{ position: relative; border-radius: 8px; background: #000; overflow: hidden; }}
+            .world-viewer {{ display: block; position: relative; border-radius: 8px; background: #000; overflow: hidden; }}
             .world-viewer-empty {{ background: var(--studio-input); }}
             .world-viewer .world-video {{ position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }}
             .world-viewer .world-video.world-buffer {{ visibility: hidden; }}  /* the next clip, loading */
@@ -703,7 +707,11 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
   const SPARK = VENDOR + 'spark/';
   MG.visible = element => {
     const box = element.getBoundingClientRect();
-    return !document.hidden && box.width > 0 && box.height > 0 && box.bottom > 0 && box.right > 0
+    const modal = document.querySelector('dialog[open]:focus-within') || [...document.querySelectorAll('dialog[open]')].at(-1);
+    const full = document.fullscreenElement;
+    return element.isConnected && !document.hidden && document.hasFocus() && (!modal || modal.contains(element))
+      && (!full || full.contains(element) || element.contains(full))
+      && box.width > 0 && box.height > 0 && box.bottom > 0 && box.right > 0
       && box.top < window.innerHeight && box.left < window.innerWidth && getComputedStyle(element).visibility !== 'hidden';
   };
   MG.webgl = function () {
@@ -716,8 +724,10 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
   };
   MG.load = function () {
     if (customElements.get('model-viewer')) return Promise.resolve();
-    const retry = MG.moduleAttempt ? '?retry=' + MG.moduleAttempt : '';
-    return MG.loading ||= import(VENDOR + 'model-viewer.min.js' + retry).catch(error => {
+    // The render lifecycle API and its bundle must update together, including
+    // browsers which have the former viewer cached from an earlier session.
+    const retry = MG.moduleAttempt ? '&retry=' + MG.moduleAttempt : '';
+    return MG.loading ||= import(VENDOR + 'model-viewer.min.js?v=wangp-demand-1' + retry).catch(error => {
       MG.loading = null; MG.moduleAttempt = (MG.moduleAttempt || 0) + 1; throw error;
     });
   };
@@ -726,8 +736,14 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
     async load() {
       const token = this.token = {};
       this.ready = this.inView = false;
-      const [THREE, {SparkRenderer, SplatMesh}, {OrbitControls}] = await Promise.all([import(SPARK + 'three.module.js'), import(SPARK + 'spark.module.min.js'), import(SPARK + 'OrbitControls.js')]);
+      const download = this.download = new AbortController();
+      const bytes = fetch(this.getAttribute('src'), {signal: download.signal}).then(response => {
+        if (!response.ok) throw new Error('Unable to Load the Splat Asset');
+        return response.arrayBuffer();
+      });
+      const [THREE, {SparkRenderer, SplatMesh}, {OrbitControls}, fileBytes] = await Promise.all([import(SPARK + 'three.module.js'), import(SPARK + 'spark.module.min.js?v=wangp-dispose-1'), import(SPARK + 'OrbitControls.js'), bytes]);
       if (this.token !== token) return;
+      this.download = null;
       const renderer = new THREE.WebGLRenderer({antialias: false, alpha: true});
       renderer.domElement.addEventListener('webglcontextlost', () => {
         if (this.token === token) this.dispatchEvent(new Event('error'));
@@ -745,7 +761,7 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
           renderer.render(scene, camera);
         });
       };
-      const splat = new SplatMesh({url: this.getAttribute('src')});
+      const splat = new SplatMesh({fileBytes: new Uint8Array(fileBytes), fileName: 'asset.ply'});
       const spark = new SparkRenderer({renderer, onDirty: requestRender});
       scene.add(spark, splat);
       this.state = {renderer, scene, camera, controls, splat, spark, requestRender};
@@ -760,7 +776,7 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
       };
       this.state.resize = resize;
       await splat.initialized;
-      if (this.token !== token) return;
+      if (this.token !== token) {splat.dispose(); return;}
       // Same 3/4 framing as the preview: the whole asset in view, seen from the front right and slightly above.
       const box = splat.getBoundingBox(true), center = box.getCenter(new THREE.Vector3()), radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-3);
       camera.position.copy(center).addScaledVector(new THREE.Vector3(0.55, 0.35, 0.75).normalize(), radius / Math.sin(THREE.MathUtils.degToRad(20)));
@@ -781,6 +797,7 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
     }
     disconnectedCallback() {
       this.token = null;
+      this.download?.abort(); this.download = null;
       cancelAnimationFrame(this.renderFrame);
       this.renderFrame = 0;
       const state = this.state;
@@ -821,8 +838,11 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
       this.mount = null;
       this.events?.abort();
       this.viewer?.pause?.();
+      this.viewer?.setRenderActive?.(false);
     }
     async start() {
+      if (!MG.visible(this)) {this.deferred = true; return;}
+      this.deferred = false;
       this.events?.abort();
       this.events = new AbortController();
       const viewer = this.viewer = this.querySelector('model-viewer, wangp-splat-viewer');
@@ -864,22 +884,34 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
         if (!MG.webgl()) {fail('Interactive 3D Is Unavailable in This Browser. You Can Still Download the Asset.'); return;}
         if (viewer.localName === 'model-viewer') {
           await MG.load();
+          if (!this.isConnected || this.viewer !== viewer) return;
+          this.refresh();
           if (viewer.loaded) loaded();
         } else {
           await viewer.load();
           loaded();
         }
       } catch (error) {
+        if (!this.isConnected || this.viewer !== viewer) return;
         console.error('3D viewer', error);
         fail('Unable to Start the 3D Viewer. You Can Still Download the Asset.');
       }
     }
     refresh() {
+      const visible = MG.visible(this);
+      if (this.deferred && visible) {this.start(); return;}
       const viewer = this.viewer;
       if (!viewer) return;
-      if (viewer.localName === 'wangp-splat-viewer') viewer.refresh();
+      if (viewer.localName === 'wangp-splat-viewer') {
+        if (!visible) {
+          this.events?.abort();
+          viewer.replaceWith(viewer.cloneNode(false));
+          this.viewer = null; this.deferred = true;
+        } else viewer.refresh();
+      }
       else if (typeof viewer.pause === 'function') {
-        if (this.playing && MG.visible(this)) { if (viewer.paused) viewer.play(); }
+        viewer.setRenderActive(visible);
+        if (this.playing && visible) { if (viewer.paused) viewer.play(); }
         else if (!viewer.paused) viewer.pause();
       }
     }
@@ -897,6 +929,9 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
   document.addEventListener('scroll', MG.refresh, {capture: true, passive: true});
   document.addEventListener('fullscreenchange', MG.refresh);
   document.addEventListener('visibilitychange', () => document.querySelectorAll('wangp-mesh-viewer').forEach(viewer => viewer.refresh()));
+  document.addEventListener('wangp-viewer-scope', () => document.querySelectorAll('wangp-mesh-viewer').forEach(viewer => viewer.refresh()));
+  window.addEventListener('blur', () => queueMicrotask(() => document.querySelectorAll('wangp-mesh-viewer').forEach(viewer => viewer.refresh())));
+  window.addEventListener('focus', MG.refresh);
   document.addEventListener('animationstart', event => {if (event.animationName === 'wangp-mesh-ready') MG.refresh();});
   document.addEventListener('click', MG.refresh);
   document.addEventListener('click', event => {
@@ -1010,9 +1045,10 @@ class WorldGallery(StripGallery):
     def _icon(cls, name):
         return f'<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{cls._icons[name]}</svg>'
 
-    def _view_button(self, action, label, title, icon):
+    @classmethod
+    def _view_button(cls, action, label, title, icon):
         """A button with the markup of Gradio's icon buttons (the image gallery's frame actions): the same look in every theme."""
-        drawing = self._icons[icon]
+        drawing = cls._icons[icon]
         return (f'<button type="button" aria-label="{label}" title="{title}" class="svelte-vzs2gq padded" data-world-action="{action}" '
                 f'style="color: var(--block-label-text-color); --bg-color: var(--block-background-fill);"><div class="svelte-vzs2gq small">'
                 f'<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" '
@@ -1054,22 +1090,26 @@ class WorldGallery(StripGallery):
     def _player_value(self, path):
         if path is None or not os.path.isfile(path):
             return f'<div class="world-viewer world-viewer-empty" style="height:{self.viewer_height}px"></div>'
-        video = self.video_path(path)
+        return self.viewer_html(path)
+
+    @classmethod
+    def viewer_html(cls, path):
+        video = cls.video_path(path)
         video_url = html.escape(gradio_file_url(video)) if os.path.isfile(video) else ""
         name = html.escape(Path(path).name)
-        manifest = self.read_manifest(path)
-        poster = f' poster="{self._poster(path)}"'
+        manifest = cls.read_manifest(path)
+        poster = f' poster="{cls._poster(path)}"'
         from shared.gradio.world_explorer import explorer_choices, explorer_menus, world_model_available
         if not world_model_available(manifest):  # its model was removed or disabled: the world's video plays, without the explorer
-            return f"""<div class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" style="height:{self.viewer_height}px">
+            return f"""<wangp-world-viewer class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" style="height:{cls.viewer_height}px">
 <video class="world-video" src="{video_url}"{poster} autoplay loop muted playsinline></video>
 <div class="world-viewer-actions" role="group" aria-label="World Actions">
 <div class="world-actions-row">
 <span class="world-unavailable">Its model ({html.escape(manifest["model_type"])}) is not available: this world can be watched, not explored</span>
-<a href="{html.escape(gradio_file_url(path))}" download="{name}" title="Download the World File" aria-label="Download {name}">{self._icon("download")}</a>
+<a href="{html.escape(gradio_file_url(path))}" download="{name}" title="Download the World File" aria-label="Download {name}">{cls._icon("download")}</a>
 </div>
 </div>
-</div>"""
+</wangp-world-viewer>"""
         menus = explorer_menus(manifest)  # the world model's own controls and menus
         chosen = explorer_choices(manifest, menus)  # those of the last exploration
         move_frames = {value: frames for value, _, frames in menus["seconds"]}
@@ -1085,23 +1125,23 @@ class WorldGallery(StripGallery):
         memory_items = "".join(f'<div role="option" data-value="{value}" aria-selected="{str(value == chosen["memory"]).lower()}">{moves(value)} ({video_seconds} s) · {needs}</div>'
                                for value, video_seconds, needs in menus["memory"])
         event_box = '<form class="world-event"><input type="text" placeholder="Type something that happens, then Enter" aria-label="World Event"></form>' if "event" in menus["controls"] else ""
-        return f"""<div class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" data-controls="{html.escape(json.dumps(self._controls_layout(menus["controls"])))}" style="height:{self.viewer_height}px">
+        return f"""<wangp-world-viewer class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" data-controls="{html.escape(json.dumps(cls._controls_layout(menus["controls"])))}" style="height:{cls.viewer_height}px">
 <video class="world-video" src="{video_url}"{poster} autoplay loop muted playsinline></video>
 <div class="world-hud" aria-live="polite"><span class="world-status"></span><span class="world-keys"></span></div>
 {event_box}
 <div class="world-help"></div>
 <div class="world-stats"></div>
-<div class="icon-button-wrapper svelte-9lsba8 world-view-actions no-border" role="group" aria-label="View Actions">{self._view_button("download-view", "Save Image", "Save Current View as PNG - Original Resolution, without the Controls", "save-view")}{self._view_button("snapshot", "Add View to Image Gallery", "Add Current View to Image Gallery, without the Controls", "add-view")}{self._view_button("record", "Record Video", "Record the World's Video and your Moves as a new Video of the Video Gallery", "record")}{self._view_button("replay", "Replay", "Replay the World's Video and your Moves - Space: Pause, Esc: Stop", "replay")}{self._view_button("save-world", "Save World", "Save the World as it is now, with your Moves, as a new World of the Worlds Gallery: Explore it later to resume from here", "save-world")}</div>
+<div class="icon-button-wrapper svelte-9lsba8 world-view-actions no-border" role="group" aria-label="View Actions">{cls._view_button("download-view", "Save Image", "Save Current View as PNG - Original Resolution, without the Controls", "save-view")}{cls._view_button("snapshot", "Add View to Image Gallery", "Add Current View to Image Gallery, without the Controls", "add-view")}{cls._view_button("record", "Record Video", "Record the World's Video and your Moves as a new Video of the Video Gallery", "record")}{cls._view_button("replay", "Replay", "Replay the World's Video and your Moves - Space: Pause, Esc: Stop", "replay")}{cls._view_button("save-world", "Save World", "Save the World as it is now, with your Moves, as a new World of the Worlds Gallery: Explore it later to resume from here", "save-world")}</div>
 <div class="world-viewer-actions" role="group" aria-label="World Actions">
 <div class="world-actions-row">
 <label class="world-seconds" title="Length of each move">Move <select aria-label="Move Length">{seconds}</select></label>
 <label class="world-steps" title="Quality of the moves: fewer denoising steps answer faster"{" hidden" if len(menus["steps"]) < 2 else ""}>Quality <select aria-label="Move Quality">{steps}</select></label>
 <div class="world-memory" title="{html.escape(menus["memory_title"])}"{" hidden" if len(menus["memory"]) < 2 else ""}>Memory <select aria-label="Move Memory" hidden>{memory}</select><button type="button" class="world-memory-button" aria-haspopup="listbox">{moves(chosen["memory"])}</button><div class="world-memory-list" role="listbox" hidden><div class="world-memory-note">Memory needs at this world's {manifest["width"]}x{manifest["height"]}, memory profile {menus["memory_profile"]["profile"]}</div>{memory_items}</div></div>
-<a href="{html.escape(gradio_file_url(path))}" download="{name}" title="Download the World File" aria-label="Download {name}">{self._icon("download")}</a>
+<a href="{html.escape(gradio_file_url(path))}" download="{name}" title="Download the World File" aria-label="Download {name}">{cls._icon("download")}</a>
 </div>
 </div>
-<button type="button" class="world-explore" data-world-action="explore" title="Explore this World Full Screen">{self._icon("explore")}<span>Explore</span></button>
-</div>"""
+<button type="button" class="world-explore" data-world-action="explore" title="Explore this World Full Screen">{cls._icon("explore")}<span>Explore</span></button>
+</wangp-world-viewer>"""
 
     def _extra_file_info(self, path):
         import base64
@@ -1167,16 +1207,10 @@ window.WangpWorld = window.WangpWorld || (function () {
     lines.push(`Move     ${stats.moves} · ${stats.video_seconds} s of video in ${stats.move_seconds} s · ${stats.steps} steps`);
     session.viewer.querySelector('.world-stats').textContent = lines.join('\n');
   }
-  let statsTimer = null;
-  function pollStats() {
-    // VRAM and load change without any event to listen to: while the statistics are shown during an exploration (preparation
-    // included), ask for them every second; stopped when hidden or when the exploration ends
-    clearInterval(statsTimer);
-    statsTimer = null;
+  function refreshStats() {
+    // Refresh on opening the statistics and on exploration responses, without a background timer.
     if (!session || !session.viewer.classList.contains('world-stats-shown')) return;
-    const ask = () => { if (session) send({action: 'stats', path: session.path}); };
-    ask();
-    statsTimer = setInterval(ask, 1000);
+    send({action: 'stats', path: session.path});
     showStats();
   }
   function captureView(viewer) {
@@ -1277,7 +1311,7 @@ window.WangpWorld = window.WangpWorld || (function () {
       event.preventDefault(); event.stopPropagation();
       if (event.type === 'keydown' && !event.repeat) {
         session.viewer.classList.toggle(event.code === 'KeyH' ? 'world-ui-hidden' : 'world-stats-shown');
-        if (event.code === 'KeyG') pollStats();
+        if (event.code === 'KeyG') refreshStats();
       }
       return;
     }
@@ -1315,12 +1349,13 @@ window.WangpWorld = window.WangpWorld || (function () {
     status('Preparing the world… (the model loads the first time)');
     send({action: 'start', path: session.path, seconds: session.seconds, steps: session.steps, memory: session.memory});
   }
-  function leave() {
+  function leave(suspend = false) {
     if (!session) return;
     if (session.replay) stopReplay();
     const current = session;
     session = null;
-    pollStats();
+    clearTimeout(current.errorTimer);
+    refreshStats();
     document.removeEventListener('keydown', onKey, true);
     document.removeEventListener('keyup', onKey, true);
     document.removeEventListener('fullscreenchange', onFullscreen);
@@ -1328,7 +1363,10 @@ window.WangpWorld = window.WangpWorld || (function () {
     const [video, ...buffers] = current.viewer.querySelectorAll('.world-video');
     buffers.forEach((buffer) => buffer.remove());
     video.classList.remove('world-buffer');
-    video.loop = true; video.autoplay = true; video.src = current.viewer.dataset.video; video.play().catch(() => {});
+    video.loop = true; video.autoplay = !suspend;
+    if (!suspend && current.viewer.dataset.video) video.src = current.viewer.dataset.video;
+    if (!suspend && window.__meshGalleryNS.visible(current.viewer)) video.play().catch(() => {});
+    else video.pause();
     if (document.fullscreenElement === current.viewer) document.exitFullscreen().catch(() => {});
     send({action: 'leave', path: current.path});
   }
@@ -1340,6 +1378,7 @@ window.WangpWorld = window.WangpWorld || (function () {
       session.ready = true; session.busy = false;
       session.viewer.classList.add('world-ready');
       status('Ready: hold ' + hold());
+      refreshStats();
       maybeMove();
     } else if (response.action === 'clip') {
       session.busy = false; session.moves += 1;
@@ -1361,7 +1400,7 @@ window.WangpWorld = window.WangpWorld || (function () {
     } else if (response.action === 'error') {
       session.busy = true;
       status('The exploration could not run: ' + response.message);
-      setTimeout(leave, 6000);
+      session.errorTimer = setTimeout(leave, 6000);
     } else if (response.action === 'ended') {
       leave();
     }
@@ -1453,10 +1492,123 @@ window.WangpWorld = window.WangpWorld || (function () {
     const input = form.querySelector('input');
     if (session && input.value.trim()) { session.text = input.value.trim(); input.value = ''; input.blur(); maybeMove(); }
   });
+  class WorldViewer extends HTMLElement {
+    connectedCallback() {queueMicrotask(() => {if (this.isConnected) this.refresh();});}
+    disconnectedCallback() { this.suspend(); }
+    suspend() {
+      if (session?.viewer === this) leave(true);
+      this.querySelectorAll('video').forEach(video => {video.pause(); video.removeAttribute('src'); video.load();});
+      this.suspended = true;
+    }
+    refresh() {
+      if (!window.__meshGalleryNS.visible(this)) {if (!this.suspended) this.suspend();}
+      else if (this.suspended) {
+        this.suspended = false;
+        const video = this.querySelector('.world-video');
+        if (video && this.dataset.video) {video.autoplay = false; video.controls = true; video.src = this.dataset.video;}
+      }
+    }
+  }
+  customElements.define('wangp-world-viewer', WorldViewer);
+  const refreshViewers = () => document.querySelectorAll('wangp-world-viewer').forEach(viewer => viewer.refresh());
+  document.addEventListener('visibilitychange', refreshViewers);
+  document.addEventListener('wangp-viewer-scope', refreshViewers);
+  document.addEventListener('fullscreenchange', refreshViewers);
+  document.addEventListener('scroll', refreshViewers, {capture: true, passive: true});
+  document.addEventListener('click', () => queueMicrotask(refreshViewers));
+  window.addEventListener('resize', refreshViewers);
+  window.addEventListener('blur', () => queueMicrotask(refreshViewers));
+  window.addEventListener('focus', refreshViewers);
+  window.addEventListener('pagehide', () => document.querySelectorAll('wangp-world-viewer').forEach(viewer => viewer.suspend()));
   return {onResponse: onResponse, start: start, leave: leave};
 })();
 // ===== end WorldGallery JS =====
 """
 
 
-STRIP_GALLERY_CLASSES = {gallery.source.id: gallery for gallery in (AudioGallery, MeshGallery, WorldGallery)}
+class AppGallery(StripGallery):
+    """Web apps made with Deepy (.wgpapp): the selected app's thumbnail, name and controls above a strip of thumbnails. Play opens it in the
+    app player (deepy/web/app_player.js), framed isolated from WanGP by shared.apps.server; nothing runs until Play is pressed."""
+
+    source = APP
+    viewer_height = 420
+
+    def _create_player(self, path):
+        return gr.HTML(value=self._player_value(path), elem_id=self.element_id("viewer"))
+
+    def _player_value(self, path):
+        if path is None:
+            return f'<div class="app-viewer app-viewer-empty" style="height:{self.viewer_height}px"></div>'
+        return self.viewer_html(path)
+
+    @classmethod
+    def viewer_html(cls, path):
+        from shared.apps import server as apps_server
+        from shared.utils.app_outputs import preview_path, read_app_metadata
+
+        try:
+            app_id = apps_server.register_package(Path(path))
+            app = read_app_metadata(path)
+        except Exception as error:
+            return f'<div class="app-viewer" style="height:{cls.viewer_height}px"><p class="app-viewer-error">This app cannot be opened: {html.escape(str(error))}</p></div>'
+        preview = preview_path(path)
+        picture = f'<img src="{html.escape(gradio_file_url(preview))}" alt="" loading="lazy">' if os.path.isfile(preview) else '<span class="app-viewer-icon">▶</span>'
+        controls = "".join(f'<span><kbd>{html.escape(str(key))}</kbd> {html.escape(str(action))}</span>' for key, action in (app["app_controls"] or {}).items())
+        name = html.escape(app["app_name"] or Path(path).stem)
+        version = html.escape(str(int(os.path.getmtime(path))))
+        return f"""<div class="app-viewer" style="height:{cls.viewer_height}px">
+<a class="app-viewer-play" href="#" role="button" data-app-id="{app_id}" data-app-name="{name}" data-app-version="{version}" data-download-url="{html.escape(gradio_file_url(path))}" data-download="{html.escape(Path(path).name)}" title="Play {name}">
+{picture}<span class="app-viewer-badge"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>Play</span></a>
+<div class="app-viewer-info"><strong>{name}</strong> <span class="app-viewer-version">version {html.escape(str(app["app_version"]))}</span>{f'<p>{html.escape(app["app_description"])}</p>' if app["app_description"] else ""}{f'<div class="app-viewer-controls">{controls}</div>' if controls else ""}</div>
+</div>"""
+
+    def _extra_file_info(self, path):
+        from shared.utils.app_outputs import preview_path, read_app_metadata
+
+        preview = preview_path(path)
+        try:  # a package dropped in the outputs by hand may be damaged: its file name labels it
+            name = read_app_metadata(path)["app_name"]
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            name = ""
+        return {"preview": preview if os.path.isfile(preview) else None, "name": name or Path(path).stem}
+
+    def _thumbnail_body(self, info):
+        if info["deleted"]:
+            return f'<div class="thumbnail-date">{info["date"]}</div><div class="thumbnail-time">{info["time"]}</div>'
+        image = f'<img class="thumbnail-image" src="{html.escape(gradio_file_url(info["preview"]))}" alt="" loading="lazy">' if info["preview"] else '<div class="thumbnail-detail">App</div>'
+        return f'{image}<div class="thumbnail-detail">{html.escape(info["name"])}</div>'
+
+    _own_javascript = r"""
+// ===== AppGallery: Play opens the app player =====
+if (!window.__appGalleryInit) {
+  window.__appGalleryInit = true;
+  document.addEventListener('click', event => {
+    const link = event.target.closest('.app-viewer [data-app-id]');
+    if (!link || !window.WanGPAppPlayer) return;
+    event.preventDefault();
+    window.WanGPAppPlayer.open(link);
+  });
+  const style = document.createElement('style');
+  style.textContent = `
+.app-viewer { display: flex; gap: 16px; align-items: stretch; padding: 12px; box-sizing: border-box; border-radius: 8px; background: var(--studio-input); color: var(--body-text-color); }
+.app-viewer-empty { padding: 0; }
+.app-viewer-play { position: relative; flex: 1.6; min-width: 0; display: grid; place-items: center; border-radius: 8px; overflow: hidden; background: #000; text-decoration: none !important; }
+.app-viewer-play img { width: 100%; height: 100%; object-fit: contain; }
+.app-viewer-icon { color: #fff; font-size: 48px; }
+.app-viewer-badge { position: absolute; display: inline-flex; align-items: center; gap: 8px; padding: 10px 20px; border-radius: 999px; background: rgba(0, 0, 0, 0.66); color: #fff !important; font-weight: 600; font-size: 16px; }
+.app-viewer-badge svg { width: 18px; height: 18px; fill: currentColor; }
+.app-viewer-play:hover .app-viewer-badge { background: var(--studio-accent, #3b82f6); }
+.app-viewer-info { flex: 1; min-width: 0; overflow: auto; font-size: 14px; line-height: 1.5; }
+.app-viewer-info strong { font-size: 16px; }
+.app-viewer-version { color: var(--body-text-color-subdued); }
+.app-viewer-controls { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; }
+.app-viewer-controls kbd { padding: 1px 6px; border: 1px solid var(--studio-border); border-bottom-width: 2px; border-radius: 5px; font-size: 12px; }
+.app-viewer-error { margin: auto; }
+@media (max-width: 760px) { .app-viewer { flex-direction: column; } }`;
+  document.head.append(style);
+}
+// ===== end AppGallery JS =====
+"""
+
+
+STRIP_GALLERY_CLASSES = {gallery.source.id: gallery for gallery in (AudioGallery, MeshGallery, WorldGallery, AppGallery)}

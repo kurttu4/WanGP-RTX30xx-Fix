@@ -159,7 +159,8 @@ def infer_media_inputs(model_def):
     image_control = image_outputs and not model_def.get("reference_video_enabled", False)
     custom_guide = model_def.get("custom_guide")
     return {
-        **({"custom_file": {"name": custom_guide.get("name", "Custom Guide"), "kinds": custom_guide_kinds(model_def), "file_types": list(custom_guide.get("file_types", [])), "required": bool(custom_guide.get("required", False))}} if custom_guide is not None else {}),
+        **({"custom_file": {"name": custom_guide.get("name", "Custom Guide"), "kinds": custom_guide_kinds(model_def), "file_types": list(custom_guide.get("file_types", [])), "required": bool(custom_guide.get("required", False)),
+                           **{key: custom_guide[key] for key in ("model_mode", "model_mode_not", "video_prompt_type", "video_prompt_type_not", "audio_prompt_type", "audio_prompt_type_not") if key in custom_guide}}} if custom_guide is not None else {}),
         "image": {
             "start": "S" in image_prompt_types_allowed,
             "end": "E" in image_prompt_types_allowed or bool(model_def.get("end_frames_always_enabled", False)),

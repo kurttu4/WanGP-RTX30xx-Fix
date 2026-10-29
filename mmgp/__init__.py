@@ -31,3 +31,8 @@ class profile_type(int, enum.Enum):
 _welcome_message = f" Memory Management for the GPU Poor (mmgp {__version__}) - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[95m{_welcome_message:*^100}\033[0m")
 
+import os as _os
+if _os.environ.get("MMGP_VIRTUAL_VRAM_GB") or _os.environ.get("MMGP_VIRTUAL_RAM_GB"):  # a smaller GPU or machine emulated for simulations (mmgp.virtual_gpu)
+    from . import virtual_gpu
+    virtual_gpu.install_from_environment()
+

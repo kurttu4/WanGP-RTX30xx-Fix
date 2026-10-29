@@ -77,6 +77,9 @@ from shared.deepy.config import (
     normalize_deepy_python_sandbox,
     DEEPY_PYTHON_SANDBOX_DEFAULT,
     DEEPY_PYTHON_SANDBOX_KEY,
+    PYTHON_APPS_KEY,
+    normalize_python_apps,
+    python_apps_level,
     normalize_deepy_web_search,
     DEEPY_WEB_SEARCH_DEFAULT,
     DEEPY_WEB_SEARCH_KEY,
@@ -262,6 +265,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.request_component("assistant_launcher_host")
         self.request_component("assistant_panel")
         self.request_component("assistant_chat_event")
+        self.request_component("apps_gallery_tab")
 
         self.add_tab(
             tab_id="configuration",
@@ -755,6 +759,13 @@ class ConfigTabPlugin(WAN2GPPlugin):
                                     label="Enable Python Sandbox",
                                     info="On by default. Lets Deepy Prime and MCP agents run Python (numpy, PIL, SVG, matplotlib, data and text) in a separate, restartable interpreter to compute layouts, compose images and build clips. It can only write inside the session's sandbox folder, reads Gallery media and documents, and has no network, processes or GPU; reads of other files are refused by the interpreter rather than by the operating system.",
                                 )
+                                apps_level = normalize_python_apps(self.server_config.get(PYTHON_APPS_KEY))["development"]
+                                self.python_apps_choice = gr.Dropdown(
+                                    choices=[("Off", "off"), ("Web Apps", "apps")],  # "Web Apps and Plugins" joins when the plugin tier ships
+                                    value="apps" if apps_level == "plugins" else apps_level,
+                                    label="App Development (Advanced)",
+                                    info="Off by default; needs the Python Sandbox. Web Apps lets Deepy Prime and MCP agents build interactive animations, games and three.js scenes, with pictures, 3D models and music made by WanGP, that you play in the chat and keep in the Apps gallery. Apps run in your browser in an isolated frame: they cannot reach WanGP's controls, your files or the internet, and keep only their own saved data.",
+                                )
                             with gr.Tab("Internet Access", id="internet_access", visible=deepy_type_default == DEEPY_TYPE_PRIME) as self.deepy_internet_access_tab:
                                 self.deepy_web_search_choice = gr.Checkbox(
                                     value=normalize_deepy_web_search(self.server_config.get(DEEPY_WEB_SEARCH_KEY, DEEPY_WEB_SEARCH_DEFAULT)) == "enabled",
@@ -866,7 +877,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         self.embed_source_images_choice = gr.Checkbox(
                             value=self.server_config.get("embed_source_images", False),
                             label="Embed Source Images",
-                            info="Saves i2v source images inside MP4/MOV/MKV files"
+                            info="Saves the source images inside MP4/MOV/MKV videos and GLB 3D assets (their object image, reused by late 3D post-processing)"
                         )
                     self.keep_intermediate_sliding_windows_choice = gr.Dropdown(
                         choices=[("Yes", 1), ("No", 0)],
@@ -1030,7 +1041,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.prompt_enhancer_temperature_choice, self.prompt_enhancer_top_p_choice, self.prompt_enhancer_randomize_seed_choice,
             self.matanyone_version_choice, self.whisper_model_choice,
             self.deepy_type_choice, self.deepy_vram_mode_choice, self.deepy_voice_language_choice, self.voice_mode_choice, self.deepy_allow_read_file_system_choice, self.deepy_file_system_paths_choice, self.deepy_read_everywhere_choice,
-            self.deepy_context_tokens_choice, self.deepy_kv_cache_quantization_choice, self.deepy_kv_cache_exact_choice, self.deepy_compaction_type_choice, self.deepy_repetition_penalty_choice, self.deepy_zero_custom_system_prompt_choice, self.deepy_prime_custom_system_prompt_choice, self.deepy_prime_mcp_servers_choice, self.deepy_mcp_auto_discover_paths_choice, self.deepy_python_sandbox_choice, self.deepy_web_search_choice, self.civitai_api_key_choice, self.civitai_api_key_secure_choice, self.huggingface_token_choice, self.huggingface_token_secure_choice,
+            self.deepy_context_tokens_choice, self.deepy_kv_cache_quantization_choice, self.deepy_kv_cache_exact_choice, self.deepy_compaction_type_choice, self.deepy_repetition_penalty_choice, self.deepy_zero_custom_system_prompt_choice, self.deepy_prime_custom_system_prompt_choice, self.deepy_prime_mcp_servers_choice, self.deepy_mcp_auto_discover_paths_choice, self.deepy_python_sandbox_choice, self.python_apps_choice, self.deepy_web_search_choice, self.civitai_api_key_choice, self.civitai_api_key_secure_choice, self.huggingface_token_choice, self.huggingface_token_secure_choice,
             self.video_container_choice, self.video_output_codec_choice, self.rgba_video_output_choice, self.hdr_video_crf_choice, self.image_output_codec_choice, self.audio_output_codec_choice, self.audio_stand_alone_output_codec_choice,
             self.metadata_choice, self.embed_source_images_choice,
             self.video_save_path_choice, self.image_save_path_choice, self.audio_save_path_choice, self.mesh_save_path_choice,
@@ -1045,7 +1056,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         # These configuration input callbacks only derive presentation/choices.
         view_events = [event for index, event in gr.context.get_blocks_context().fns.items() if index >= first_event and event.fn and event.outputs and all(kind in ('input', 'change') for _, kind in event.targets)]
         self.synced_form = GradioForm(self.state.value.service.forms, 'configuration', inputs[1:-1], view_events=view_events)
-        save_event = self.synced_form.bind_save(
+        saved = self.synced_form.bind_save(
             self.apply_btn.click, lambda *values: self._save_changes(*values[:-1], overrides=values[-1]),
             inputs=[*inputs, self.overrides],
             outputs=[
@@ -1060,7 +1071,11 @@ class ConfigTabPlugin(WAN2GPPlugin):
                 self.assistant_panel,
                 self.assistant_chat_event,
             ]
-        ).then(
+        )
+        # Server-side follow-ups chain on the saved step: Gradio fires no .then after the script-only step below.
+        # App Development (Advanced) shows or hides the Apps gallery.
+        saved.then(lambda: gr.update(visible=python_apps_level() != "off"), outputs=[self.apps_gallery_tab], show_progress="hidden", queue=False)
+        saved.then(
             fn=None, inputs=None, outputs=None,
             js="""() => {
                 const button = document.querySelector('#assistant_chat_session_refresh_button button, #assistant_chat_session_refresh_button');
@@ -1075,7 +1090,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                 return gr.update(value=model_output_filter.render_filter(selected_filter, model_dropdowns.available_output_filters(deps))), *self.generate_dropdown_model_list(state["model_type"], state)
 
             filter_outputs = [self.model_filter.html, self.model_family, self.model_base_type_choice, self.model_choice]
-            save_event.then(refresh_model_filters, inputs=[self.state], outputs=filter_outputs, show_progress="hidden")
+            saved.then(refresh_model_filters, inputs=[self.state], outputs=filter_outputs, show_progress="hidden")
             self.show_all_model_filter_choice.change(refresh_model_filters, inputs=[self.state], outputs=filter_outputs, show_progress="hidden")
 
         def release_ram_and_notify(state):
@@ -1138,7 +1153,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             prompt_enhancer_temperature_choice, prompt_enhancer_top_p_choice, prompt_enhancer_randomize_seed_choice,
             matanyone_version_choice, whisper_model_choice,
             deepy_type_choice, deepy_vram_mode_choice, deepy_voice_language_choice, voice_mode_choice, deepy_allow_read_file_system_choice, deepy_file_system_paths_choice, deepy_read_everywhere_choice,
-            deepy_context_tokens_choice, deepy_kv_cache_quantization_choice, deepy_kv_cache_exact_choice, deepy_compaction_type_choice, deepy_repetition_penalty_choice, deepy_zero_custom_system_prompt_choice, deepy_prime_custom_system_prompt_choice, deepy_prime_mcp_servers_choice, deepy_mcp_auto_discover_paths_choice, deepy_python_sandbox_choice, deepy_web_search_choice, civitai_api_key_choice, civitai_api_key_secure_choice, huggingface_token_choice, huggingface_token_secure_choice,
+            deepy_context_tokens_choice, deepy_kv_cache_quantization_choice, deepy_kv_cache_exact_choice, deepy_compaction_type_choice, deepy_repetition_penalty_choice, deepy_zero_custom_system_prompt_choice, deepy_prime_custom_system_prompt_choice, deepy_prime_mcp_servers_choice, deepy_mcp_auto_discover_paths_choice, deepy_python_sandbox_choice, python_apps_choice, deepy_web_search_choice, civitai_api_key_choice, civitai_api_key_secure_choice, huggingface_token_choice, huggingface_token_secure_choice,
             video_container_choice, video_output_codec_choice, rgba_video_output_choice, hdr_video_crf_choice, image_output_codec_choice, audio_output_codec_choice, audio_stand_alone_output_codec_choice,
             metadata_choice, embed_source_images_choice,
             save_path_choice, image_save_path_choice, audio_save_path_choice, mesh_save_path_choice,
@@ -1330,6 +1345,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     DEEPY_PRIME_MCP_SERVERS_KEY: deepy_prime_mcp_servers_choice,
                     DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY: normalize_deepy_mcp_auto_discover_paths(deepy_mcp_auto_discover_paths_choice),
                     DEEPY_PYTHON_SANDBOX_KEY: normalize_deepy_python_sandbox(deepy_python_sandbox_choice),
+                    PYTHON_APPS_KEY: normalize_python_apps({**normalize_python_apps(old_server_config.get(PYTHON_APPS_KEY)), "development": python_apps_choice}),
                     DEEPY_WEB_SEARCH_KEY: normalize_deepy_web_search(deepy_web_search_choice),
                     **civitai_config_update,
                 })
@@ -1400,7 +1416,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "metadata_type", "clear_file_list", "multi_prompts_gen_type", "keep_intermediate_sliding_windows", "fit_canvas", "depth_anything_v2_variant",
             "notification_sound_enabled", "notification_sound_volume", *notifications.CONFIG_KEYS, "audio_processors", "temporal_upsamplers", "spatial_upsamplers", "matanyone_version",
             "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization", PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, "enhancer_mode",
-            DEEPY_ENABLED_KEY, DEEPY_TYPE_KEY, DEEPY_VRAM_MODE_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_THINKING_KEY, DEEPY_REPETITION_PENALTY_KEY, DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY,
+            DEEPY_ENABLED_KEY, DEEPY_TYPE_KEY, DEEPY_VRAM_MODE_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_THINKING_KEY, DEEPY_REPETITION_PENALTY_KEY, DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, PYTHON_APPS_KEY,
             LLM_CONFIG_KEY,
             "max_frames_multiplier", "display_stats", "keep_resolution_on_model_switch", "enable_4k_resolutions", "max_reserved_loras", "video_output_codec", "hdr_video_crf", "video_container",
             "embed_source_images", "image_output_codec", "audio_output_codec", "audio_stand_alone_output_codec", "checkpoints_paths", "loras_root", "save_queue_if_crash",
@@ -1435,7 +1451,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         enhancer_runtime_changed = LLM_CONFIG_KEY in changes or "enhancer_enabled" in changes or "prompt_enhancer_quantization" in changes or DEEPY_KV_CACHE_QUANTIZATION_KEY in changes or DEEPY_ENABLED_KEY in changes or DEEPY_VRAM_MODE_KEY in changes
         deepy_type_changed = DEEPY_TYPE_KEY in changes
-        deepy_prime_mcp_servers_changed = DEEPY_PRIME_MCP_SERVERS_KEY in changes or DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY in changes
+        deepy_prime_mcp_servers_changed = DEEPY_PRIME_MCP_SERVERS_KEY in changes or DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY in changes or PYTHON_APPS_KEY in changes  # Prime's tools change: the app actions of wangp_python
         deepy_file_access_changed = any(key in changes for key in (DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, "save_path", "image_save_path", "audio_save_path", "mesh_save_path"))
         speculative_decoding_changed = PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY in changes
         enhancer_profile_changed = "profile" in changes or "video_profile" in changes or "llm_cpu_compute" in changes

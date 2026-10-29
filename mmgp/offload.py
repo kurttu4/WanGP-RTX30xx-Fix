@@ -185,7 +185,9 @@ ONE_MB =  1048576
 sizeofhalffloat = torch.bfloat16.itemsize
 sizeofint8 = torch.int8.itemsize
 
-physical_memory= psutil.virtual_memory().total
+physical_memory= psutil.virtual_memory().total # the RAM MMGP plans with: a RAM budget's when one is set (virtual_gpu.install_ram)
+from . import virtual_gpu
+machine_memory = virtual_gpu.ram_state.get("machine", physical_memory) # the machine's RAM, of which the reserved RAM may take a share
 
 class clock:
     def __init__(self):
@@ -243,8 +245,8 @@ def _get_perc_reserved_mem_max(perc_reserved_mem_max = 0):
     return perc_reserved_mem_max
     
 def _get_max_reservable_memory(perc_reserved_mem_max = 0):
-    max_reservable_memory = perc_reserved_mem_max * physical_memory
-    return  max_reservable_memory
+    # a share of the machine's RAM (a safeguard: the system needs the rest), within a RAM budget
+    return min(perc_reserved_mem_max * machine_memory, physical_memory)
 
 def _detect_main_towers(model, min_floors = 5, extra_towers = ()):
     cur_blocks_prefix = None
@@ -1218,8 +1220,8 @@ class _StagingRing:
                         self.cond.acquire()
 
     def _stage(self, items, layout, pooled=None, state=()):
-        if pooled is not None and pooled.result():
-            return None, items, layout # it entered the pinned pool instead, its transfers read it there
+        if pooled is not None and (pooled.result() or layout[2] > self.size):
+            return None, items, layout # it entered the pinned pool instead (its transfers read it there), or, refused, does not fit in the ring: moved as a block that is not staged
         nbytes = 0 if layout is None else layout[2]
         # the pageable state records attached to the block (mmgp.state_ring) follow its parameters in its region: region[3] says where
         runs = []
@@ -1291,10 +1293,11 @@ class _StagingRing:
 
 PAGE_SIZE = 4096
 POOL_RAM_FLOOR = max(4 << 30, physical_memory // 10) # the pinned pool grows while the system keeps this much RAM available (as the VRAM allocator before it spills)
-POOL_DROPS_IDLE_PAGES = True # comparison switch: below that floor, the checkpoint pages of the models that do not run leave the working set (_drop_idle_pages)
+POOL_DROPS_IDLE_PAGES = True # comparison switch: below that floor, when a model loads, is pinned or enters the pool, the checkpoint pages of the models of the other offload objects that do not run leave the working set (_drop_idle_pages)
 POOL_RECLAIMS_PINNED = True # comparison switch: what is still short then comes from the RAM pinned for good of the idle models of other offload objects (_reclaim_pinned)
 DROP_ONCE_PER_GENERATION_PAGES = True # after each transfer of a block of a model that runs once or twice per generation, the checkpoint pages it read leave the working set (when the RAM is short)
 ONCE_PER_GENERATION_MODELS = ("text_encoder", "text_encoder_2", "vae") # unless the model sets _mm_pinned_pool (e.g. a language model registered as a text encoder)
+DROP_UNREFERENCED_PAGES = True # comparison switch: once the models are profiled, the checkpoint pages that nothing reads any more (sources of the copies made at load) leave the working set
 
 if os.name == "nt":
     class _MemoryInformation(ctypes.Structure):
@@ -1305,6 +1308,8 @@ if os.name == "nt":
     _virtual_query.restype = ctypes.c_size_t
     _virtual_unlock = ctypes.WinDLL("kernel32", use_last_error=True).VirtualUnlock
     _virtual_unlock.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+    _mapped_file_name = ctypes.WinDLL("psapi", use_last_error=True).GetMappedFileNameW
+    _mapped_file_name.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong)
 
 def _drop_mapped_pages(ranges):
     # the pages of a checkpoint mapping that a copy has read stay in the process' working set beside the copy, counted as used RAM, until
@@ -1336,6 +1341,45 @@ def _mapped_pages(leaves):
         else:
             ranges.append([start, end, region[2]])
     return [(start, end) for start, end, _ in ranges]
+
+def _tensor_spans(t):
+    # (address, bytes) of the memory a CPU tensor reads, through the inner tensors of a traceable tensor subclass
+    if type(t) is torch.Tensor:
+        if t.device.type != "cpu" or t.numel() == 0:
+            return []
+        return [(t.data_ptr(), (1 + builtins.sum((size - 1) * stride for size, stride in builtins.zip(t.shape, t.stride()))) * t.element_size())]
+    if not hasattr(t, "__tensor_flatten__"):
+        return []
+    return [span for name in t.__tensor_flatten__()[0] for span in _tensor_spans(getattr(t, name))]
+
+def _unreferenced_pages(spans):
+    # the pages of the checkpoint views that the tensors (address, bytes) read, outside all of them: read at load for copies (fused
+    # projections, conversions, tables copied into locked RAM, pinned copies), never read again, yet in the working set until Windows trims
+    # them. A page shared with a tensor stays. Dropping pages that are not in the working set costs almost nothing. Windows only
+    if os.name != "nt":
+        return []
+    info, views, region = _MemoryInformation(), {}, (0, 0, None)
+    for pointer, nbytes in sorted(spans):
+        if not region[0] <= pointer < region[1]:
+            found = _virtual_query(pointer, ctypes.byref(info), ctypes.sizeof(info)) != 0
+            region = (info.BaseAddress, info.BaseAddress + info.RegionSize, info.AllocationBase if info.Type == 0x40000 else None) if found else (0, 0, None) # MEM_MAPPED: its view
+        if region[2] is not None and nbytes:
+            views.setdefault(region[2], []).append((pointer // PAGE_SIZE * PAGE_SIZE, (pointer + nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE))
+    ranges, name = [], ctypes.create_unicode_buffer(260)
+    for base, used in views.items():
+        if not _mapped_file_name(ctypes.c_void_p(-1), base, name, 260): # a view of a file, not of shared memory
+            continue
+        end = base
+        while _virtual_query(end, ctypes.byref(info), ctypes.sizeof(info)) and info.AllocationBase == base:
+            end = info.BaseAddress + info.RegionSize
+        position = base
+        for start, stop in sorted(used):
+            if start > position:
+                ranges.append((position, start))
+            position = builtins.max(position, stop)
+        if position < end:
+            ranges.append((position, end))
+    return ranges
 
 def _private_memory(pointers):
     # whether each address (in increasing order) lies in RAM the process allocated (PyTorch's allocators, the heap), rather than in a mapping
@@ -1542,14 +1586,15 @@ class _PinnedPool:
             manager.staged_entries.pop(entry_name, None)
         self.version += 1
 
-    def make_room(self, manager, model_id=None, need=0, whole=0, ring=0):
+    def make_room(self, manager, model_id=None, need=0, whole=0, ring=0, ram=0):
         """A quiet point (the GPU has finished the work of the models unloaded), before model_id runs if not None: the entries of the models
         that do not run leave, those of the models used least recently first and their last entered first (those left stay spread evenly),
         while the room left is short of need (the bytes the pool may still lock for model_id) and ring (those of the staging ring its blocks
         cross until they enter), the system's available RAM is under POOL_RAM_FLOOR or, for the other models of manager, its entries and need
         exceed the largest whole (the bytes of all the blocks the pool takes for a model, model_id's being whole): a text encoder's entries
         leave when its transformer runs, a few of the transformer's when the text encoder runs again. Entries whose block's tensors were
-        replaced leave too."""
+        replaced leave too. Then, if the available RAM is short of need, ring and ram (the checkpoint pages its transfers will read), whatever
+        the memory profile, the idle models of the other offload objects drop their checkpoint pages (_drop_idle_pages)."""
         self.full, self.epoch = False, self.epoch + 1
         pinned.collect() # the locked buffers retired since the last quiet point (outgrown staging slots) are unlocked
         largest = math.inf
@@ -1563,10 +1608,10 @@ class _PinnedPool:
             if stale:
                 self.release(manager, stale)
                 manager.block_items = {key: found for key, found in manager.block_items.items() if key[0] not in stale}
-        idle = {}
+        idle = {} # the models that do not run: not loaded, or loaded in a parked offload object (offload.park), which gives way to the others
         for other, entries in list(self.entries.items()):
             for entry_name, entry in entries.items():
-                if entry.model_id not in other.active_models_ids and (other is not manager or entry.model_id != model_id):
+                if (entry.model_id not in other.active_models_ids or other.parked) and (other is not manager or entry.model_id != model_id):
                     idle.setdefault((self.used.get(other, {}).get(entry.model_id, 0), id(other)), (other, entry.model_id, []))[2].append(entry_name)
         held = builtins.sum(entry.nbytes for entry in self.entries.get(manager, {}).values())
         released = {}
@@ -1582,8 +1627,8 @@ class _PinnedPool:
                 held -= nbytes if other is manager else 0
         if released and manager.verboseLevel >= 1:
             tqdm.write(f"Pinned pool: released {', '.join(f'{nbytes/ONE_MB:0.0f} MB of {other_model}' for (_, other_model), nbytes in released.items())}" + (f" for '{model_id}'" if model_id is not None else " (RAM short)"))
-        if model_id is not None and need and psutil.virtual_memory().available < POOL_RAM_FLOOR + need:
-            self._drop_idle_pages(manager, POOL_RAM_FLOOR + need)
+        if need + ring + ram and psutil.virtual_memory().available < POOL_RAM_FLOOR + need + ring + ram:
+            self._drop_idle_pages(manager, POOL_RAM_FLOOR + need + ring + ram)
         if model_id is not None:
             with self.guard:
                 refused = self.shortfalls.pop(manager, 0) # blocks refused while it last ran: the preload decides those out of VRAM during the run
@@ -1636,11 +1681,12 @@ class _PinnedPool:
         return builtins.sum(reclaimed.values())
 
     def _drop_idle_pages(self, manager, target):
-        # The available RAM is short for the pool of a model of manager (when it loads, or when its block is refused): the checkpoint pages
-        # read by the models of the other offload objects that do not run (e.g. a video model kept loaded beside a language model, whose
-        # pages stay in the working set until Windows trims them under pressure) leave it, until target bytes are available, once per quiet
-        # point. On the standby list they count as available and come back without reading the drive while they stay there. The idle
-        # models of manager are left to its own policy (_drops_pages). Windows only: elsewhere the available RAM already counts these pages
+        # The available RAM is short for a model of manager (when it loads or is pinned, in any memory profile, or when its block is refused
+        # by the pool): the checkpoint pages read by the models of the other offload objects that do not run, or are parked (e.g. a language
+        # model kept loaded beside a video model, whose pages stay in the working set until Windows trims them, which it hardly does) leave
+        # it, until target bytes are available, once per quiet point. On the standby list they count as available and come back without
+        # reading the drive while they stay there. The idle models of manager are left to its own policy (_drops_pages). Windows only:
+        # elsewhere the available RAM already counts these pages
         if not POOL_DROPS_IDLE_PAGES or self.dropped_epoch == self.epoch:
             return
         self.dropped_epoch = self.epoch
@@ -1648,7 +1694,7 @@ class _PinnedPool:
         for other in [other for other in list(_managers) if other is not manager]:
             for entry in list(other.blocks_of_modules):
                 model_id = entry.split("/", 1)[0]
-                if model_id in other.active_models_ids or model_id in other.pages_dropped:  # dropped already, since it last ran
+                if model_id in other.active_models_ids and not other.parked or model_id in other.pages_dropped:  # dropped already, since it last ran
                     continue
                 ranges = other._mapped_pages(entry)
                 if ranges:
@@ -1663,7 +1709,7 @@ class _PinnedPool:
             break
         if dropped and manager.verboseLevel >= 1:
             available = psutil.virtual_memory().available
-            tqdm.write(f"Pinned pool: the RAM is short, the checkpoint pages read by {', '.join(sorted(repr(model_id) for _, model_id in dropped))}, which do not run, "
+            tqdm.write(f"The RAM is short: the checkpoint pages read by {', '.join(sorted(repr(model_id) for _, model_id in dropped))}, which do not run, "
                        f"left the working set: {(available - before) / ONE_MB:0.0f} MB more available ({available / ONE_MB:0.0f} MB)")
 
     def close(self, manager):
@@ -3966,7 +4012,7 @@ class offload:
     supports_cotenant_wildcards = True
     def __init__(self):
         _managers.add(self)
-        self.pages_dropped = set() # its models whose checkpoint pages left the working set for another offload object's pool, since they last ran
+        self.pages_dropped = set() # its models whose checkpoint pages left the working set for another offload object's models, since they last ran
         self.active_models = []
         self.active_models_ids = []
         self.models = {}
@@ -4039,6 +4085,12 @@ class offload:
         self.pool_plans = {} # entry name -> how its block enters the pool (_PoolPlan), made at profile time for the blocks of pool models
         self.mapped_pages = {} # entry name -> (layout, the pages of its tensors mapped from a checkpoint file), of the models that run once or twice per generation
         self.mapped_bytes = {} # model id -> bytes of these pages, of all its blocks
+        self.used = {} # model id -> stamp of its last use (memory_pressure.stamp): the least recently used models give their VRAM first
+        self.parked = False # park(): its models stay loaded while others use the GPU, their VRAM reclaimed from any thread as it is needed
+        self.park_release = None # with park(): "models", "blocks" or the owner's release callable (see park)
+        self.park_state_bytes = 0 # with a release callable: the VRAM the owner holds beside the models, freed by its release
+        self.park_lock = threading.RLock() # reclaims of the parked models (any thread) against unpark and unload_all
+        self.parked_size = None # parked_bytes() while it is unchanged
 
         global last_offload_obj
         last_offload_obj = self
@@ -4149,20 +4201,22 @@ class offload:
         return plan.state_room if plan is not None else self.state_rooms.get(model_id, 0)
 
     def state_bytes(self, model_id):
-        # the VRAM of the state the model's rings keep in VRAM: counted with its weights by the dynamic preload
-        return builtins.sum(ring.resident_bytes for ring in self.state_rings if ring.model_id == model_id)
+        # the VRAM of the state the model's rings keep in VRAM (and the slots of its dynamic rings): counted with its weights by the dynamic
+        # preload
+        return builtins.sum(ring.vram_bytes for ring in self.state_rings if ring.model_id == model_id)
 
     def state_changed(self, model_id):
         # the state the model's rings keep in VRAM changed: the dynamic preload's cycle running does not measure the activations
         if self.auto_preload is not None:
             self.auto_preload.on_state_change(model_id)
 
-    def state_pressure(self, model_id, released):
+    def state_pressure(self, model_id, released, dynamic=False):
         # the state the model's rings kept in VRAM was released under VRAM pressure: the room of the next plans shrinks by as much (the
-        # dynamic preload's state penalty of the workload; a budget's room, until the model is profiled again), not the weights' room
+        # dynamic preload's state penalty of the workload, or its penalty for a dynamic ring, planned with the weights; a budget's room,
+        # until the model is profiled again), not the weights' room
         plan = self.auto_preload.plans.get(model_id) if self.auto_preload is not None else None
         if plan is not None:
-            self.auto_preload.on_state_pressure(plan, released)
+            self.auto_preload.on_state_pressure(plan, released, dynamic)
         else:
             self.state_rooms[model_id] = max(0, self.state_rooms.get(model_id, 0) - released)
 
@@ -4391,7 +4445,7 @@ class offload:
             if entry not in self.inflight and (only is None or entry in only):
                 items, layout, sources = self._block_items(entry)
                 # the pageable state attached to the block (mmgp.state_ring) is staged with it, or alone for a block whose parameters are pinned
-                state = [(ring, block, ring.records[block][0], ring.generation) for ring, block in self.state_records.get(entry, ()) if block in ring.stored]
+                state = [(ring, block, ring.records[block][0], ring.generation) for ring, block in self.state_records.get(entry, ()) if ring.stages(block)]
                 state_bytes = builtins.sum(-(-source.numel() // BLOCK_ALIGN) * BLOCK_ALIGN for _, _, source, _ in state)
                 if items and sources is None and entry in wanted and not _pool.pending:
                     self.ring.schedule(entry, items, layout, _pool.prepare(self, model_id, entry, self._pool_plan(entry)))
@@ -4509,10 +4563,24 @@ class offload:
         # about 75 ms per GiB, as much as Windows' own trimming under pressure: with RAM to spare the pages stay, for nothing
         if not (DROP_ONCE_PER_GENERATION_PAGES and not getattr(self.models[model_id], "_mm_pinned_pool", model_id not in ONCE_PER_GENERATION_MODELS)):
             return False
+        mapped = self._mapped_bytes(model_id)
+        return mapped > 0 and psutil.virtual_memory().available < POOL_RAM_FLOOR + mapped
+
+    def _read_later(self):
+        # the CPU tensors it may still read: its models' weights, the CPU copies its transfers read (those of a model in VRAM included) and
+        # the views of the file that its freed pinned buffers are filled again from
+        for model in self.models.values():
+            yield from model.parameters()
+            yield from model.buffers()
+            yield from (source for record in getattr(model, "_mm_pinned_buffers", ()) for item in record.items for source in item[3])
+        yield from (p for params in self.blocks_of_modules.values() for _, _, p, _, _ in params)
+
+    def _mapped_bytes(self, model_id):
+        # the bytes of the checkpoint pages of all the blocks of a model
         mapped = self.mapped_bytes.get(model_id)
         if mapped is None:
             mapped = self.mapped_bytes[model_id] = builtins.sum(end - start for entry in self.blocks_of_modules if entry.split("/", 1)[0] == model_id for start, end in self._mapped_pages(entry))
-        return mapped > 0 and psutil.virtual_memory().available < POOL_RAM_FLOOR + mapped
+        return mapped
 
     def _mapped_pages(self, entry_name):
         # the pages of a block's tensors mapped from a checkpoint file, for its current layout
@@ -4754,7 +4822,11 @@ class offload:
         return key, adapters, builtins.tuple(self._get_lora_scaling(model._loras_scaling, model, adapter) for adapter in adapters)
 
     def _graph_ready(self, model_id):
-        # the weights are where they stay: the automatic preload does not measure a new workload (it may keep other blocks after it)
+        # the weights are where they stay: the automatic preload does not measure a new workload (it may keep other blocks after it). Asked
+        # at each graph call, which replays without the hooks: the model is in use (and no longer parked)
+        self.used[model_id] = memory_pressure.stamp()
+        if self.parked:
+            self.unpark()
         return (self.auto_preload is None or self.auto_preload.settled(model_id)) and self.cpu_blocks.get(model_id) is None
 
     def _graph_lora_inputs(self, model, module):
@@ -4957,7 +5029,8 @@ class offload:
             self._release_ring(on_demand=True) # made for the smaller blocks of another model: made again for this one's if it needs one
         ring = RING_DEFAULT_BLOCKS * self._ring_bound(model_id) if need and self.ring is None and self.ring_on_demand is not None else 0
         reclaimed = self._reclaimed_bytes(model_id) # its buffers pinned for good that the pinned pool took while it did not run
-        _pool.make_room(self, model_id, need + reclaimed, whole, ring) # a quiet point: the models unloaded before have finished
+        ram = 0 if model_id in self.pool_models else self._mapped_bytes(model_id) # the checkpoint pages its transfers read (a pool model's: in need)
+        _pool.make_room(self, model_id, need + reclaimed, whole, ring, ram) # a quiet point: the models unloaded before have finished
         if reclaimed:
             self._refill_pinned(model_id)
         model = self.models[model_id]
@@ -4975,8 +5048,101 @@ class offload:
                 self.gpu_unload_blocks(model_id, block_name)  # left out of the preload by an allocation of its own transfer
 
     def unload_all(self, *, keep=()):
+        with self.park_lock:
+            self._unpark()
+            self._unload(keep)
+
+    def park(self, release="models", state_bytes=0):
+        """Its models stay loaded while other models or code use the GPU (another offload object, a model outside MMGP): their VRAM is
+        reclaimed, from the allocating thread, only as allocations need it (mmgp.memory_pressure), before the VRAM of the models running:
+        expert copies and state kept in VRAM, the preloaded blocks (the least recently used models first), the disposable assets its models'
+        code declared (runtime.disposable, e.g. a language model's KV cache), then, if that is not enough, release="models": whole models
+        (they come back at their next forward); "blocks": nothing more (their bases stay in VRAM); a callable: release() is called once, to
+        free the owner's state (state_bytes of VRAM) and unload the models. Call it on the thread running the models, between their calls; unpark() before they run again (their hooks unpark too).
+        Needs the MMGP VRAM allocator, which asks for VRAM it misses: returns False without it, the models keep their VRAM."""
+        from . import allocator
+        if allocator.active != "vmm" or not self.active_models_ids:
+            return False
+        with self.park_lock:
+            self.wait_prefetch()
+            torch.cuda.synchronize() # nothing of these models runs any more: other threads may release them
+            if self.auto_preload is not None:
+                self.auto_preload.on_park()
+            self.parked, self.park_release, self.park_state_bytes, self.parked_size = True, release, state_bytes, None
+            memory_pressure.park(self)
+        return True
+
+    def unpark(self):
+        """The models run again (park), on the calling thread: what was released comes back as they run."""
+        with self.park_lock:
+            if self.parked and self.auto_preload is not None:
+                self.auto_preload.thread = threading.get_ident()
+            self._unpark()
+
+    def _unpark(self):
+        if self.parked:
+            self.parked, self.park_release, self.park_state_bytes, self.parked_size = False, None, 0, None
+            self.pages_dropped.clear() # its models run again without a gpu_load: their pages may come back
+            memory_pressure.unpark(self)
+
+    def last_used(self):
+        return builtins.max((self.used.get(model_id, 0) for model_id in self.active_models_ids), default=0)
+
+    def parked_bytes(self):
+        """VRAM the parked models would give back (park), for the plans of the other models: their preloaded blocks, with release "models" or
+        a callable also their bases, expert copies and state kept in VRAM, and the owner's state with a callable (not their disposable
+        assets, which go only when an allocation finds the VRAM short)."""
+        if self.parked_size is None:
+            total = 0
+            for model_id in self.active_models_ids:
+                total += builtins.sum(size for name, size in self.preloaded_blocks_per_model[model_id].items() if self.block_in_vram(model_id, name))
+                if self.park_release != "blocks":
+                    residency = self.expert_residency.get(model_id)
+                    total += self.blocks_of_modules_sizes.get(model_id, 0) + self.state_bytes(model_id) + (0 if residency is None else residency.nbytes)
+            self.parked_size = total + (self.park_state_bytes if callable(self.park_release) else 0)
+        return self.parked_size
+
+    def reclaim_parked(self, need):
+        """While parked, on the allocating thread (mmgp.memory_pressure): VRAM of these models for an allocation that misses need bytes."""
+        from . import allocator
+        if need <= 0 or not self.park_lock.acquire(blocking=False):
+            return 0
+        try:
+            if not self.parked:
+                return 0
+            self.parked_size, freed = None, 0
+            for client in memory_pressure.clients_of(self): # expert copies and state kept in VRAM, then the preloaded blocks
+                freed += client.on_pressure(need - freed, parked=True)
+                if freed >= need:
+                    return freed
+            if self.park_release == "blocks":
+                return freed
+            before = allocator.stats()["allocated"]
+            if callable(self.park_release):
+                release, self.park_release = self.park_release, "blocks" # once: what the owner keeps afterwards is its own
+                try:
+                    release()
+                except Exception as exc: # the owner's code, inside an allocation: the allocation goes on with what was freed
+                    tqdm.write(f"VRAM short: the release of parked models failed: {exc}")
+            else:
+                for model_id in sorted(self.active_models_ids, key=lambda model_id: self.used.get(model_id, 0)):
+                    self._unload([name for name in self.active_models_ids if name != model_id], reclaim=True)
+                    if freed + before - allocator.stats()["allocated"] >= need:
+                        break
+            released = before - allocator.stats()["allocated"]
+            if released > 0:
+                tqdm.write(f"VRAM short, {released / ONE_MB:0.0f} MB of parked models released")
+            return freed + builtins.max(0, released)
+        finally:
+            self.parked_size = None
+            self.park_lock.release()
+
+    def _unload(self, keep=(), reclaim=False):
+        # reclaim: models of a parked object, unloaded on another thread inside an allocation (reclaim_parked): their work is finished, and
+        # the quiet-point work (pinned pool, caches) waits for their next load
         self.wait_prefetch()
-        torch.cuda.synchronize() # blocks may still be read or written by queued work
+        if not reclaim:
+            torch.cuda.synchronize() # blocks may still be read or written by queued work
         for ring in list(self.state_rings): # the state kept in VRAM leaves with the weights of its model (streamed from RAM when it comes back)
             if ring.model_id in self.active_models_ids and ring.model_id not in keep:
                 ring.drop_resident()
@@ -5022,6 +5188,8 @@ class offload:
         self.slot_views = {key: views for key, views in self.slot_views.items() if key[0].split("/", 1)[0] in self.block_slots}
         self.active_models_ids = [model_id for model_id in self.active_models_ids if model_id in keep]
         self.active_models = [self.models[model_id] for model_id in self.active_models_ids]
+        if reclaim:
+            return
         _pool.make_room(self) # the entries of the pinned pool of the models that do not run leave if the RAM is short
         torch.cuda.empty_cache()
         gc.collect()
@@ -5396,6 +5564,9 @@ class offload:
         return functools.update_wrapper(functools.partial(target_fn, submodule), old_forward)
 
     def ensure_model_loaded(self, model_id):
+        self.used[model_id] = memory_pressure.stamp()
+        if self.parked:
+            self.unpark()
         if model_id in self.active_models_ids:
             return
         # new_model_id = getattr(module, "_mm_id") 
@@ -5772,7 +5943,11 @@ def {fname}(module, *args, **kwargs):
             def check_load_into_GPU_needed_auto(module, *args, **kwargs):
                 if self.auto_preload is not None: # the plan of a cycle is set as it starts, before its first block is loaded
                     self.auto_preload.on_block(model_id, blocks_name, args, kwargs)
-                return check_load_into_GPU_needed_plain(module, *args, **kwargs)
+                try:
+                    return check_load_into_GPU_needed_plain(module, *args, **kwargs)
+                finally:
+                    if self.auto_preload is not None: # after the last block of its towers, a model is between its passes
+                        self.auto_preload.after_block(model_id, blocks_name)
             check_load_into_GPU_needed_module = check_load_into_GPU_needed_auto
 
         setattr(target_module, "_mm_id", model_id)
@@ -6591,6 +6766,9 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
     for computed in self.cpu_compute.values(): # after pinning, which may give them other storage
         for parent, name, p, _, _ in computed:
             p._mm_cpu_compute = getattr(parent, name)._mm_cpu_compute = True
+    if DROP_UNREFERENCED_PAGES: # what every offload object may still read: a view may serve several
+        _drop_mapped_pages(_unreferenced_pages([span for manager in list(_managers) if manager.models is not None for t in manager._read_later()
+                                                for span in _tensor_spans(t.data if isinstance(t, torch.nn.Parameter) else t)]))
     if verboseLevel >= 2: # weights in private RAM go to the page file under memory pressure; those mapped from checkpoint files are reread instead
         from .allocator import ram_debug
         for model_id, info in ram_debug.weight_backing(self.models).items():
