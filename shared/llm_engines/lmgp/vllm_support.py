@@ -153,7 +153,7 @@ def resolve_lm_features():
 
 @functools.cache
 def _prompt_enhancer_triton_check():
-    """Qwen's FLA kernels require block pointers, removed in Triton 3.9 despite basic kernels still working."""
+    """Check Qwen's block accesses, including their masked lowering on Triton 3.9."""
     global tl
     import torch
     import triton
@@ -164,12 +164,16 @@ def _prompt_enhancer_triton_check():
         @triton.jit
         def _smoke_block_pointer_kernel(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
             offset = tl.program_id(0) * BLOCK
-            source = tl.make_block_ptr(X, (N,), (1,), (0,), (BLOCK,), (0,))
-            source = tl.advance(source, (offset,))
+            source = tl.make_block_ptr(X, (N,), (1,), (offset,), (BLOCK,), (0,))
             target = tl.make_block_ptr(Y, (N,), (1,), (offset,), (BLOCK,), (0,))
             value = tl.load(source, boundary_check=(0,), padding_option="zero")
             tl.store(target, value + 1, boundary_check=(0,))
 
+        if tuple(map(int, triton.__version__.split(".")[:2])) >= (3, 9):
+            from shared.kernels.fla_block_pointers import lower_block_pointers
+            from shared.kernels.fla_inference import configure_fla_inference_kernels
+            lower_block_pointers(_smoke_block_pointer_kernel)
+            configure_fla_inference_kernels()
         device = torch.device("cuda", torch.cuda.current_device())
         x = torch.arange(129, dtype=torch.float32, device=device)
         y = torch.empty_like(x)

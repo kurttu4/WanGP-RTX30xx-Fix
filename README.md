@@ -83,7 +83,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 29th of October 2026: WanGP v18.88 - Are You Game?
+## 29th of October 2026: WanGP v18.888 - Are You Game?
 
 - **Deepy Prime Can Now Build Apps**: turn an idea into a game, an interactive story, a music toy or an explorable 3D scene, with images, video, sound and 3D assets made by WanGP's generative models. Play in the chat, keep your creations in the new **Apps gallery**, save progress and share them as `.wgpapp` files. Deepy can keep improving an app in later conversations, including one someone else shared with you. This development preview is off by default: under **Configuration → Prompt Enhancer / Deepy → Python**, enable **Python Sandbox** and set **App Development (Advanced)** to **Web Apps**, then save. See the [Apps guide](docs/APPS.md).
 
@@ -91,7 +91,12 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **H3 Regenerate for High-Resolution Video**: choose the **H3 Regenerate 2K 2 Phases** preset for a first pass at lower resolution followed by a new three-step refinement at the selected output resolution. It enhances fine detail while preserving the first pass's soundtrack. The previous workflow remains available through **H3 Original 2 Phases** and **H3 Vanilla 1 Phase (Reset)** returns to single-pass generation.
 
+- **H3 Pika**: **six steps instead of vanilla H3's original 50**, with improved aesthetics, anatomy, prompt following and audio quality according to [Pika's evaluations](https://pika.art/blog/pika-h3-flex-research). Select the **Pika H3 Flex FL2VA / Ref2VA 6 Steps** accelerator profile.
+
+- **H3 Singularity**: **clearer fast action, sharper distant faces and less glossy skin** than vanilla H3, according to [its author](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity). Singularity V2 focuses on combat, fantasy effects and stronger prompt/style control. Available in **33B** and **pruned 20B**.
+
 - **More Room When RAM Runs Short**: WanGP automatically reclaims memory held by idle models to make room for the model doing the work. On Windows, it also frees cached checkpoint data left behind after loading, reducing RAM pressure when several generation and assistant models share the same PC.
+
 
 - **Custom Sigmas**: pick your own *Denoising Sigmas* for H3, LTX2 and Wan
 

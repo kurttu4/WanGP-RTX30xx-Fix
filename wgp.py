@@ -2,7 +2,7 @@
 import os, sys
 from tqdm import tqdm
 
-WanGP_version = "18.88"
+WanGP_version = "18.888"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -528,6 +528,7 @@ def process_prompt_and_add_tasks(state, current_gallery_tab, model_choice):
     if model_choice != model_type or inputs ==None:
         raise gr.Error("Webform can not be used as the App has been restarted since the form was displayed. Please refresh the page")
     
+    inputs = inputs.copy()
     inputs["state"] =  state
     inputs["model_type"] = model_type
     inputs.pop("lset_name", None)
@@ -5370,7 +5371,7 @@ def format_media_info(file_name, configs):
         if is_deepy_display_metadata(configs):
             values += ["Deepy"]
             labels += ["Made By"]
-            video_prompt = html.escape(str(configs.get("prompt", "") or "")[:1024]).replace("\n", "<BR>")
+            video_prompt = html.escape(str(configs.get("prompt", "") or "")[:4096]).replace("\n", "<BR>")
             if len(video_prompt) > 0:
                 values += [video_prompt]
                 labels += ["Prompt"]
@@ -5435,8 +5436,8 @@ def format_media_info(file_name, configs):
                 original_prompts, enhanced_prompts = prompt_history
                 video_prompt_text = prompt_parser.serialize_prompt_units("", original_prompts, multi_prompts_gen_type)
                 enhanced_video_prompt_text = prompt_parser.serialize_prompt_units("", enhanced_prompts, multi_prompts_gen_type)
-            video_prompt = html.escape(video_prompt_text[:4096]).replace("\n", "<BR>")
-            enhanced_video_prompt = html.escape(enhanced_video_prompt_text[:4096]).replace("\n", "<BR>")
+            video_prompt = html.escape(video_prompt_text[:16384]).replace("\n", "<BR>")
+            enhanced_video_prompt = html.escape(enhanced_video_prompt_text[:16384]).replace("\n", "<BR>")
             map_video_prompt  = {"V" : "Control Image" if image_outputs else "Control Video", ("VA", "U") : "Mask Image" if image_outputs else "Mask Video", "I" : "Reference Images", "&": "HDR Output"}
             map_image_prompt  = {"V" : "Source Video", "L" : "Last Video", "S" : "Start Image", "E" : "End Image"}
             map_audio_prompt  = {"A" : "Audio Source", "O": "Force Output Audio", "B" : "Audio Source #2", "D" : "Audio Source #3", "K": "Control Video Audio Track", "N": "Normalized Audio Volumes"}
@@ -5580,11 +5581,11 @@ def format_media_info(file_name, configs):
                     original_alt_prompts, enhanced_alt_prompts = alt_prompt_history
                     alt_prompt_text = prompt_parser.serialize_prompt_units("", original_alt_prompts, alt_prompt_mode)
                     enhanced_alt_prompt_text = prompt_parser.serialize_prompt_units("", enhanced_alt_prompts, alt_prompt_mode)
-                alt_prompt = html.escape(alt_prompt_text[:4096]).replace("\n", "<BR>")
+                alt_prompt = html.escape(alt_prompt_text[:16384]).replace("\n", "<BR>")
                 if len(alt_prompt):
                     values += [alt_prompt]
                     labels += [f"Original {alt_prompt_label}" if enhanced_alt_prompt_text else alt_prompt_label]
-                enhanced_alt_prompt = html.escape(enhanced_alt_prompt_text[:4096]).replace("\n", "<BR>")
+                enhanced_alt_prompt = html.escape(enhanced_alt_prompt_text[:16384]).replace("\n", "<BR>")
                 if len(enhanced_alt_prompt):
                     values += [enhanced_alt_prompt]
                     labels += [alt_prompt_label]
