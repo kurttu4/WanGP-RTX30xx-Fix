@@ -46,6 +46,8 @@ SOL_ATTN_TAU_END = 0.8
 H3_TWO_PHASE_SCALE = 2.0
 H3_PHASE_2_SIGMAS = (H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, 0.6316, 0.3158, 0.0)
 H3_PHASE_2_SAMPLE_SOLVER = "euler"
+# Keep phase-1 audio as frozen conditioning; True restores Regenerate's silent conditioning.
+H3_REGENERATE_SILENT_AUDIO = False
 H3_PHASE_2_TILE_COUNT = 4
 H3_PHASE_2_TILE_OVERLAP_RATIO = 0.25
 H3_PHASE_2_TILE_ALIGNMENT = 32
@@ -1524,7 +1526,7 @@ class MiniMaxH3Pipeline:
                 regenerate = any(value != 0 for value in (multiplier if isinstance(multiplier, list) else [multiplier]))
                 if regenerate:
                     break
-            if regenerate:
+            if regenerate and H3_REGENERATE_SILENT_AUDIO:
                 if set_progress_status is not None:
                     set_progress_status("Encoding Silent Audio for Phase 2")
                 saved_phase_1_audio = audio
