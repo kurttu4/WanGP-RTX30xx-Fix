@@ -6144,6 +6144,7 @@ def {fname}(module, *args, **kwargs):
         self.inflight = {}
         self._release_ring()
         _pool.close(self)
+        _managers.discard(self)
         self.stager.release()
         self.stager = None
         self.block_items.clear() # cached tensors and bulk-copy views also own the registered RAM
