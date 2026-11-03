@@ -13,7 +13,7 @@ import torchaudio.functional as audio_F
 from PIL import Image
 from tqdm import tqdm
 
-from mmgp import offload
+from mmgp import offload, transfer
 from shared.utils.loras_mutipliers import extract_loras_side, parse_loras_multipliers, update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
 from shared.utils.phase_progress import control_video_encoding, generation_progress
@@ -1106,8 +1106,6 @@ class MiniMaxH3Pipeline:
         if self.reference_mode:
             visual_ref_count = sum(ref["kind"] in ("image", "video", "video_audio") for ref in refs)
             audio_ref_count = sum(ref["kind"] in ("audio", "video_audio") for ref in refs)
-            if pika and not visual_ref_count:
-                raise ValueError("Pika H3 Flex Ref2VA requires at least one image or video reference")
             if not pika and not self.audio_only and audio_ref_count > visual_ref_count:
                 raise ValueError(f"MiniMax H3 requires at least as many image and video references as audio references (found {visual_ref_count} visual and {audio_ref_count} audio)")
             standalone_audio_count = sum(ref["kind"] == "audio" for ref in refs)
@@ -1587,7 +1585,7 @@ class MiniMaxH3Pipeline:
                     phase_2_source_video = _resize_video(control_source, target_height, target_width)
                     with control_video_encoding(control_video):
                         phase_2_source_latents = _encode_video_source(self.vae, phase_2_source_video, self.device, outpainting_dims)
-                    phase_2_source_latents = phase_2_source_latents[:, :, :latent_t].to(device="cpu", dtype=phase_2_latent_canvas.dtype, non_blocking=False)
+                    phase_2_source_latents = transfer.move(phase_2_source_latents[:, :, :latent_t], "cpu", phase_2_latent_canvas.dtype)
                     if input_masks is not None:
                         phase_2_source_mask = input_masks[:, history_count:history_count + phase_2_source_video.shape[1]]
                         phase_2_editable_mask = _resize_video_mask(phase_2_source_mask, phase_2_source_latents.shape[-3:], self.vae.config.clip_length,
