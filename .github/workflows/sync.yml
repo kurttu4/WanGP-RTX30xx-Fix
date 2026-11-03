@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write  # ЭТОЙ СТРОКИ ТЕБЕ НЕ ХВАТАЛО
 
 jobs:
   sync:
@@ -17,7 +16,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }} # Явно указываем токен
 
       - name: Merge upstream changes
         run: |
@@ -25,9 +23,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/deepbeepmeep/WanGP.git
           git fetch upstream main
-          # Мержим всё, кроме папки .github
+          # Мержим только файлы, игнорируя папку .github (где лежат воркфлоу)
           git merge upstream/main -X theirs --no-edit --no-commit
           git reset HEAD .github/
           git checkout .github/
-          git commit -m "Auto-sync with upstream"
+          git commit -m "Auto-sync with upstream" || echo "No changes to commit"
           git push origin main
