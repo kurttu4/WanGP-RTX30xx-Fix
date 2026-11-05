@@ -6400,6 +6400,24 @@ def any_audio_track(model_type):
         return False
     return ( model_def.get("returns_audio", False) or model_def.get("any_audio_prompt", False) )
 
+def make_tail_clip(video_path, keep_frames, fps, save_dir):
+    """Last `keep_frames` frames (and their audio) of a video as a small lossless clip, so a continuation re-encodes only that tail."""
+    import subprocess, imageio_ffmpeg
+    source_fps, _, _, source_frames = get_video_info(video_path)
+    keep_source_frames = int(math.ceil(keep_frames * source_fps / fps)) if fps and source_fps else keep_frames
+    if keep_source_frames <= 0 or source_frames <= keep_source_frames:
+        return video_path, False
+    out_path = get_available_filename(save_dir, video_path, suffix="_tail", force_extension=".mkv")
+    start_seconds = (source_frames - keep_source_frames) / source_fps
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-v", "error", "-i", video_path, "-ss", f"{start_seconds:.6f}",
+           "-c:v", "libx264", "-crf", "0", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", out_path]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        print(f"Unable to cut the tail of the Last Video, using the whole video: {e}")
+        return video_path, False
+    return out_path, True
+
 def get_available_filename(target_path, video_source, suffix = "", force_extension = None):
     name, extension =  os.path.splitext(os.path.basename(strip_virtual_media_suffix(video_source)))
     if force_extension != None:
@@ -7840,6 +7858,11 @@ def generate_media(
     if "L" in image_prompt_type:
         video_source = prompt_enhancer_images.resolve_continue_video(video_source, image_prompt_type, get_processed_queue(gen)[VIDEO.id][0], save_path)
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
+    # "Last Video" + a positive number of frames to keep: continue from a lossless clip of the last frames only, so the older frames are not re-encoded again
+    source_tail_only = False # True: the source is a tail clip of the Last Video and its frames are not saved again with the new video
+    if "L" in image_prompt_type and video_source is not None and not is_image and is_integer(keep_frames_video_source) and int(keep_frames_video_source) > 0:
+        video_source, source_tail_only = make_tail_clip(video_source, int(keep_frames_video_source), fps, save_path)
+        if source_tail_only: temp_filenames_list.append(video_source)
     gen_state = {}
     frame_scheduler = None
     first_window_available_overlap = estimate_first_window_overlap_frames(None if fake_start_image else image_start, video_source, keep_frames_video_source, fps)
@@ -8985,7 +9008,10 @@ def generate_media(
                             prefix_video = convert_video_tensor_to_uint8_chunked(prefix_video)
                         elif prefix_video.dtype == torch.uint8:
                             prefix_video = prefix_video.float().div_(127.5).sub_(1.0)
-                    if prefix_video.shape[1] > 1:
+                    if source_tail_only:
+                        # the tail frames only served as guide: keep just the newly generated frames (they start right after the tail)
+                        sample = sample[: , source_video_overlap_frames_count:]
+                    elif prefix_video.shape[1] > 1:
                         if prefix_video.shape[-2:] != sample.shape[-2:]: # a VAE upsampler enlarged the generated frames
                             prefix_video = resize_lanczos_spatial(prefix_video, None, size=sample.shape[-2:])
                         # remove sliding window overlapped frames at the beginning of the generation
@@ -12738,7 +12764,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 else:
                     model_mode_value = ui_defaults["model_mode"] = get_default_value(model_mode_choices["choices"], ui_get("model_mode", None), model_mode_choices["default"] )
                     model_mode = gr.Dropdown(choices=model_mode_choices["choices"], value=model_mode_value, label=model_mode_choices["label"],  visible=image_mode_value in model_modes_visibility)                        
-                keep_frames_video_source = gr.Text(value=ui_get("keep_frames_video_source") , visible= len(filter_letters(image_prompt_type_value, "VL"))>0 , scale = 2, label= "Truncate Video beyond this number of resampled Frames (empty=Keep All, negative truncates from End)" ) 
+                keep_frames_video_source = gr.Text(value=ui_get("keep_frames_video_source") , visible= len(filter_letters(image_prompt_type_value, "VL"))>0 , scale = 2, label= "Truncate Video beyond this number of resampled Frames (empty=Keep All, negative truncates from End). Last Video: a positive number continues from the last N frames only and saves just the new frames, without the previous video" ) 
 
             any_control_video = any_control_image = False
             if image_mode_value ==2:
