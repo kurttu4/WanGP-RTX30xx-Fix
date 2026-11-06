@@ -9039,7 +9039,7 @@ def generate_media(
                 if drop_generated_audio: generated_audio = None
                 if generated_audio is not None:
                     # The generated track starts at the source boundary, including any repaired source tail.
-                    source_audio_frames = source_video_frames_count if video_source is not None else 0
+                    source_audio_frames = source_video_frames_count if video_source is not None and not source_tail_only else 0 # in tail mode the tail frames are not in the output timeline
                     committed_audio_samples = int(round(max(0, retained_video_frames - source_audio_frames) * output_audio_sampling_rate / fps))
                     committed_audio_samples += round(source_audio_repair_seconds * output_audio_sampling_rate)
                     if full_generated_audio is None:
@@ -9271,21 +9271,24 @@ def generate_media(
                     mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
 
                     set_progress_status(saving_status)
-                    combine_and_concatenate_video_with_audio_tracks(
-                        video_path,
-                        save_path_tmp,
-                        source_audio_tracks,
-                        new_audio_tracks,
-                        source_audio_duration,
-                        mux_audio_sampling_rate,
-                        new_audio_from_start=new_audio_added_from_audio_start,
-                        source_audio_metadata=source_audio_metadata,
-                        audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
-                        pad_audio_to_video=audio_window_alignment and full_generated_audio is not None,
-                        verbose=verbose_level >= 2,
-                        audio_tail_seconds=saved_audio_tail_seconds,
-                    )
-                    os.remove(save_path_tmp)
+                    if source_tail_only and len(new_audio_tracks) == 0:
+                        os.replace(save_path_tmp, video_path) # tail mode: the tail audio is not saved and there is no new audio
+                    else:
+                        combine_and_concatenate_video_with_audio_tracks(
+                            video_path,
+                            save_path_tmp,
+                            [] if source_tail_only else source_audio_tracks, # tail mode: do not put the audio of the tail frames before the new audio
+                            new_audio_tracks,
+                            0 if source_tail_only else source_audio_duration,
+                            mux_audio_sampling_rate,
+                            new_audio_from_start=new_audio_added_from_audio_start,
+                            source_audio_metadata=source_audio_metadata,
+                            audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
+                            pad_audio_to_video=audio_window_alignment and full_generated_audio is not None,
+                            verbose=verbose_level >= 2,
+                            audio_tail_seconds=saved_audio_tail_seconds,
+                        )
+                        os.remove(save_path_tmp)
                     if output_new_audio_temp_filepath is not None: os.remove(output_new_audio_temp_filepath)
                     cleanup_temp_audio_files(trimmed_mux_audio_tracks)
                     cleanup_temp_audio_files(replace_voice_temp_audio_tracks)
