@@ -7874,6 +7874,11 @@ def generate_media(
     if "L" in image_prompt_type:
         video_source = prompt_enhancer_images.resolve_continue_video(video_source, image_prompt_type, get_processed_queue(gen)[VIDEO.id][0], save_path)
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
+    # "Last Video" + a positive number of frames to keep: continue from a lossless clip of the last frames only, so the older frames are not re-encoded again
+    source_tail_only = False # True: the source is a tail clip of the Last Video and its frames are not saved again with the new video
+    if "L" in image_prompt_type and video_source is not None and not is_image and is_integer(keep_frames_video_source) and int(keep_frames_video_source) > 0:
+        video_source, source_tail_only = make_tail_clip(video_source, int(keep_frames_video_source), fps, save_path)
+        if source_tail_only: temp_filenames_list.append(video_source)
     # A virtual control video keeps its own length, in frames at the output rate, whatever lengths the model renders: the render pads it up to the next one, and the output is trimmed back.
     # Asked for more than that rounding, it is a shorter control video like any other: temporal outpainting
     guide_own_frames = virtual_own_frames(video_guide, fps) if image_mode == 0 and "-" not in video_prompt_type else None
@@ -12769,7 +12774,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 with gr.Group(visible= len(image_prompt_types_allowed)>1 and image_mode_value == 0) as image_prompt_type_group:
                     with gr.Row(elem_classes=["wangp-input-mode-row"]):
                         image_prompt_type_radio_allowed_values= filter_letters(image_prompt_types_allowed, "SVL")
-                        image_prompt_type_radio_value = filter_letters(image_prompt_type_value, image_prompt_type_radio_allowed_values,  image_prompt_type_choices[0][1] if len(image_prompt_type_choices) > 0 else "")
+                        image_prompt_type_radio_value = filter_letters(image_prompt_type_value, image_prompt_type_radio_allowed_values,  image_prompt_type_choices[0][1] if len(image_prompt_type_choices) > 0 else "")[-1:] # the radio takes a single letter: with settings such as "SL" keep the last mode (L over V over S)
                         if len(image_prompt_type_choices) > 0:
                             image_prompt_type_radio = gr.Radio(image_prompt_type_choices, value=image_prompt_type_radio_value, label="Video Input Mode", show_label=False, visible=len(image_prompt_types_allowed)>1, min_width=0, elem_classes=["wangp-input-modes"])
                         else:
