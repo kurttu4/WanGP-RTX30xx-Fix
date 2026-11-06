@@ -22,10 +22,10 @@ Model links below select a model when this guide is opened inside WanGP. When re
 | Short audio-video clips with a smaller model | [Kandinsky 6 Lite Distilled](modeltype:k6_lite_distill) | A 3B generator for text or a start image, with speech, music and effects. Start with five seconds and the supplied ten-step settings. |
 | A planned camera move from an image | [Fun Control-Camera 1.3B](modeltype:fun_camera_1.3B), [Uni3C 14B](modeltype:uni3c) | Pick a camera preset or supply a custom path. Fun is smaller; Uni3C uses the start image's estimated geometry to guide the shot. |
 | Video following reference subjects, scenes or voices | [MiniMax H3 Ref2VA Pruned](modeltype:minimax_h3_ref2va_pruned), [LTX 2.5 MSR](modeltype:ltx2_25_22B_msr) | Ref2VA accepts image, video and audio references. MSR combines subject/object references, with an optional background reference. |
-| Character animation and replacement | [SCAIL-2](modeltype:scail2_14B), [Wan 2.2 Animate 2](modeltype:animate2), [Viggle Animate](modeltype:viggle_animate) | SCAIL-2 and Animate 2 are Wan-derived workflows. Viggle is H3-derived and needs an edited frame from the original driving video. |
+| Character animation and replacement | [SCAIL-2](modeltype:scail2_14B), [Wan 2.2 Animate 2](modeltype:animate2), [Viggle Animate](modeltype:viggle_animate), [Viggle Remake Pruned 20B Swap](modeltype:viggle_remake) | SCAIL-2 and Animate 2 are Wan-derived workflows. The Viggle models are H3-derived and need an edited frame from the original video. Viggle Remake also takes a prompt, keeps the soundtrack and recasts several people at once. |
 | General text-to-video or image-to-video | [Wan 2.2 T2V](modeltype:t2v_2_2), [Wan 2.2 I2V](modeltype:i2v_2_2) | General-purpose generation with a broad choice of LoRAs and specialist variants. |
 | Connected stories with recurring characters | [JoyAI-Echo Surgical](modeltype:joyai_echo_surgical) | This LTX-2 variant reuses character, voice, object and location memories between shots. |
-| Video editing and outpainting | [H3 ControlNet-Union Pruned](modeltype:minimax_h3_control_pruned), [Wan VACE](modeltype:vace_14B), [Bernini-R](modeltype:bernini) | Pick H3 for controlled audio-video generation, VACE for mask/control editing, or Bernini for video edits and multiple references. |
+| Video editing and outpainting | [H3 ControlNet-Union Pruned](modeltype:minimax_h3_control_pruned), [Wan VACE](modeltype:vace_14B), [Bernini-R](modeltype:bernini), [Viggle Remake Pruned 20B Edit](modeltype:viggle_remake_edit) | Pick H3 for controlled audio-video generation, VACE for mask/control editing, Bernini for video edits and multiple references, or Viggle Remake Edit to change objects, setting, weather or light from a painted frame while keeping the people, motion and soundtrack. |
 | Talking characters and longer dialogue | [LongCat Avatar 1.5](modeltype:longcat_avatar_v1_5), [InfiniteTalk](modeltype:infinitetalk), [Magi Human Distill](modeltype:magi_human_distill) | LongCat Avatar and InfiniteTalk follow speech audio. Magi Human can generate speech with motion or follow supplied audio. |
 | General image generation | [Krea 2 Turbo](modeltype:krea2_turbo), [Z-Image Turbo](modeltype:z_image), [Flux 2 Klein 4B](modeltype:flux2_klein_4b) | Distilled choices for iteration. Compare their appearance, reference support and memory use on your own prompts. |
 | Image editing and references | [Qwen Image 2.1](modeltype:qwen_image_21_7B), [Qwen Image Edit Plus 2511](modeltype:qwen_image_edit_plus2_20B), [Krea 2 Identity Edit](modeltype:krea2_raw_edit) | Qwen 2.1 combines generation and editing with up to ten references. Edit Plus emphasizes image edits and identity. Krea Identity Edit accepts up to two references. |
@@ -145,7 +145,7 @@ Other specialist entries remain in the selector. Use their own Help for required
 
 **[Qwen Image 2.1 7B](modeltype:qwen_image_21_7B)** combines image generation and editing. It accepts up to ten references and supports masked editing, LanPaint, outpainting, pose/depth/edge guidance and resolutions up to 4K. Enable **RGBA** and request a transparent background to save cutouts as PNG with an alpha channel.
 
-Its optional **KV Cache** trades extra GPU memory for faster denoising; its **INT8** choice gives the same speedup in about half that memory. **Viggle Turbo** and **Pruna** acceleration profiles apply the matching adapter, scheduler and step settings; these image accelerators are unrelated to the H3-based Viggle Animate video workflow. Prefer short text in Qwen 2.1 images and proofread it; use a design-oriented model for dense infographics.
+Its optional **KV Cache** (INT8) trades extra GPU memory for faster denoising. **Viggle Turbo** and **Pruna** acceleration profiles apply the matching adapter, scheduler and step settings; these image accelerators are unrelated to the H3-based Viggle Animate video workflow. Prefer short text in Qwen 2.1 images and proofread it; use a design-oriented model for dense infographics.
 
 The older 20B family remains useful:
 
@@ -184,7 +184,7 @@ Choose LoRAs and reference workflows for the exact Flux architecture and variant
 
 ### Z-Image
 
-**[Z-Image Turbo](modeltype:z_image)** is a distilled 6B generator. **Base**, **Fun ControlNet**, **TwinFlow** and supported **Nunchaku** variants offer different control, sampling and memory choices. Use a ControlNet variant when you need its particular pose/depth/edge or editing workflow, rather than expecting those controls on every Z-Image entry.
+**[Z-Image Turbo](modeltype:z_image)** is a distilled 6B generator. **Base**, **Fun ControlNet**, **TwinFlow** and supported **Nunchaku** variants offer different control, sampling and memory choices. **[NitroFusion2](modeltype:z_image_nitrofusion2)** needs only 1 to 4 steps (2 by default): pick the step count with its Accelerator profiles, which also set the matching Shift Scale and De-distillation LoRA strengths. Use a ControlNet variant when you need its particular pose/depth/edge or editing workflow, rather than expecting those controls on every Z-Image entry.
 
 ### Ideogram 4
 
@@ -304,7 +304,7 @@ Open results in the **3D gallery** to rotate, zoom and inspect them. Gaussian sp
 
 Generation models and finishing tools are separate choices. Select a processor in **Post Processing**, use **Late Post Processing** on a gallery result, or use **Media Flow** for supported batch workflows.
 
-- **Spatial upscaling and detail**: SeedVR2, FlashVSR and LTX-based upscaling offer different appearance and memory trade-offs. LTX 2.5 Detail Refiner can restore texture in soft or compressed video. Lanczos provides conventional resizing; latent/VAE upsamplers apply only to compatible generation workflows.
+- **Spatial upscaling and detail**: SeedVR2, FlashVSR, RelayVSR and LTX-based upscaling offer different appearance, speed and memory trade-offs; RelayVSR is the fast choice for x2 and x4 upscaling (its X2 model serves ratios up to x2). LTX 2.5 Detail Refiner can restore texture in soft or compressed video. Lanczos provides conventional resizing; latent/VAE upsamplers apply only to compatible generation workflows.
 - **Smoother motion**: RIFE supports x2/x3/x4 interpolation. Optional DLSS Frame Generation offers hardware-dependent multipliers on compatible RTX GPUs.
 - **Neural refinement**: optional DLSS 5 can refine lighting, material appearance and detail at native or enlarged resolution, on supported hardware. See the [DLSS 5 guide](DLSS5.md) for setup and limits.
 - **Faces**: H3 Face Refiner and TaoMate-FVSR Face Refiner refine up to five detected, tracked faces in a video, both using the soundtrack; TaoMate-FVSR pushes the mouth toward it much harder. See [Processing](PROCESSING.md#face-refinement).
