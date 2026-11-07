@@ -12801,7 +12801,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 keep_frames_video_source = gr.Text(value=ui_get("keep_frames_video_source") , visible= len(filter_letters(image_prompt_type_value, "VL"))>0 , scale = 2, label= "Truncate Video beyond this number of resampled Frames (empty=Keep All, negative truncates from End)" ) 
 
                 continue_no_join_checkbox = gr.Checkbox(value=lambda: CONTINUE_NO_JOIN[0], label="Continue without joining: save only the newly generated frames (the source video and its audio are used only as a guide)", visible=len(filter_letters(image_prompt_type_value, "VL"))>0)
-                continue_no_join_checkbox.change(fn=set_continue_no_join, inputs=[continue_no_join_checkbox], outputs=None)
+                if not update_form: continue_no_join_checkbox.change(fn=set_continue_no_join, inputs=[continue_no_join_checkbox], outputs=None)
 
             any_control_video = any_control_image = False
             if image_mode_value ==2:
