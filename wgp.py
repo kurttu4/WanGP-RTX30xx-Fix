@@ -207,6 +207,9 @@ VIDEO_LENGTH_ROUNDING = "ceil"  # how a requested video length is fitted to the 
 set_video_length_rounding(VIDEO_LENGTH_ROUNDING)
 settings_version = 2.83
 max_source_video_frames = 3000
+CONTINUE_NO_JOIN = [False] # state of the Continue without joining checkbox (page only, not saved in the settings)
+def set_continue_no_join(value):
+    CONTINUE_NO_JOIN[0] = bool(value)
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
 image_names_list = ["image_start", "image_end", "image_refs"]
 CUSTOM_SETTINGS_MAX = 5
@@ -6419,7 +6422,7 @@ def any_audio_track(model_type):
     return ( model_def.get("returns_audio", False) or model_def.get("any_audio_prompt", False) )
 
 def make_tail_clip(video_path, keep_frames, fps, save_dir):
-    """Last `keep_frames` frames (and their audio) of a video as a small lossless clip, so a continuation re-encodes only that tail."""
+    """Last `keep_frames` frames (and their audio) of a video as a small lossless clip: only these frames are read when continuing a video."""
     import subprocess, imageio_ffmpeg
     source_fps, _, _, source_frames = get_video_info(video_path)
     keep_source_frames = int(math.ceil(keep_frames * source_fps / fps)) if fps and source_fps else keep_frames
@@ -6432,7 +6435,7 @@ def make_tail_clip(video_path, keep_frames, fps, save_dir):
     try:
         subprocess.run(cmd, check=True)
     except Exception as e:
-        print(f"Unable to cut the tail of the Last Video, using the whole video: {e}")
+        print(f"Unable to cut the end of the source video, using the whole video: {e}")
         return video_path, False
     return out_path, True
 
@@ -7874,11 +7877,11 @@ def generate_media(
     if "L" in image_prompt_type:
         video_source = prompt_enhancer_images.resolve_continue_video(video_source, image_prompt_type, get_processed_queue(gen)[VIDEO.id][0], save_path)
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
-    # "Last Video" + a positive number of frames to keep: continue from a lossless clip of the last frames only, so the older frames are not re-encoded again
-    source_tail_only = False # True: the source is a tail clip of the Last Video and its frames are not saved again with the new video
-    if "L" in image_prompt_type and video_source is not None and not is_image and is_integer(keep_frames_video_source) and int(keep_frames_video_source) > 0:
-        video_source, source_tail_only = make_tail_clip(video_source, int(keep_frames_video_source), fps, save_path)
-        if source_tail_only: temp_filenames_list.append(video_source)
+    skip_source_join = bool(CONTINUE_NO_JOIN[0] and any_letters(image_prompt_type, "VL") and video_source is not None and not is_image) # Continue without joining: the source video and its audio only guide the generation, they are not saved again with the new frames
+    if skip_source_join: # read only the last frames of the source: cut them (with their audio) into a small temporary clip
+        tail_frames = int(keep_frames_video_source) if is_integer(keep_frames_video_source) and int(keep_frames_video_source) > 0 else int(sliding_window_overlap or 0) + 4
+        video_source, tail_created = make_tail_clip(video_source, max(tail_frames, 5), fps, save_path)
+        if tail_created: temp_filenames_list.append(video_source)
     # A virtual control video keeps its own length, in frames at the output rate, whatever lengths the model renders: the render pads it up to the next one, and the output is trimmed back.
     # Asked for more than that rounding, it is a shorter control video like any other: temporal outpainting
     guide_own_frames = virtual_own_frames(video_guide, fps) if image_mode == 0 and "-" not in video_prompt_type else None
@@ -9036,8 +9039,8 @@ def generate_media(
                             prefix_video = convert_video_tensor_to_uint8_chunked(prefix_video)
                         elif prefix_video.dtype == torch.uint8:
                             prefix_video = prefix_video.float().div_(127.5).sub_(1.0)
-                    if source_tail_only:
-                        # the tail frames only served as guide: keep just the newly generated frames (they start right after the tail)
+                    if skip_source_join:
+                        # the source frames only served as guide: keep just the newly generated frames (they start right after the overlap)
                         sample = sample[: , source_video_overlap_frames_count:]
                     elif prefix_video.shape[1] > 1:
                         if prefix_video.shape[-2:] != sample.shape[-2:]: # a VAE upsampler enlarged the generated frames
@@ -9067,7 +9070,7 @@ def generate_media(
                 if drop_generated_audio: generated_audio = None
                 if generated_audio is not None:
                     # The generated track starts at the source boundary, including any repaired source tail.
-                    source_audio_frames = source_video_frames_count if video_source is not None and not source_tail_only else 0 # in tail mode the tail frames are not in the output timeline
+                    source_audio_frames = source_video_frames_count if video_source is not None and not skip_source_join else 0 # when the source is not joined its frames are not in the output timeline
                     committed_audio_samples = int(round(max(0, retained_video_frames - source_audio_frames) * output_audio_sampling_rate / fps))
                     committed_audio_samples += round(source_audio_repair_seconds * output_audio_sampling_rate)
                     if full_generated_audio is None:
@@ -9299,15 +9302,15 @@ def generate_media(
                     mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
 
                     set_progress_status(saving_status)
-                    if source_tail_only and len(new_audio_tracks) == 0:
-                        os.replace(save_path_tmp, video_path) # tail mode: the tail audio is not saved and there is no new audio
+                    if skip_source_join and len(new_audio_tracks) == 0:
+                        os.replace(save_path_tmp, video_path) # the source audio is not saved and there is no new audio
                     else:
                         combine_and_concatenate_video_with_audio_tracks(
                             video_path,
                             save_path_tmp,
-                            [] if source_tail_only else source_audio_tracks, # tail mode: do not put the audio of the tail frames before the new audio
+                            [] if skip_source_join else source_audio_tracks, # do not put the audio of the source video before the new audio
                             new_audio_tracks,
-                            0 if source_tail_only else source_audio_duration,
+                            0 if skip_source_join else source_audio_duration,
                             mux_audio_sampling_rate,
                             new_audio_from_start=new_audio_added_from_audio_start,
                             source_audio_metadata=source_audio_metadata,
@@ -11929,7 +11932,7 @@ def refresh_image_prompt_type_radio(state, image_prompt_type, image_prompt_type_
     model_def = get_model_def(get_state_model_type(state))
     end_visible = end_frames_option_visible(model_def, image_prompt_type)
     input_strength_visible = input_video_strength_visible(model_def, image_prompt_type, video_prompt_type)
-    return image_prompt_type, gr.update(visible = "S" in image_prompt_type ), gr.update(visible = end_visible and ("E" in image_prompt_type) ), gr.update(visible = "V" in image_prompt_type) , gr.update(visible = input_strength_visible), gr.update(visible = any_video_source), gr.update(visible = end_visible)
+    return image_prompt_type, gr.update(visible = "S" in image_prompt_type ), gr.update(visible = end_visible and ("E" in image_prompt_type) ), gr.update(visible = "V" in image_prompt_type) , gr.update(visible = input_strength_visible), gr.update(visible = any_video_source), gr.update(visible = end_visible), gr.update(visible = any_video_source)
 
 def refresh_image_prompt_type_endcheckbox(state, image_prompt_type, image_prompt_type_radio, end_checkbox, video_prompt_type):
     image_prompt_type = del_in_sequence(image_prompt_type, "E")
@@ -12795,7 +12798,10 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 else:
                     model_mode_value = ui_defaults["model_mode"] = get_default_value(model_mode_choices["choices"], ui_get("model_mode", None), model_mode_choices["default"] )
                     model_mode = gr.Dropdown(choices=model_mode_choices["choices"], value=model_mode_value, label=model_mode_choices["label"],  visible=image_mode_value in model_modes_visibility)                        
-                keep_frames_video_source = gr.Text(value=ui_get("keep_frames_video_source") , visible= len(filter_letters(image_prompt_type_value, "VL"))>0 , scale = 2, label= "Truncate Video beyond this number of resampled Frames (empty=Keep All, negative truncates from End). Last Video: a positive number continues from the last N frames only and saves just the new frames, without the previous video" ) 
+                keep_frames_video_source = gr.Text(value=ui_get("keep_frames_video_source") , visible= len(filter_letters(image_prompt_type_value, "VL"))>0 , scale = 2, label= "Truncate Video beyond this number of resampled Frames (empty=Keep All, negative truncates from End)" ) 
+
+                continue_no_join_checkbox = gr.Checkbox(value=lambda: CONTINUE_NO_JOIN[0], label="Continue without joining: save only the newly generated frames (the source video and its audio are used only as a guide)", visible=len(filter_letters(image_prompt_type_value, "VL"))>0)
+                continue_no_join_checkbox.change(fn=set_continue_no_join, inputs=[continue_no_join_checkbox], outputs=None)
 
             any_control_video = any_control_image = False
             if image_mode_value ==2:
@@ -14163,7 +14169,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             audio_inputs_refresh.change(fn=refresh_audio_inputs, inputs=[state, audio_prompt_type, video_prompt_type, image_mode], outputs=[audio_guide, audio_guide2, audio_guide3, speakers_locations_row, remove_background_sound, normalize_audio_volumes, audio_prompt_type_custom_option, audio_options_row, audio_guide_row, force_control_video_trim], show_progress="hidden", queue=False)
             prompt_enhancer_mode_dropdown.input(fn=build_prompt_enhancer_value, inputs=[prompt_enhancer_mode_dropdown, prompt_enhancer_think], outputs=[prompt_enhancer], show_progress="hidden")
             prompt_enhancer_think.input(fn=build_prompt_enhancer_value, inputs=[prompt_enhancer_mode_dropdown, prompt_enhancer_think], outputs=[prompt_enhancer], show_progress="hidden")
-            image_prompt_type_radio.change(fn=refresh_image_prompt_type_radio, inputs=[state, image_prompt_type, image_prompt_type_radio, video_prompt_type], outputs=[image_prompt_type, image_start_row, image_end_row, video_source, input_video_strength, keep_frames_video_source, image_prompt_type_endcheckbox], show_progress="hidden").then(fn=None, inputs=None, outputs=None, js="() => window.wangpRefreshInputModes()")
+            image_prompt_type_radio.change(fn=refresh_image_prompt_type_radio, inputs=[state, image_prompt_type, image_prompt_type_radio, video_prompt_type], outputs=[image_prompt_type, image_start_row, image_end_row, video_source, input_video_strength, keep_frames_video_source, image_prompt_type_endcheckbox, continue_no_join_checkbox], show_progress="hidden").then(fn=None, inputs=None, outputs=None, js="() => window.wangpRefreshInputModes()")
             image_prompt_type_endcheckbox.change(fn=refresh_image_prompt_type_endcheckbox, inputs=[state, image_prompt_type, image_prompt_type_radio, image_prompt_type_endcheckbox, video_prompt_type], outputs=[image_prompt_type, image_end_row, input_video_strength] ) 
             video_prompt_type_image_refs.input(fn=refresh_video_prompt_type_image_refs, inputs = [state, video_prompt_type, video_prompt_type_image_refs,image_mode, image_prompt_type], outputs = [video_prompt_type, image_refs_row, remove_background_images_ref,  image_refs_relative_size, frames_positions,video_guide_outpainting_col, input_video_strength], show_progress="hidden")
             enhancer_label_inputs = [image_mode, video_prompt_type, image_prompt_type, image_start, image_end, image_refs, image_guide, image_mask_guide, video_source]
