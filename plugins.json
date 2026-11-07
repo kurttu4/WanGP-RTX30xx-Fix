@@ -213,7 +213,7 @@
   {
     "name": "Prompt Manager",
     "author": "David Brum",
-    "version": "1.4.2",
+    "version": "1.4.3",
     "description": "Browse generated images and videos with search, sort, and grid size controls. Copy metadata, generate in-plugin, manage a saved library with export/import, and bulk actions on multi-select.",
     "type": [
       "app"
