@@ -1175,11 +1175,68 @@ class PluginManager:
                 entries = [self._normalize_catalog_entry(entry) for entry in payload if isinstance(entry, dict)]
         return entries or []
 
-    def load_local_catalog_entries(self) -> List[Dict[str, Any]]:
+    def remove_local_catalog_entry(self, plugin_id: str) -> bool:
+        if not plugin_id:
+            return False
         payload = self._load_json_file(self.local_catalog_path)
-        if isinstance(payload, list):
-            return [self._normalize_catalog_entry(entry) for entry in payload if isinstance(entry, dict)]
-        return []
+        if not isinstance(payload, list) or not payload:
+            return False
+        target_id = plugin_id.strip().lower()
+        new_payload = []
+        changed = False
+        for entry in payload:
+            if not isinstance(entry, dict):
+                changed = True
+                continue
+            e_url = normalize_plugin_url(entry.get("url", "")).lower()
+            e_id = entry.get("id") or plugin_id_from_url(e_url)
+            if (e_id and e_id.strip().lower() == target_id) or (target_id in e_url.split("/")):
+                changed = True
+                continue
+            new_payload.append(entry)
+        if changed:
+            self._write_json_file(self.local_catalog_path, new_payload)
+            return True
+        return False
+
+    def clean_local_catalog(self) -> List[Dict[str, Any]]:
+        payload = self._load_json_file(self.local_catalog_path)
+        if not isinstance(payload, list) or not payload:
+            return []
+
+        base_entries = self.load_catalog_entries(use_remote=False)
+        base_urls = set()
+        for b in base_entries:
+            b_url = normalize_plugin_url(b.get("url", "")).lower()
+            if b_url:
+                base_urls.add(b_url)
+
+        cleaned_entries = []
+        changed = False
+        for entry in payload:
+            if not isinstance(entry, dict):
+                changed = True
+                continue
+            entry_url = normalize_plugin_url(entry.get("url", "")).lower()
+            entry_id = entry.get("id") or plugin_id_from_url(entry_url)
+
+            is_installed = bool(entry_id and os.path.isdir(os.path.join(self.plugins_dir, entry_id)))
+            in_base_catalog = bool(entry_url and entry_url in base_urls)
+
+            # Если плагин удалили из папки и его нет в каталоге — вычищаем
+            if not is_installed and not in_base_catalog:
+                changed = True
+                continue
+
+            cleaned_entries.append(self._normalize_catalog_entry(entry))
+
+        if changed:
+            self._write_json_file(self.local_catalog_path, cleaned_entries)
+
+        return cleaned_entries
+
+    def load_local_catalog_entries(self) -> List[Dict[str, Any]]:
+        return self.clean_local_catalog()
 
     def get_merged_catalog_entries(self, use_remote: bool = True) -> Dict[str, Dict[str, Any]]:
         base_entries = self.load_catalog_entries(use_remote=use_remote)
@@ -1507,6 +1564,7 @@ class PluginManager:
         try:
             shutil.rmtree(target_dir, onerror=self._remove_readonly)
             self.clear_remote_plugin_install(plugin_id)
+            self.remove_local_catalog_entry(plugin_id)
             return f"[Success] Plugin '{plugin_id}' uninstalled. Please restart WanGP."
         except Exception as e:
             return f"[Error] Failed to remove plugin '{plugin_id}': {e}"
