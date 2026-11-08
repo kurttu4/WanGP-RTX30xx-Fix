@@ -945,6 +945,63 @@ class ConfigTabPlugin(WAN2GPPlugin):
                 with gr.Tab("Notifications"):
                     self.notification_sound_enabled_choice = gr.Dropdown(choices=[("On", 1), ("Off", 0)], value=self.server_config.get("notification_sound_enabled", 0), label="Notification Sound")
                     self.notification_sound_volume_choice = gr.Slider(0, 100, value=self.server_config.get("notification_sound_volume", 50), step=5, label="Notification Volume")
+
+                    sound_choices = [
+                        ("The winning chord (C-E-G-C)", "chord"),
+                        ("Double beep (880 Hz + 1175 Hz)", "double_beep"),
+                        ("Single beep (customizable)", "single_beep"),
+                        ("System bell (Windows Asterisk)", "asterisk"),
+                        ("System Warning (Windows Exclamation)", "exclamation"),
+                        ("File custom.wav (put custom.wav in root folder)", "custom_wav"),
+                    ]
+                    self.notification_sound_type_choice = gr.Dropdown(
+                        choices=sound_choices,
+                        value=self.server_config.get("notification_sound_type", "double_beep"),
+                        label="Type of sound signal"
+                    )
+                    with gr.Row():
+                        self.notification_sound_freq_choice = gr.Slider(
+                            200, 4000, value=self.server_config.get("notification_sound_freq", 1000), step=50,
+                            label="Beep frequency (Hz) [for single beep]"
+                        )
+                        self.notification_sound_duration_choice = gr.Slider(
+                            50, 1500, value=self.server_config.get("notification_sound_duration", 300), step=50,
+                            label="Duration (ms) [for single beep]"
+                        )
+                    with gr.Row():
+                        self.notification_sound_repeats_choice = gr.Slider(
+                            1, 5, value=self.server_config.get("notification_sound_repeats", 1), step=1,
+                            label="Number of repetitions"
+                        )
+                        self.notification_sound_delay_choice = gr.Slider(
+                            50, 1000, value=self.server_config.get("notification_sound_delay", 150), step=50,
+                            label="Pause between repeats (ms)"
+                        )
+                    with gr.Row():
+                        self.test_sound_btn = gr.Button("🔊 Check sound now", size="sm")
+
+                    def _test_notification_sound(stype, freq, dur, reps, delay, vol):
+                        from shared.utils import notification_sound
+                        notification_sound.play_notification_async(
+                            volume=vol, sound_type=stype, beep_freq=freq,
+                            beep_duration=dur, repeat_count=reps, repeat_delay=delay
+                        )
+                        return None
+
+                    self.test_sound_btn.click(
+                        fn=_test_notification_sound,
+                        inputs=[
+                            self.notification_sound_type_choice,
+                            self.notification_sound_freq_choice,
+                            self.notification_sound_duration_choice,
+                            self.notification_sound_repeats_choice,
+                            self.notification_sound_delay_choice,
+                            self.notification_sound_volume_choice
+                        ],
+                        outputs=[],
+                        queue=False,
+                        show_progress="hidden"
+                    )
                     self.notification_config_ui = notifications.create_config_ui(gr, self.server_config)
                     self.notification_apprise_urls_choice, self.notification_secure_storage_choice, self.notification_on_generation_choice, self.notification_on_queue_complete_choice, self.notification_on_queue_interrupted_choice = self.notification_config_ui.save_components
 
@@ -1110,7 +1167,9 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.metadata_choice, self.embed_source_images_choice,
             self.video_save_path_choice, self.image_save_path_choice, self.audio_save_path_choice, self.mesh_save_path_choice,
             self.workspace_storage_choice, self.workspaces_root_choice, self.mcp_workspace_mode_choice, self.mcp_port_choice, self.mcp_webui_choice, self.mcp_workspace_visibility_choice, self.mcp_visual_inspection_choice,
-            self.notification_sound_enabled_choice, self.notification_sound_volume_choice, self.notification_apprise_urls_choice, self.notification_secure_storage_choice, self.notification_on_generation_choice, self.notification_on_queue_complete_choice, self.notification_on_queue_interrupted_choice,
+            self.notification_sound_enabled_choice, self.notification_sound_volume_choice,
+            self.notification_sound_type_choice, self.notification_sound_freq_choice, self.notification_sound_duration_choice, self.notification_sound_repeats_choice, self.notification_sound_delay_choice,
+            self.notification_apprise_urls_choice, self.notification_secure_storage_choice, self.notification_on_generation_choice, self.notification_on_queue_complete_choice, self.notification_on_queue_interrupted_choice,
             *self.audio_processor_config_components,
             *self.temporal_upsampler_config_components,
             *self.upsampler_config_components,
@@ -1223,7 +1282,9 @@ class ConfigTabPlugin(WAN2GPPlugin):
             metadata_choice, embed_source_images_choice,
             save_path_choice, image_save_path_choice, audio_save_path_choice, mesh_save_path_choice,
             workspace_storage_choice, workspaces_root_choice, mcp_workspace_mode_choice, mcp_port_choice, mcp_webui_choice, mcp_workspace_visibility_choice, mcp_visual_inspection_choice,
-            notification_sound_enabled_choice, notification_sound_volume_choice, notification_apprise_urls_choice, notification_secure_storage_choice, notification_on_generation_choice, notification_on_queue_complete_choice, notification_on_queue_interrupted_choice,
+            notification_sound_enabled_choice, notification_sound_volume_choice,
+            notification_sound_type_choice, notification_sound_freq_choice, notification_sound_duration_choice, notification_sound_repeats_choice, notification_sound_delay_choice,
+            notification_apprise_urls_choice, notification_secure_storage_choice, notification_on_generation_choice, notification_on_queue_complete_choice, notification_on_queue_interrupted_choice,
             last_resolution_choice
         ) = fixed_args
 
@@ -1366,6 +1427,11 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "depth_anything_v2_variant": depth_anything_v2_variant_choice,
             "notification_sound_enabled": notification_sound_enabled_choice,
             "notification_sound_volume": notification_sound_volume_choice,
+            "notification_sound_type": notification_sound_type_choice,
+            "notification_sound_freq": int(notification_sound_freq_choice),
+            "notification_sound_duration": int(notification_sound_duration_choice),
+            "notification_sound_repeats": int(notification_sound_repeats_choice),
+            "notification_sound_delay": int(notification_sound_delay_choice),
             **notification_config_update,
             "max_frames_multiplier": max_frames_multiplier_choice, "display_stats": display_stats_choice,
             "keep_resolution_on_model_switch": keep_resolution_on_model_switch_choice,
@@ -1484,7 +1550,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             DEEPY_VOICE_LANGUAGE_KEY,
             "attention_mode", "vae_config", "boost", "int8_kernels", "fp8_kernels", "kernel_precision", "attention_head_split", "save_path", "image_save_path", "audio_save_path", "mesh_save_path",
             "metadata_type", "clear_file_list", "multi_prompts_gen_type", "keep_intermediate_sliding_windows", "fit_canvas", "depth_anything_v2_variant",
-            "notification_sound_enabled", "notification_sound_volume", *notifications.CONFIG_KEYS, "audio_processors", "temporal_upsamplers", "spatial_upsamplers", "matanyone_version",
+            "notification_sound_enabled", "notification_sound_volume", "notification_sound_type", "notification_sound_freq", "notification_sound_duration", "notification_sound_repeats", "notification_sound_delay", *notifications.CONFIG_KEYS, "audio_processors", "temporal_upsamplers", "spatial_upsamplers", "matanyone_version",
             "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization", PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, "enhancer_mode",
             DEEPY_ENABLED_KEY, DEEPY_TYPE_KEY, DEEPY_VRAM_MODE_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_ROUTE_TAIL_SKIP_KEY, DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_THINKING_KEY, DEEPY_REPETITION_PENALTY_KEY, DEEPY_KEPT_KV_CACHES_KEY, DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, PYTHON_APPS_KEY, DEEPY_ADVANCED_TRANSCRIPTION_KEY, DEEPY_TRANSCRIPTION_TERMS_KEY,
             LLM_CONFIG_KEY,
