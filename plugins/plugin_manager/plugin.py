@@ -406,7 +406,7 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
             .plugin-action-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 88px; margin: 0 !important; border: 1px solid var(--button-secondary-border-color, #ccc) !important; background: var(--button-secondary-background-fill, #f0f0f0) !important; color: var(--button-secondary-text-color) !important; padding: 4px 12px !important; border-radius: 4px !important; cursor: pointer; font-weight: 500; }
             .plugin-action-btn:hover { background: var(--button-secondary-background-fill-hover, #e0e0e0) !important; transform: translateY(-1px); box-shadow: var(--shadow-drop); }
             .plugin-requirements-not-met { display: inline-flex; align-items: center; justify-content: center; min-width: 132px; border: 1px solid rgba(185, 28, 28, 0.35); border-radius: 4px; padding: 4px 12px; color: var(--color-error, #b91c1c); background-color: rgba(185, 28, 28, 0.1); font-weight: 600; white-space: nowrap; }
-            .save-buttons-container { justify-content: flex-start; margin-top: 20px !important; gap: 12px; }
+            .save-buttons-container { justify-content: flex-start; margin-top: 6px !important; margin-bottom: 12px !important; gap: 12px; }
             .stylish-save-btn { font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', sans-serif !important; font-weight: 600 !important; font-size: 1.05em !important; padding: 10px 20px !important; white-space: nowrap; }
             .plugin-instruction { font-size: 0.95em; color: var(--text-color-secondary); margin-bottom: 6px; }
             .plugin-restart-warning {
@@ -540,10 +540,10 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
             with gr.Row(equal_height=False, variant='panel'):
                 with gr.Column(scale=2, min_width=600):
                     gr.Markdown("### Enabled Apps & Plugins")
-                    self.plugins_html_display = gr.HTML()
                     with gr.Row(elem_classes="save-buttons-container"):
                         self.restart_button = gr.Button("Restart", variant="primary", size="sm", scale=0, elem_classes="stylish-save-btn")
                         self.refresh_catalog_button = gr.Button("Check for Updates", variant="secondary", size="sm", scale=0, elem_classes="stylish-save-btn")
+                    self.plugins_html_display = gr.HTML()
                 with gr.Column(scale=2, min_width=300):
                     gr.Markdown("### Available Apps & Plugins")
                     self.local_available_plugins_html_outputs = []
