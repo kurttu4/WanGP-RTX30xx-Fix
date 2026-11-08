@@ -7,12 +7,85 @@ Set WAN2GP_FORCE_AUDIO=1 to bypass the automatic device detection when audio har
 
 import os
 import sys
+import json
+import time
 import threading
 from pathlib import Path
 
 import numpy as np
 
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+
+
+try:
+    import winsound
+    HAS_WINSOUND = True
+except ImportError:
+    HAS_WINSOUND = False
+
+def _get_wgp_config():
+    """Load configuration from root wgp_config.json if present."""
+    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    config_file = os.path.join(root_dir, "wgp_config.json")
+    if os.path.isfile(config_file):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _play_windows_sound(sound_type, freq, duration, repeats, delay_sec):
+    if not HAS_WINSOUND:
+        return False
+    
+    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    custom_wav_paths = [
+        os.path.join(root_dir, "custom.wav"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom.wav")
+    ]
+    custom_wav = next((p for p in custom_wav_paths if os.path.isfile(p)), None)
+
+    for i in range(repeats):
+        try:
+            if sound_type == "chord":
+                notes = [(523, 110), (659, 110), (784, 110), (1046, 260)]
+                for note_f, note_d in notes:
+                    winsound.Beep(note_f, note_d)
+                    time.sleep(0.03)
+
+            elif sound_type == "double_beep":
+                winsound.Beep(880, 160)
+                time.sleep(0.08)
+                winsound.Beep(1175, 240)
+
+            elif sound_type == "single_beep":
+                clamped_freq = max(37, min(32767, int(freq)))
+                clamped_dur = max(50, min(5000, int(duration)))
+                winsound.Beep(clamped_freq, clamped_dur)
+
+            elif sound_type == "asterisk":
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+
+            elif sound_type == "exclamation":
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+
+            elif sound_type == "custom_wav":
+                if custom_wav:
+                    winsound.PlaySound(custom_wav, winsound.SND_FILENAME)
+                else:
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
+
+            else:
+                winsound.MessageBeep(winsound.MB_OK)
+
+        except Exception as e:
+            print(f"Error in _play_windows_sound: {e}")
+            return False
+
+        if i < repeats - 1:
+            time.sleep(delay_sec)
+    return True
 
 _cached_waveforms = {}
 _sample_rate = 44100
@@ -275,21 +348,35 @@ def play_audio_with_winsound(audio_data, sample_rate=_sample_rate):
         print(f"Winsound error: {e}")
         return False
 
-def play_notification_sound(volume=50):
-    """Play notification sound with specified volume"""
+def play_notification_sound(volume=None, sound_type=None, beep_freq=None, beep_duration=None, repeat_count=None, repeat_delay=None):
+    """Play notification sound with specified parameters or values from wgp_config.json"""
+    cfg = _get_wgp_config()
+
+    if volume is None:
+        volume = cfg.get("notification_sound_volume", 50)
     if volume == 0:
         return
 
-    # Native Double beep (880 Hz + 1175 Hz) for Windows
-    try:
-        import winsound, time
-        winsound.Beep(880, 160)
-        time.sleep(0.05)
-        winsound.Beep(1175, 240)
-        return
-    except Exception:
-        pass
+    if sound_type is None:
+        sound_type = cfg.get("notification_sound_type", "double_beep")
+    if beep_freq is None:
+        beep_freq = cfg.get("notification_sound_freq", 1000)
+    if beep_duration is None:
+        beep_duration = cfg.get("notification_sound_duration", 300)
+    if repeat_count is None:
+        repeat_count = cfg.get("notification_sound_repeats", 1)
+    if repeat_delay is None:
+        repeat_delay = cfg.get("notification_sound_delay", 150)
 
+    repeats = max(1, min(5, int(repeat_count)))
+    delay_sec = max(0.05, float(repeat_delay) / 1000.0)
+
+    # 1. On Windows, try the selected pleasant sound first
+    if HAS_WINSOUND and sys.platform == "win32":
+        if _play_windows_sound(sound_type, beep_freq, beep_duration, repeats, delay_sec):
+            return
+
+    # 2. Fallback to existing audio waveform / backends
     audio_data = _get_cached_waveform(volume)
     if len(audio_data) == 0:
         return
@@ -311,19 +398,19 @@ def play_notification_sound(volume=50):
     _audio_backends_failed = True
     _terminal_beep("all audio backends failed")
 
-def play_notification_async(volume=50):
+def play_notification_async(volume=None, sound_type=None, beep_freq=None, beep_duration=None, repeat_count=None, repeat_delay=None):
     """Play notification sound asynchronously (non-blocking)"""
     def play_sound():
         try:
-            play_notification_sound(volume)
+            play_notification_sound(volume, sound_type, beep_freq, beep_duration, repeat_count, repeat_delay)
         except Exception as e:
             print(f"Error playing notification sound: {e}")
 
     threading.Thread(target=play_sound, daemon=True).start()
 
-def notify_video_completion(video_path=None, volume=50):
+def notify_video_completion(video_path=None, volume=None):
     """Notify about completed video generation"""
-    play_notification_async(volume)
+    play_notification_async(volume=volume)
 
 for vol in (25, 50, 75, 100):
     _get_cached_waveform(vol)
