@@ -280,6 +280,16 @@ def play_notification_sound(volume=50):
     if volume == 0:
         return
 
+    # Native Double beep (880 Hz + 1175 Hz) for Windows
+    try:
+        import winsound, time
+        winsound.Beep(880, 160)
+        time.sleep(0.05)
+        winsound.Beep(1175, 240)
+        return
+    except Exception:
+        pass
+
     audio_data = _get_cached_waveform(volume)
     if len(audio_data) == 0:
         return
