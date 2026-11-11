@@ -12225,6 +12225,19 @@ PROMPT_WIZARD_ELEM_ID = "wangp-prompt-wizard"
 RESOLUTION_ELEM_ID = "wangp-resolution"
 PROMPT_TOOLS_ATTACH_JS = "() => { requestAnimationFrame(() => requestAnimationFrame(() => { window.wangpPromptTools?.attach?.(document); window.wangpRefreshInputModes(); window.wangpRefreshSettingsTools(); window.wangpRefreshActionBars(); window.__wangpMagicMaskNS.scheduleMount(); })); }"
 
+PROMPT_PASTE_JS = "async (current) => { try { return await navigator.clipboard.readText(); } catch (e) { alert('Cannot read the clipboard: ' + e); return current; } }"
+
+def prompt_clipboard_buttons():
+    with gr.Row(elem_classes=["wangp-prompt-clipboard-row"]):
+        clear_btn = gr.Button("Clear", size="sm", scale=0, min_width=70)
+        paste_btn = gr.Button("Paste", size="sm", scale=0, min_width=70)
+    return clear_btn, paste_btn
+
+def bind_prompt_clipboard_buttons(clear_btn, paste_btn, textbox):
+    clear_btn.click(fn=None, inputs=None, outputs=[textbox], js="() => ''", show_progress="hidden")
+    paste_btn.click(fn=None, inputs=[textbox], outputs=[textbox], js=PROMPT_PASTE_JS, show_progress="hidden")
+
+
 def get_prompt_helper_popup_id(model_type, prompt_id):
     safe_model = re.sub(r"[^A-Za-z0-9_-]", "-", str(model_type or "model")).strip("-").lower()
     safe_prompt = re.sub(r"[^A-Za-z0-9_-]", "-", str(prompt_id or "prompt")).strip("-").lower()
@@ -13206,7 +13219,9 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             wizard_prompt_info_html = render_prompt_info_label(wizard_prompt_label, model_type, model_def, "wizard")
             with gr.Column(visible=advanced_prompt, elem_classes=["wangp-prompt-tools-stack"]) as prompt_column_advanced:
                 prompt_info_label = gr.HTML(value=prompt_info_html, visible=True, elem_classes=["wangp-prompt-tools-anchor"])
-                prompt = gr.Textbox(visible=advanced_prompt, label=prompt_label, value=launch_prompt, lines=3, elem_id=PROMPT_ADVANCED_ELEM_ID, elem_classes=["wangp-voice-prompt"])
+                prompt_clear_btn, prompt_paste_btn = prompt_clipboard_buttons()
+				prompt = gr.Textbox(visible=advanced_prompt, label=prompt_label, value=launch_prompt, lines=3, elem_id=PROMPT_ADVANCED_ELEM_ID, elem_classes=["wangp-voice-prompt"])
+				if not update_form: bind_prompt_clipboard_buttons(prompt_clear_btn, prompt_paste_btn, prompt)
 
             with gr.Column(visible=not advanced_prompt and len(variables) > 0) as prompt_column_wizard_vars:
                 gr.Markdown("<B>Please fill the following input fields to adapt automatically the Prompt:</B>")
