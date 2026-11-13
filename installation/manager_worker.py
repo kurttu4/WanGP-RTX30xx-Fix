@@ -71,7 +71,9 @@ def installation_info(root, python=None, data=None):
         python = installation_environments(root)["python"]
         if not python:
             raise InstallError("python_required", "Choose the Python environment used by this WanGP installation. Use Detect environment to find env_uv, venv or the saved selection")
-    inspection = inspect_interpreter(plain_path(python))
+    python = Path(os.path.abspath(python))
+    # Its folders must be plain; outside Windows the interpreter itself may be a link (a venv's or Conda's bin/python).
+    inspection = inspect_interpreter(plain_path(python) if os.name == "nt" else plain_path(python.parent) / python.name)
     if inspection["status"] != "inspected":
         raise InstallError("python_unavailable", inspection["error"])
     demo = (root / "setup_config.json").is_file() and set(load_config(root / "setup_config.json")["gpu_profiles"]) == {"Demo"}
@@ -269,13 +271,13 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
         arguments = [*manager_arguments(args.get("launch_options")), "--server-port", str(port)]
         try:
             if info["ownership"] == "managed":
-                return launch_managed(info["root"], runtime, arguments, emit, cancelled.is_set, started, args.get("launch_options"), args.get("auth_password"))
+                return launch_managed(info["root"], runtime, arguments, emit, cancelled.is_set, started, args.get("launch_options"), args.get("auth_password"), args.get("github_opened", False))
             # The lease is in Manager data, never inside an externally owned checkout.
             import hashlib
             lease = Path(info["root"]) if info.get("maintenance") in ("conda", "venv") else data / "external-leases" / hashlib.sha256(os.path.normcase(info["root"]).encode()).hexdigest()
             with InstallationLock(lease):
                 root = Path(info["root"])
-                with launch_context(runtime, info["python"], args.get("launch_options"), args.get("auth_password"), emit) as (env, output_events):
+                with launch_context(runtime, info["python"], args.get("launch_options"), args.get("auth_password"), emit, args.get("github_opened", False)) as (env, output_events):
                     runner.events = output_events
                     if info.get("maintenance") == "venv":
                         ensure_pip(info["python"], runtime, runner)

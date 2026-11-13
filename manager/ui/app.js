@@ -124,12 +124,13 @@ function render(){
   state.renderedView=nextView;
   const nav=state.preferences.installations.length?[["overview","home","Overview"],["install","install","Install / Add"],["maintenance","maintain","Update WanGP"],["diagnostics","diagnostic","Diagnostics"],["activity","activity","Activity"],["preferences","settings","Preferences"]]:[["install","install","Install / Add"]];
   document.querySelector("#app").innerHTML=html(
-    '<div class="shell" {shellState}><aside class="sidebar"><div class="brand"><img class="brand-icon" src="manager.png" alt=""><div><div class="brand-name">WanGP</div><div class="brand-sub">Manager</div></div></div><div class="nav-label">YOUR INSTALLATIONS</div><nav class="nav">{nav}</nav><div class="sidebar-bottom"><div><span class="dot {warn}"></span>{runtime}</div><div class="badge-label">VERSION {version} · EXPERIMENTAL</div>{managerNew}</div></aside><main class="main"><header class="topbar"><div class="breadcrumb">WanGP Manager / <strong>{page}</strong></div>{picker}</header><div class="content">{error}{message}{progress}{content}</div></main></div>{expandedConsole}<dialog id="close-dialog"><h2>Work is still running</h2><p>Keep Manager open, or stop its servers and cancel active operations before exiting. Interrupted installation work can be recovered when you return.</p><div class="actions">{keep}{exit}</div></dialog>',{
+    '<div class="shell" {shellState}><aside class="sidebar"><div class="brand"><img class="brand-icon" src="manager.png" alt=""><div><div class="brand-name">WanGP</div><div class="brand-sub">Manager</div></div></div><div class="nav-label">YOUR INSTALLATIONS</div><nav class="nav">{nav}</nav><div class="sidebar-bottom"><div><span class="dot {warn}"></span>{runtime}</div><div class="badge-label">VERSION {version} · EXPERIMENTAL</div>{managerNew}{star}</div></aside><main class="main"><header class="topbar"><div class="breadcrumb">WanGP Manager / <strong>{page}</strong></div>{picker}</header><div class="content">{error}{message}{progress}{content}</div></main></div>{expandedConsole}<dialog id="close-dialog"><h2>Work is still running</h2><p>Keep Manager open, or stop its servers and cancel active operations before exiting. Interrupted installation work can be recovered when you return.</p><div class="actions">{keep}{exit}</div></dialog>',{
       shellState:state.consoleExpanded?'inert aria-hidden="true"':"",
       expandedConsole:state.consoleExpanded?consoleMarkup(launchLog(),"server-log","Start WanGP to see its console output here."):"",
       nav:nav.map(([page,icon,label])=>button("navigate",svg(icon)+label,state.page===page?"active":"",false,'data-page="'+page+'"')).join(""),
       warn:state.runtime_error?"warn":"",runtime:state.runtime_error?"Runtime needs attention":"Local runtime ready",version:esc(state.version||"0.1.0"),
       managerNew:state.managerUpdate&&newerVersion(state.managerUpdate.version,state.version||"0")?button("navigate","Manager "+esc(state.managerUpdate.version)+" is available","text-link small manager-new",false,'data-page="preferences"'):"",
+      star:button("github-star","★ Star WanGP on GitHub","text-link small manager-new",false,'title="Opens the WanGP project page in your browser"'),
       page:nav.find(x=>x[0]===state.page)?.[2],
       picker:state.preferences.installations.length?'<select id="installation-picker" aria-label="Active installation">'+state.preferences.installations.map(x=>option(x.root,(x.test_workspace?"Test installation":x.name)+(x.test_workspace?" · Test":""),selected()?.root)).join("")+'</select>':'<span class="pill">WanGP installations</span>',
       error:state.runtime_error?notice(esc(state.runtime_error),"error"):"",
@@ -458,6 +459,8 @@ document.addEventListener("click",async event=>{
     else if(action==="detect-installation")await detectInstallation();
     else if(action==="manager-update"){state.managerUpdate=await run("manager_update");render();}
     else if(action==="manager-download")await invoke("open_manager_download");
+    // WanGP asks for the star itself; the next launch tells it the project page was opened here.
+    else if(action==="github-star"){state.preferences=await invoke("github_star");render();}
     else if(action==="new-view"){state.registerView=false;render();}
     else if(action==="browse"){
       const value=await invoke("pick_path",{kind:el.dataset.kind});
