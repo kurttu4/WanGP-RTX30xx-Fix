@@ -6591,8 +6591,8 @@ def edit_media(
 
     if gen.get("abort", False): return 
     abort = False
-		
-		
+        
+        
     postprocess_audio = audio_processor_api.normalize_method(postprocess_audio or "")
     replace_voice_method = audio_processor_api.normalize_method(replace_voice_method or "")
     source_is_image = has_image_file_extension(video_source)
@@ -12380,7 +12380,7 @@ def bind_prompt_clipboard_buttons(clear_btn, select_btn, copy_btn, textbox, elem
     select_btn.click(fn=None, inputs=None, outputs=None, js=select_js, show_progress="hidden")
     copy_btn.click(fn=None, inputs=[textbox], outputs=None, js=PROMPT_COPY_JS, show_progress="hidden")
 
-	
+    
 def get_prompt_helper_popup_id(model_type, prompt_id):
     safe_model = re.sub(r"[^A-Za-z0-9_-]", "-", str(model_type or "model")).strip("-").lower()
     safe_prompt = re.sub(r"[^A-Za-z0-9_-]", "-", str(prompt_id or "prompt")).strip("-").lower()
@@ -13363,7 +13363,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             with gr.Column(visible=advanced_prompt, elem_classes=["wangp-prompt-tools-stack"]) as prompt_column_advanced:
                 prompt_info_label = gr.HTML(value=prompt_info_html, visible=True, elem_classes=["wangp-prompt-tools-anchor"])
                 prompt_clear_btn, prompt_select_btn, prompt_copy_btn = prompt_clipboard_buttons()
-				prompt = gr.Textbox(visible=advanced_prompt, label=prompt_label, value=launch_prompt, lines=3, elem_id=PROMPT_ADVANCED_ELEM_ID, elem_classes=["wangp-voice-prompt"])
+                prompt = gr.Textbox(visible=advanced_prompt, label=prompt_label, value=launch_prompt, lines=3, elem_id=PROMPT_ADVANCED_ELEM_ID, elem_classes=["wangp-voice-prompt"])
                 if not update_form: bind_prompt_clipboard_buttons(prompt_clear_btn, prompt_select_btn, prompt_copy_btn, prompt, PROMPT_ADVANCED_ELEM_ID)
 
             with gr.Column(visible=not advanced_prompt and len(variables) > 0) as prompt_column_wizard_vars:
