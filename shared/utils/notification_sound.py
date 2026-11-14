@@ -56,7 +56,7 @@ def _play_windows_sound(sound_type, freq, duration, repeats, delay_sec):
 
             elif sound_type == "double_beep":
                 winsound.Beep(880, 160)
-                time.sleep(0.08)
+                time.sleep(0.03)
                 winsound.Beep(1175, 240)
 
             elif sound_type == "single_beep":
