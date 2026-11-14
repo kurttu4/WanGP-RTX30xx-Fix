@@ -8458,7 +8458,7 @@ def generate_media(
                     pre_video_guide =  prefix_video = image_start_tensor.unsqueeze(1)
                 else:
                     prefix_video_is_hdr = "&" in video_prompt_type and _video_input_is_hdr(video_source)
-                    if continued_source and loaded_source_plan is None:  # the frames the model reads, at the place a whole read gives them; the others stay in the file
+                    if continued_source and loaded_source_plan is None and not skip_source_join:  # the frames the model reads, at the place a whole read gives them; the others stay in the file
                         read_source_frames = lambda start, count, fit_canvas=sample_fit_canvas: preprocess_video(width=width, height=height, video_in=video_source, max_frames=count, start_frame=start, fit_canvas=fit_canvas, fit_crop=fit_crop, target_fps=fps, block_size=block_size)
                         prefix_video, source_video_frames_count = video_continuation.read_source_tail(read_source_frames, video_continuation.source_frames_count(video_source, keep_frames_video_source, fps), max(reuse_frames, 1) + 5)
                         source_stays_in_file = source_video_frames_count > 1
@@ -9182,7 +9182,10 @@ def generate_media(
                             prefix_video = convert_video_tensor_to_uint8_chunked(prefix_video)
                         elif prefix_video.dtype == torch.uint8:
                             prefix_video = prefix_video.float().div_(127.5).sub_(1.0)
-                    if prefix_video.shape[1] > 1 and not source_stays_in_file:
+                    if skip_source_join:
+                        # the source frames only served as guide: keep just the newly generated frames (they start right after the overlap)
+                        sample = sample[: , source_video_overlap_frames_count:]
+                    elif prefix_video.shape[1] > 1 and not source_stays_in_file:
                         if prefix_video.shape[-2:] != sample.shape[-2:]: # a VAE upsampler enlarged the generated frames
                             prefix_video = resize_lanczos_spatial(prefix_video, None, size=sample.shape[-2:])
                         # remove sliding window overlapped frames at the beginning of the generation
@@ -9452,21 +9455,24 @@ def generate_media(
                     mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
 
                     set_progress_status(saving_status)
-                    combine_and_concatenate_video_with_audio_tracks(
-                        video_path,
-                        save_path_tmp,
-                        source_audio_tracks,
-                        new_audio_tracks,
-                        source_audio_duration,
-                        mux_audio_sampling_rate,
-                        new_audio_from_start=new_audio_added_from_audio_start,
-                        source_audio_metadata=source_audio_metadata,
-                        audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
-                        pad_audio_to_video=audio_window_alignment and full_generated_audio is not None,
-                        verbose=verbose_level >= 2,
-                        audio_tail_seconds=saved_audio_tail_seconds,
-                    )
-                    if not source_stays_in_file: os.remove(save_path_tmp)
+                    if skip_source_join and len(new_audio_tracks) == 0:
+                        os.replace(save_path_tmp, video_path) # the source audio is not saved and there is no new audio
+                    else:
+                        combine_and_concatenate_video_with_audio_tracks(
+                            video_path,
+                            save_path_tmp,
+                            [] if skip_source_join else source_audio_tracks, # do not put the audio of the source video before the new audio
+                            new_audio_tracks,
+                            0 if skip_source_join else source_audio_duration,
+                            mux_audio_sampling_rate,
+                            new_audio_from_start=new_audio_added_from_audio_start,
+                            source_audio_metadata=source_audio_metadata,
+                            audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
+                            pad_audio_to_video=audio_window_alignment and full_generated_audio is not None,
+                            verbose=verbose_level >= 2,
+                            audio_tail_seconds=saved_audio_tail_seconds,
+                        )
+                        if not source_stays_in_file: os.remove(save_path_tmp)
                     if output_new_audio_temp_filepath is not None: os.remove(output_new_audio_temp_filepath)
                     cleanup_temp_audio_files(trimmed_mux_audio_tracks)
                     cleanup_temp_audio_files(replace_voice_temp_audio_tracks)
