@@ -951,7 +951,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
                 with gr.Tab("Notifications"):
                     self.notification_sound_enabled_choice = gr.Dropdown(choices=[("On", 1), ("Off", 0)], value=self.server_config.get("notification_sound_enabled", 0), label="Notification Sound")
-                    self.notification_sound_volume_choice = gr.Slider(0, 100, value=self.server_config.get("notification_sound_volume", 50), step=5, label="Notification Volume")
+                    self.notification_sound_volume_choice = gr.Slider(0, 100, value=self.server_config.get("notification_sound_volume", 50), step=1, label="Notification Volume")
 
                     sound_choices = [
                         ("The winning chord (C-E-G-C)", "chord"),
