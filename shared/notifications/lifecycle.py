@@ -109,6 +109,23 @@ def start_queue(gen: dict[str, Any], total_tasks: int) -> NotificationRun:
     return run
 
 
+def _play_sound_notification(config: dict[str, Any]) -> None:
+    if not config.get("notification_sound_enabled", 0):
+        return
+    try:
+        from shared.utils import notification_sound
+        notification_sound.play_notification_async(
+            volume=config.get("notification_sound_volume", 50),
+            sound_type=config.get("notification_sound_type", "double_beep"),
+            beep_freq=config.get("notification_sound_freq", 1000),
+            beep_duration=config.get("notification_sound_duration", 300),
+            repeat_count=config.get("notification_sound_repeats", 1),
+            repeat_delay=config.get("notification_sound_delay", 150),
+        )
+    except Exception as e:
+        print(f"Error playing notification sound: {e}")
+
+
 def record_generation(config: dict[str, Any], gen: dict[str, Any], paths: str | list[str], configs: Any, replace_last: bool = False, notify: bool = True) -> None:
     entry = _generation_entry(paths, configs)
     run = gen.get(_RUN_KEY)
@@ -116,6 +133,7 @@ def record_generation(config: dict[str, Any], gen: dict[str, Any], paths: str | 
         run.record(entry, replace_last)
         if notify and config.get(NOTIFY_GENERATION_KEY, False):
             send_notification_async(config, "WanGP generation completed", _format_generation(entry))
+            _play_sound_notification(config)
 
 
 def finish_queue(config: dict[str, Any], gen: dict[str, Any], run: NotificationRun, elapsed_seconds: float) -> None:
@@ -139,3 +157,4 @@ def finish_queue(config: dict[str, Any], gen: dict[str, Any], run: NotificationR
         lines.extend(["", "Generated media:"])
         lines.extend(_format_generation(entry, number, include_prompt=False) for number, entry in enumerate(generations, 1))
     send_notification_async(config, title, "\n".join(lines))
+    _play_sound_notification(config)
