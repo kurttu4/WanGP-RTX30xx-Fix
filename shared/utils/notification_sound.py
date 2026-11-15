@@ -17,11 +17,42 @@ import numpy as np
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 
 
+import io
+import wave
+import math
+import struct
+
 try:
     import winsound
     HAS_WINSOUND = True
 except ImportError:
     HAS_WINSOUND = False
+
+def _make_sine_wav(freq_duration_list, volume=50, sample_rate=44100):
+    vol_scale = max(0.0, min(1.0, float(volume) / 100.0))
+    samples = []
+    for freq, duration_sec in freq_duration_list:
+        n_samples = int(sample_rate * duration_sec)
+        fade_len = min(int(0.008 * sample_rate), n_samples // 2)
+        for i in range(n_samples):
+            if freq <= 0:
+                val = 0
+            else:
+                t = float(i) / sample_rate
+                fade = 1.0
+                if fade_len > 0:
+                    fade = min(1.0, i / fade_len, (n_samples - 1 - i) / fade_len)
+                val = int(32767 * vol_scale * fade * math.sin(2.0 * math.pi * freq * t))
+            samples.append(val)
+    
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        raw_data = struct.pack('<' + ('h' * len(samples)), *samples)
+        wf.writeframes(raw_data)
+    return buf.getvalue()
 
 def _get_wgp_config():
     """Load configuration from root wgp_config.json if present."""
@@ -35,10 +66,13 @@ def _get_wgp_config():
             pass
     return {}
 
-def _play_windows_sound(sound_type, freq, duration, repeats, delay_sec):
+def _play_windows_sound(sound_type, freq, duration, repeats, delay_sec, volume=50):
     if not HAS_WINSOUND:
         return False
     
+    if volume <= 0:
+        return True
+
     root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     custom_wav_paths = [
         os.path.join(root_dir, "custom.wav"),
@@ -49,20 +83,20 @@ def _play_windows_sound(sound_type, freq, duration, repeats, delay_sec):
     for i in range(repeats):
         try:
             if sound_type == "chord":
-                notes = [(523, 110), (659, 110), (784, 110), (1046, 260)]
-                for note_f, note_d in notes:
-                    winsound.Beep(note_f, note_d)
-                    time.sleep(0.03)
+                notes = [(523, 0.11), (0, 0.03), (659, 0.11), (0, 0.03), (784, 0.11), (0, 0.03), (1046, 0.26)]
+                wav_bytes = _make_sine_wav(notes, volume=volume)
+                winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
 
             elif sound_type == "double_beep":
-                winsound.Beep(880, 160)
-                time.sleep(0.03)
-                winsound.Beep(1175, 240)
+                notes = [(880, 0.16), (0, 0.03), (1175, 0.24)]
+                wav_bytes = _make_sine_wav(notes, volume=volume)
+                winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
 
             elif sound_type == "single_beep":
                 clamped_freq = max(37, min(32767, int(freq)))
-                clamped_dur = max(50, min(5000, int(duration)))
-                winsound.Beep(clamped_freq, clamped_dur)
+                clamped_dur = max(0.05, min(5.0, float(duration) / 1000.0))
+                wav_bytes = _make_sine_wav([(clamped_freq, clamped_dur)], volume=volume)
+                winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
 
             elif sound_type == "asterisk":
                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
@@ -373,7 +407,7 @@ def play_notification_sound(volume=None, sound_type=None, beep_freq=None, beep_d
 
     # 1. On Windows, try the selected pleasant sound first
     if HAS_WINSOUND and sys.platform == "win32":
-        if _play_windows_sound(sound_type, beep_freq, beep_duration, repeats, delay_sec):
+        if _play_windows_sound(sound_type, beep_freq, beep_duration, repeats, delay_sec, volume=volume):
             return
 
     # 2. Fallback to existing audio waveform / backends
