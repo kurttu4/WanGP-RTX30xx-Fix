@@ -9857,18 +9857,6 @@ def _process_tasks(state):
         status = f"Queue processing was interrupted. Total Generation Time: {format_time(end_time-start_time)}"
     else:
         status = f"Total Generation Time: {format_time(end_time-start_time)}"
-        try:
-            if server_config.get("notification_sound_enabled", 0):
-                notification_sound.play_notification_async(
-                    volume=server_config.get("notification_sound_volume", 50),
-                    sound_type=server_config.get("notification_sound_type", "double_beep"),
-                    beep_freq=server_config.get("notification_sound_freq", 1000),
-                    beep_duration=server_config.get("notification_sound_duration", 300),
-                    repeat_count=server_config.get("notification_sound_repeats", 1),
-                    repeat_delay=server_config.get("notification_sound_delay", 150),
-                )
-        except Exception as e:
-            print(f"Error playing notification sound: {e}")
     notifications.finish_queue(server_config, gen, notification_run, end_time - start_time)
     set_generation_state(gen, status=status, status_display=False)
     release_gen()
