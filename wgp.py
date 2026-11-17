@@ -81,6 +81,7 @@ import importlib
 from models import model_metadata
 from shared import notifications
 from shared.utils import notification_sound
+from shared.utils.user_mods import CONTINUE_NO_JOIN, set_continue_no_join
 from shared.utils.setting_names import settings_error
 from shared.utils import generation_overrides
 from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_loras_multipliers
