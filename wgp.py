@@ -213,9 +213,9 @@ max_frames_in_memory = 3000  # the most video frames held in memory at once: a w
 max_audio_guide_frames = 3000  # the most frames of an audio guide handed whole to a model at each window
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
 image_names_list = ["image_start", "image_end", "image_refs"]
-CUSTOM_SETTINGS_MAX = 5
+CUSTOM_SETTINGS_MAX = 8
 CUSTOM_SETTINGS_PER_ROW = 2
-CUSTOM_SETTING_DROPDOWN_MAX = 5
+CUSTOM_SETTING_DROPDOWN_MAX = 8
 CUSTOM_SETTING_TYPES = {"int", "float", "text", "dropdown"}
 PHASE_2_TILING_VIDEO_PROMPT_FLAG = "~"
 PHASE_2_TILING_GUIDANCE_VALUE = "2~"
@@ -296,13 +296,30 @@ def clear_gen_cache():
 _deepy_hybrid = None
 
 def release_model():
-    global wan_model, offloadobj, reload_needed
+    global wan_model, offloadobj, reload_needed, enhancer_offloadobj
+    global prompt_enhancer_image_caption_model, prompt_enhancer_llm_model, vae_upsampler_session, skip_steps_cache
     released = transformer_type if wan_model is not None or offloadobj is not None else None
+
+    # Deep purge hook
+    try:
+        from shared.utils.user_mods import deep_memory_purge
+        deep_memory_purge(globals())
+    except Exception as e:
+        print(f"Error in deep_memory_purge: {e}")
+
     wan_model = None
+    prompt_enhancer_image_caption_model = None
+    prompt_enhancer_llm_model = None
+    vae_upsampler_session = None
+    skip_steps_cache = None
     clear_gen_cache()
     if "_cache" in offload.shared_state:
         del offload.shared_state["_cache"]
     if offloadobj is not None:
+        try:
+            offloadobj.unload_all()
+        except Exception:
+            pass
         offloadobj.release()
         offloadobj = None
     offload.flush_torch_caches()
