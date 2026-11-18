@@ -27,7 +27,8 @@ class H3Engine:
 
         self.job = job
         context = job.loaded_model_context
-        self.hybrid_h3 = (context is not None and context.model_family == "minimax_h3" and (not context.model.reference_mode or context.model.transformer.pdd_num_steps is not None))
+        allow_pdd = not bool(job.config.get("use_turbo_lora", False))
+        self.hybrid_h3 = (context is not None and context.model_family == "minimax_h3" and (not context.model.reference_mode or (context.model.transformer.pdd_num_steps is not None and not allow_pdd)))
         if context is None or self.hybrid_h3:
             load_model(context if self.hybrid_h3 else None)
             self.pipeline = RUNTIME.model
