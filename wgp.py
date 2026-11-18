@@ -9516,21 +9516,24 @@ def generate_media(
                     mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
 
                     set_progress_status(saving_status)
-                    combine_and_concatenate_video_with_audio_tracks(
-                        video_path,
-                        save_path_tmp,
-                        source_audio_tracks,
-                        new_audio_tracks,
-                        source_audio_duration,
-                        mux_audio_sampling_rate,
-                        new_audio_from_start=new_audio_added_from_audio_start,
-                        source_audio_metadata=source_audio_metadata,
-                        audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
-                        pad_audio_to_video=audio_window_alignment and full_generated_audio is not None,
-                        verbose=verbose_level >= 2,
-                        audio_tail_seconds=saved_audio_tail_seconds,
-                    )
-                    if continued_video is None: os.remove(save_path_tmp)
+                    if skip_source_join and len(new_audio_tracks) == 0:
+                        os.replace(save_path_tmp, video_path) # the source audio is not saved and there is no new audio
+                    else:
+                        combine_and_concatenate_video_with_audio_tracks(
+                            video_path,
+                            save_path_tmp,
+                            [] if skip_source_join else source_audio_tracks, # do not put the audio of the source video before the new audio
+                            new_audio_tracks,
+                            0 if skip_source_join else source_audio_duration,
+                            mux_audio_sampling_rate,
+                            new_audio_from_start=new_audio_added_from_audio_start,
+                            source_audio_metadata=source_audio_metadata,
+                            audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
+                            pad_audio_to_video=audio_window_alignment and full_generated_audio is not None,
+                            verbose=verbose_level >= 2,
+                            audio_tail_seconds=saved_audio_tail_seconds,
+                        )
+                        if continued_video is None: os.remove(save_path_tmp)
                     if output_new_audio_temp_filepath is not None: os.remove(output_new_audio_temp_filepath)
                     cleanup_temp_audio_files(trimmed_mux_audio_tracks)
                     cleanup_temp_audio_files(replace_voice_temp_audio_tracks)
