@@ -132,17 +132,18 @@ class H3Engine:
                             window_index_offset=segment.window_index_offset, window_count_total=segment.window_count_total)
 
     def close(self):
-        from .runtime import RUNTIME
+        # from .runtime import RUNTIME
 
-        on_demand = getattr(self, '_on_demand_offloadobj', None)
-        if on_demand is not None:
-            on_demand.unload_all()
-            return
-        context = self.job.loaded_model_context
-        if context is None or self.hybrid_h3:
-            RUNTIME.unload_all()
-        else:
-            context.offloadobj.unload_all()
+        # on_demand = getattr(self, '_on_demand_offloadobj', None)
+        # if on_demand is not None:
+        #     on_demand.unload_all()
+        #     return
+        # context = self.job.loaded_model_context
+        # if context is None or self.hybrid_h3:
+        #     RUNTIME.unload_all()
+        # else:
+        #     context.offloadobj.unload_all()
+        pass
 
 
 class H3FaceRefinerBridge(FaceRefinerBridge):
