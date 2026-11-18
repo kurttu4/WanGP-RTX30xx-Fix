@@ -98,6 +98,9 @@ class H3Engine:
                 print(f"[FaceRefine] Face track {track_index + 1}: using stabilized single-face crop from pose-aware source frame {reference_frame + 1} as reference")
             track_prompt = self.prompt if not track_references or "<Picture 1>" in self.prompt else REFERENCE_BINDING + "\n" + self.prompt
             track_jobs.append((transform, strengths, (track_references, track_prompt)))
+        abort_requested = self.job.abort_callback
+        if hasattr(self.pipeline, "_interrupt") and not (callable(abort_requested) and abort_requested()):
+            self.pipeline._interrupt = False  # a stale abort flag of an earlier interrupted generation makes the prompt pre-encoding stop at once
         if hasattr(self.pipeline, "prewarm_refinement_prompt"):
             if callable(job.progress_callback):
                 job.progress_callback("Encoding Prompt")
