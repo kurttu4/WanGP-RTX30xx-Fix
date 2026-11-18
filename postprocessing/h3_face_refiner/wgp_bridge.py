@@ -234,10 +234,14 @@ class H3FaceRefinerBridge(FaceRefinerBridge):
         return context.model_family == "minimax_h3"
 
     def query_checkpoint_inventory(self):
+        if self.config().get("model_mode") == "current":
+            return [{"model_types": [], "download_defs": [ASSET_DOWNLOAD_DEF], "model_lora_keys": {}}]
         from models.minimax_h3.minimax_h3_handler import REF_TURBO_LORA_KEY
         return [{"model_types": [DEFAULT_MODEL_TYPE], "download_defs": self.query_download_defs(), "model_lora_keys": {DEFAULT_MODEL_TYPE: [REF_TURBO_LORA_KEY]}}]
 
     def query_download_defs(self) -> list[dict[str, Any]]:
+        if self.config().get("model_mode") == "current":
+            return [ASSET_DOWNLOAD_DEF]
         from models.minimax_h3.minimax_h3_handler import REF2VA_PRUNED_ARCHITECTURE, family_handler
 
         model_def = family_handler.query_model_def(REF2VA_PRUNED_ARCHITECTURE, {})
@@ -256,6 +260,8 @@ class H3FaceRefinerBridge(FaceRefinerBridge):
         return wgp.get_lora_local_path(wgp.get_lora_dir(model_type), model_def[REF_TURBO_LORA_KEY])
 
     def _ensure_turbo(self, wgp):
+        if not self.config().get("use_turbo_lora", False):
+            return None
         from models.minimax_h3.minimax_h3_handler import REF_TURBO_LORA_KEY
 
         model_def = self._private_model_def(wgp)
@@ -266,6 +272,8 @@ class H3FaceRefinerBridge(FaceRefinerBridge):
         return path
 
     def _download_extras(self, wgp):
+        if self.config().get("model_mode") == "current":
+            return
         model_def = self._private_model_def(wgp)
         transformer = wgp.get_model_filename(DEFAULT_MODEL_TYPE, wgp.transformer_quantization, wgp.transformer_dtype_policy, model_def=model_def)
         wgp.download_models(transformer, DEFAULT_MODEL_TYPE, 0, -1, model_def=model_def)
