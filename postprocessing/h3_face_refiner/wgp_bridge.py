@@ -27,17 +27,55 @@ class H3Engine:
 
         self.job = job
         context = job.loaded_model_context
-        allow_pdd = not bool(job.config.get("use_turbo_lora", False))
-        self.hybrid_h3 = (context is not None and context.model_family == "minimax_h3" and (not context.model.reference_mode or (context.model.transformer.pdd_num_steps is not None and not allow_pdd)))
-        if context is None or self.hybrid_h3:
+        if context is None:
+            import wgp
+            context = wgp.get_loaded_model_context()
+            if context is None and getattr(wgp, "wan_model", None) is not None:
+                from postprocessing.model_context import LoadedModelContext
+                context = LoadedModelContext(
+                    model=wgp.wan_model,
+                    offloadobj=wgp.offloadobj,
+                    model_type=wgp.transformer_type,
+                    base_model_type=wgp.get_base_model_type(wgp.transformer_type),
+                    model_family=wgp.get_model_family(wgp.transformer_type),
+                    model_def=wgp.get_model_def(wgp.transformer_type),
+                    profile=getattr(wgp, "loaded_profile", 0),
+                    config_id=getattr(wgp, "loaded_config", 0),
+                )
+
+        reusable_model = context is not None and getattr(context, "model", None) is not None and (hasattr(context.model, "refine_video") or hasattr(context.model, "generate"))
+        force_current = job.config.get("model_mode") == "current"
+
+        if reusable_model and (force_current or not bool(job.config.get("use_turbo_lora", False))):
+            self.hybrid_h3 = False
+            self.pipeline = context.model
+            self.model_type = context.base_model_type
+            print(f"[FaceRefine] Reusing loaded model '{context.model_type}' directly for face refinement (no extra download)")
+        elif force_current:
+            # No compatible model in VRAM — load the model selected on the page on demand
+            import wgp
+            page_model_type = getattr(wgp, 'transformer_type', None) or wgp.server_config.get('last_model_type')
+            if page_model_type is None:
+                raise RuntimeError("[FaceRefine] 'Use current compatible model' is selected but no model is configured. Select a model or switch to 'Force/reuse H3'.")
+            page_family = wgp.get_model_family(page_model_type)
+            if page_family != "minimax_h3":
+                raise RuntimeError(f"[FaceRefine] Page model '{page_model_type}' (family '{page_family}') is not H3-compatible. Select an H3 model or switch to 'Force/reuse H3'.")
+            print(f"[FaceRefine] No model in VRAM — loading page model '{page_model_type}' on demand for face refinement")
+            _model, _offloadobj = wgp.load_models(
+                page_model_type, override_profile=0, output_type="video",
+                config_id=TEXT_ENCODER_CONFIG,
+                track_as_main=False, extension=True, disable_pinning=True,
+            )
+            self.hybrid_h3 = False
+            self.pipeline = _model
+            self.model_type = wgp.get_base_model_type(page_model_type)
+            self._on_demand_offloadobj = _offloadobj
+            print(f"[FaceRefine] Loaded page model '{page_model_type}' for face refinement (no default model download)")
+        else:
+            self.hybrid_h3 = (context is not None and context.model_family == "minimax_h3")
             load_model(context if self.hybrid_h3 else None)
             self.pipeline = RUNTIME.model
             self.model_type = DEFAULT_MODEL_TYPE
-        else:
-            self.pipeline = context.model
-            self.model_type = context.base_model_type
-            if context.model_family == "minimax_h3":
-                print(f"[FaceRefine] Reusing loaded H3 Ref2VA model '{context.model_type}' and its MMGP offload object")
         self.reference_mode = bool(getattr(self.pipeline, "reference_mode", False))
         if self.reference_mode and not INJECT_REFERENCE_IMAGE:
             print("[FaceRefine] Reference image injection disabled; conditioning Ref2VA from the tracked control video and its audio track")
@@ -96,6 +134,10 @@ class H3Engine:
     def close(self):
         from .runtime import RUNTIME
 
+        on_demand = getattr(self, '_on_demand_offloadobj', None)
+        if on_demand is not None:
+            on_demand.unload_all()
+            return
         context = self.job.loaded_model_context
         if context is None or self.hybrid_h3:
             RUNTIME.unload_all()
@@ -227,9 +269,11 @@ class H3FaceRefinerBridge(FaceRefinerBridge):
         return config["denoising_strength"] != 0.0 and super().refines(config, strength)
 
     def supports_loaded_model(self, spatial_upsampling, context, *, reference_images=None, **_kwargs) -> bool:
-        if self.validate_upsampling(spatial_upsampling, 0) or getattr(context.model, "refinement_api", None) != "masked_video_sigma_v1":
+        if self.validate_upsampling(spatial_upsampling, 0):
             return False
-        if self.config()["model_mode"] == "current":
+        if context is not None and getattr(context, "model", None) is not None and (hasattr(context.model, "refine_video") or getattr(context.model, "refinement_api", None) == "masked_video_sigma_v1"):
+            return True
+        if self.config().get("model_mode") == "current":
             return True
         return context.model_family == "minimax_h3"
 
