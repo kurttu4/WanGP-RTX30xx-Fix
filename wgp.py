@@ -81,7 +81,7 @@ import importlib
 from models import model_metadata
 from shared import notifications
 from shared.utils import notification_sound
-from shared.utils.user_mods import CONTINUE_NO_JOIN, set_continue_no_join, SONG_POS, SONG_AUTO, set_song_pos, set_song_auto, song_pos_add, song_pos_add_frames
+from shared.utils.user_mods import CONTINUE_NO_JOIN, set_continue_no_join, SONG_POS, SONG_AUTO, set_song_pos, set_song_auto, song_pos_add, song_pos_add_frames, song_pos_done
 from shared.utils.setting_names import settings_error
 from shared.utils import generation_overrides
 from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_loras_multipliers
@@ -9642,8 +9642,8 @@ def generate_media(
     if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
         cleanup_temp_audio_files(control_audio_tracks + source_audio_tracks)
 
-    if skip_source_join and SONG_AUTO[0] and song_saved_frames > 0 and not gen.get("abort", False):
-        song_pos_add_frames(song_saved_frames) # the song position follows the frames that were just saved
+    if skip_source_join and song_saved_frames > 0 and not gen.get("abort", False):
+        song_pos_done(song_saved_frames) # remember the frames just saved; with Auto-add the song position follows them
 
     remove_temp_filenames(temp_filenames_list)
     return True
@@ -13419,7 +13419,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 audio_guide2 = gr.Audio(value= ui_defaults.get("audio_guide2", None), type="filepath", label=model_def.get("audio_guide2_label","Voice to follow #2"), show_download_button= True, visible=audio_inputs_visible["audio_guide2"])
                 audio_guide3 = gr.Audio(value= ui_defaults.get("audio_guide3", None), type="filepath", label=model_def.get("audio_guide3_label","Voice to follow #3"), show_download_button= True, visible=audio_inputs_visible["audio_guide3"])
             with gr.Row() as song_pos_row:
-                song_pos_number = gr.Number(value=lambda: SONG_POS[0], label="Song position (frames)", precision=0, minimum=0, scale=4)
+                song_pos_number = gr.Number(value=lambda: SONG_POS[0], label="Song position (frames): where the song stands at the end of the source video (used with Continue without joining)", precision=0, minimum=0, scale=4)
                 song_add_btn = gr.Button("+ Add", scale=1, min_width=60)
                 song_auto_checkbox = gr.Checkbox(value=lambda: SONG_AUTO[0], label="Auto-add after generation", scale=2)
             if not update_form:
