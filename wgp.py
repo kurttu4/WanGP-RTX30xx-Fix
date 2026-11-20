@@ -13418,8 +13418,15 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 audio_guide = gr.Audio(value= ui_defaults.get("audio_guide", None), type="filepath", label= model_def.get("audio_guide_label","Voice to follow"), show_download_button= True, visible=audio_inputs_visible["audio_guide"])
                 audio_guide2 = gr.Audio(value= ui_defaults.get("audio_guide2", None), type="filepath", label=model_def.get("audio_guide2_label","Voice to follow #2"), show_download_button= True, visible=audio_inputs_visible["audio_guide2"])
                 audio_guide3 = gr.Audio(value= ui_defaults.get("audio_guide3", None), type="filepath", label=model_def.get("audio_guide3_label","Voice to follow #3"), show_download_button= True, visible=audio_inputs_visible["audio_guide3"])
-            with gr.Row() as song_pos_row:
-                song_pos_number = gr.Number(value=lambda: SONG_POS[0], label="Song position (frames)", precision=0, minimum=0, scale=4)
+            with gr.Row(equal_height=True):
+                gr.HTML("""<style>
+                #song-pos-css { display: none !important; }
+                #song-pos-inline { display: flex !important; align-items: center !important; height: 100% !important; }
+                #song-pos-inline label.container { display: flex !important; flex-direction: row !important; align-items: center !important; gap: 10px !important; width: 100% !important; margin: 0 !important; }
+                #song-pos-inline span[data-testid="block-info"] { margin: 0 !important; white-space: nowrap !important; flex-shrink: 0 !important; }
+                #song-pos-inline input { width: 80px !important; min-width: 60px !important; padding: 4px 8px !important; }
+                </style>""", elem_id="song-pos-css")
+                song_pos_number = gr.Number(value=lambda: SONG_POS[0], label="Song position (frames)", precision=0, minimum=0, scale=4, elem_id="song-pos-inline")
                 song_add_btn = gr.Button("+ Add", scale=1, min_width=60)
                 song_auto_checkbox = gr.Checkbox(value=lambda: SONG_AUTO[0], label="Auto-add", scale=2)
             if not update_form:
