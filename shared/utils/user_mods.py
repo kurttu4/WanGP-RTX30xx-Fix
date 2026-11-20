@@ -6,6 +6,23 @@ CONTINUE_NO_JOIN = [False]  # state of the Continue without joining checkbox (pa
 def set_continue_no_join(value):
     CONTINUE_NO_JOIN[0] = bool(value)
 
+SONG_POS = [0]  # where the song stands at the end of the source video, in frames (page only, not saved in settings); 0 = off
+SONG_AUTO = [False]  # add the frames of every generation without joining to SONG_POS automatically
+
+def set_song_pos(value):
+    SONG_POS[0] = max(0, int(value or 0))
+
+def set_song_auto(value):
+    SONG_AUTO[0] = bool(value)
+
+def song_pos_add(current, frames):
+    """The '+ Add' button: the current position plus the number of frames set for the generation."""
+    SONG_POS[0] = max(0, int(current or 0)) + max(0, int(frames or 0))
+    return SONG_POS[0]
+
+def song_pos_add_frames(frames):
+    SONG_POS[0] = SONG_POS[0] + max(0, int(frames or 0))
+
 def deep_memory_purge(wgp_globals):
     """Deeply purge VRAM and RAM when models are released."""
     import gc
