@@ -81,7 +81,7 @@ import importlib
 from models import model_metadata
 from shared import notifications
 from shared.utils import notification_sound
-from shared.utils.user_mods import CONTINUE_NO_JOIN, set_continue_no_join
+from shared.utils.user_mods import CONTINUE_NO_JOIN, set_continue_no_join, SONG_POS, SONG_AUTO, set_song_pos, set_song_auto, song_pos_add, song_pos_add_frames
 from shared.utils.setting_names import settings_error
 from shared.utils import generation_overrides
 from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_loras_multipliers
@@ -6516,6 +6516,18 @@ def any_audio_track(model_type):
         return False
     return ( model_def.get("returns_audio", False) or model_def.get("any_audio_prompt", False) )
 
+def trim_song_head(path, start_frames, fps, save_dir):
+    """Copy of an audio file without its first `start_frames` frames (at `fps`): the song as it stands where the new frames begin."""
+    import subprocess, imageio_ffmpeg
+    out_path = get_available_filename(save_dir, path, suffix="_songpos", force_extension=".wav")
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-v", "error", "-ss", f"{start_frames / fps:.6f}", "-i", path, "-c:a", "pcm_s16le", out_path]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        print(f"Unable to cut the start of the song, using it whole: {e}")
+        return path
+    return out_path
+
 def make_tail_clip(video_path, keep_frames, fps, save_dir):
     """Last `keep_frames` frames (and their audio) of a video as a small lossless clip: only these frames are read when continuing a video."""
     import subprocess, imageio_ffmpeg
@@ -8023,6 +8035,8 @@ def generate_media(
         video_source = prompt_enhancer_images.resolve_continue_video(video_source, image_prompt_type, get_processed_queue(gen)[VIDEO.id][0], save_path)
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
     skip_source_join = bool(CONTINUE_NO_JOIN[0] and any_letters(image_prompt_type, "VL") and video_source is not None and not is_image) # Continue without joining: the source video and its audio only guide the generation, they are not saved again with the new frames
+    song_pos_frames = max(0, int(SONG_POS[0] or 0)) if skip_source_join else 0 # where the song stands at the end of the source (frames): without joining the source is only a tail, so the song is shifted by this
+    song_saved_frames = 0
     if skip_source_join: # read only the last frames of the source: cut them (with their audio) into a small temporary clip
         tail_frames = int(keep_frames_video_source) if is_integer(keep_frames_video_source) and int(keep_frames_video_source) > 0 else int(sliding_window_overlap or 0) + 4
         video_source, tail_created = make_tail_clip(video_source, max(tail_frames, 5), fps, save_path)
@@ -8578,7 +8592,7 @@ def generate_media(
             if full_audio_guide_waveform is not None:
                 input_waveform, input_waveform_sample_rate = full_audio_guide_waveform, full_audio_guide_sample_rate
             elif audio_guide is not None and model_def.get("audio_guide_window_slicing", False):
-                audio_start_frame = aligned_window_start_frame
+                audio_start_frame = aligned_window_start_frame + (max(0, song_pos_frames - source_video_frames_count) if song_pos_frames > 0 else 0) # without joining: the tail starts (song position - tail frames) into the song
                 # if reset_control_aligment:
                 #     audio_start_frame += source_video_overlap_frames_count
                 input_waveform, input_waveform_sample_rate = slice_audio_window(audio_guide, audio_start_frame, current_video_length, fps, save_path, suffix=f"_win{window_no}", pad_tail= video_length_limited_by_audio) 
@@ -9275,7 +9289,7 @@ def generate_media(
                     committed_audio_samples += round(source_audio_repair_seconds * output_audio_sampling_rate)
                     if full_generated_audio is None:
                         # a kept soundtrack file is aligned with the start of the Source Video unless control alignment is reset: skip the source part
-                        prefix_start_samples = 0 if reset_control_aligment or output_new_audio_data is not None else int(round(source_audio_frames * output_audio_sampling_rate / fps))
+                        prefix_start_samples = 0 if reset_control_aligment or output_new_audio_data is not None else int(round((source_audio_frames + song_pos_frames) * output_audio_sampling_rate / fps))
                         full_generated_audio = append_sliding_window_audio(output_new_audio_data, output_new_audio_filepath, generated_audio, output_audio_sampling_rate, committed_audio_samples,
                                                                            prefix_start_samples=prefix_start_samples, keep_existing=keep_input_audio and output_new_audio_data is None,
                                                                            trim_ranges=shift_audio_trim_ranges(external_audio_trim_ranges, source_audio_frames), video_fps=fps,
@@ -9452,6 +9466,7 @@ def generate_media(
                         save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
                     output_new_audio_temp_filepath = None
                     new_audio_tracks_are_pretrimmed = False
+                    song_saved_frames = int(output_frame_count) if skip_source_join and output_frame_count is not None else 0
                     saved_audio_tail_seconds = 0.0
                     new_audio_added_from_audio_start = reset_control_aligment or (full_generated_audio is not None and len(control_audio_tracks) == 0) # if not beginning of audio will be skipped
                     source_audio_duration = 0 if video_source is None else source_video_frames_count / fps - source_audio_repair_seconds
@@ -9504,6 +9519,9 @@ def generate_media(
                         new_audio_tracks = [output_new_audio_filepath]
                     else:
                         new_audio_tracks = control_audio_tracks
+                    song_trim_temp = []
+                    if song_pos_frames > 0 and output_new_audio_filepath is not None and output_new_audio_temp_filepath is None and audio_source is None and generated_audio is None and len(new_audio_tracks) > 0 and new_audio_tracks[0] == output_new_audio_filepath: # the song file as it is: start it at the song position
+                        new_audio_tracks = song_trim_temp = [trim_song_head(output_new_audio_filepath, song_pos_frames, fps, save_path)]
                     trimmed_mux_audio_tracks = []
                     if len(new_audio_trim_ranges) > 0 and len(new_audio_tracks) > 0 and not (any_soundtrack_processor or audio_source is not None or new_audio_tracks_are_pretrimmed):
                         new_audio_tracks = trimmed_mux_audio_tracks = [ trim_audio_file_ranges(path, new_audio_trim_ranges, fps, get_available_filename(save_path, path, suffix=f"_trim{i}", force_extension=".wav")) for i, path in enumerate(new_audio_tracks) ]
@@ -9536,6 +9554,7 @@ def generate_media(
                         if continued_video is None: os.remove(save_path_tmp)
                     if output_new_audio_temp_filepath is not None: os.remove(output_new_audio_temp_filepath)
                     cleanup_temp_audio_files(trimmed_mux_audio_tracks)
+                    cleanup_temp_audio_files(song_trim_temp)
                     cleanup_temp_audio_files(replace_voice_temp_audio_tracks)
 
                 else:
@@ -9622,6 +9641,9 @@ def generate_media(
  
     if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
         cleanup_temp_audio_files(control_audio_tracks + source_audio_tracks)
+
+    if skip_source_join and SONG_AUTO[0] and song_saved_frames > 0 and not gen.get("abort", False):
+        song_pos_add_frames(song_saved_frames) # the song position follows the frames that were just saved
 
     remove_temp_filenames(temp_filenames_list)
     return True
@@ -13396,6 +13418,13 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 audio_guide = gr.Audio(value= ui_defaults.get("audio_guide", None), type="filepath", label= model_def.get("audio_guide_label","Voice to follow"), show_download_button= True, visible=audio_inputs_visible["audio_guide"])
                 audio_guide2 = gr.Audio(value= ui_defaults.get("audio_guide2", None), type="filepath", label=model_def.get("audio_guide2_label","Voice to follow #2"), show_download_button= True, visible=audio_inputs_visible["audio_guide2"])
                 audio_guide3 = gr.Audio(value= ui_defaults.get("audio_guide3", None), type="filepath", label=model_def.get("audio_guide3_label","Voice to follow #3"), show_download_button= True, visible=audio_inputs_visible["audio_guide3"])
+            with gr.Row(visible=audio_inputs_visible["audio_guide_row"]) as song_pos_row:
+                song_pos_number = gr.Number(value=lambda: SONG_POS[0], label="Song position (frames): where the song stands at the end of the source video (used with Continue without joining)", precision=0, minimum=0, scale=4)
+                song_add_btn = gr.Button("+ Add", scale=1, min_width=60)
+                song_auto_checkbox = gr.Checkbox(value=lambda: SONG_AUTO[0], label="Auto-add after generation", scale=2)
+            if not update_form:
+                song_pos_number.change(fn=set_song_pos, inputs=[song_pos_number], outputs=None)
+                song_auto_checkbox.change(fn=set_song_auto, inputs=[song_auto_checkbox], outputs=None)
             custom_guide_def = model_def.get("custom_guide", None)
             any_custom_guide= custom_guide_def is not None
             any_mesh_input = "3d" in model_metadata.custom_guide_kinds(model_def)  # the input kinds model discovery (Deepy, MCP) reports
@@ -14418,6 +14447,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             audio_inputs_refresh.change(fn=refresh_audio_inputs, inputs=[state, audio_prompt_type, video_prompt_type, image_mode], outputs=[audio_guide, audio_guide2, audio_guide3, speakers_locations_row, remove_background_sound, normalize_audio_volumes, audio_prompt_type_custom_option, audio_options_row, audio_guide_row, force_control_video_trim], show_progress="hidden", queue=False)
             prompt_enhancer_mode_dropdown.input(fn=build_prompt_enhancer_value, inputs=[prompt_enhancer_mode_dropdown, prompt_enhancer_think], outputs=[prompt_enhancer], show_progress="hidden")
             prompt_enhancer_think.input(fn=build_prompt_enhancer_value, inputs=[prompt_enhancer_mode_dropdown, prompt_enhancer_think], outputs=[prompt_enhancer], show_progress="hidden")
+            song_add_btn.click(fn=song_pos_add, inputs=[song_pos_number, video_length], outputs=[song_pos_number], show_progress="hidden")
             image_prompt_type_radio.change(fn=refresh_image_prompt_type_radio, inputs=[state, image_prompt_type, image_prompt_type_radio, video_prompt_type], outputs=[image_prompt_type, image_start_row, image_end_row, video_source, input_video_strength, keep_frames_video_source, image_prompt_type_endcheckbox, continue_no_join_checkbox], show_progress="hidden").then(fn=None, inputs=None, outputs=None, js="() => window.wangpRefreshInputModes()")
             image_prompt_type_endcheckbox.change(fn=refresh_image_prompt_type_endcheckbox, inputs=[state, image_prompt_type, image_prompt_type_radio, image_prompt_type_endcheckbox, video_prompt_type], outputs=[image_prompt_type, image_end_row, input_video_strength] ) 
             video_prompt_type_image_refs.input(fn=refresh_video_prompt_type_image_refs, inputs = [state, video_prompt_type, video_prompt_type_image_refs,image_mode, image_prompt_type], outputs = [video_prompt_type, image_refs_row, remove_background_images_ref,  image_refs_relative_size, frames_positions,video_guide_outpainting_col, input_video_strength], show_progress="hidden")
@@ -14891,6 +14921,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 ).then(finalize_generation,
                     inputs= [state], 
                     outputs= [gallery_tabs, current_gallery_tab, output, *strip_states, abort_btn, earlystop_btn, generate_btn, add_to_queue_btn, current_gen_column, gen_info]
+                ).then(fn=lambda: SONG_POS[0], inputs=None, outputs=[song_pos_number], show_progress="hidden"
                 ).then(
                     fn=lambda s: gr.Accordion(open=False) if len(get_gen_info(s).get("queue", [])) <= 1 else gr.update(),
                     inputs=[state],
@@ -14930,6 +14961,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     inputs=[state],
                     outputs=[gallery_tabs, current_gallery_tab, output, *strip_states, abort_btn, earlystop_btn, generate_btn, add_to_queue_btn, current_gen_column, gen_info, queue_accordion, state],
                     trigger_mode="always_last"
+                ).then(fn=lambda: SONG_POS[0], inputs=None, outputs=[song_pos_number], show_progress="hidden"
                 ).then(
                     unload_model_if_needed,
                      inputs= [state],
