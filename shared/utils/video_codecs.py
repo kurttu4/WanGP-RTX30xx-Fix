@@ -1,9 +1,9 @@
 SDR_VIDEO_CODEC_CHOICES = [
     ("x265 CRF 28 (Smaller Files)", "libx265_28"),
     ("x265 CRF 18 (Balanced)", "libx265_18"),
-    ("x264 Level 8 (Balanced)", "libx264_8"),
+    ("x264 CRF 10 (Balanced)", "libx264_8"),
     ("x265 CRF 8 (High Quality)", "libx265_8"),
-    ("x264 Level 10 (High Quality)", "libx264_10"),
+    ("x264 CRF 0 (High Quality)", "libx264_10"),
     ("x264 Lossless", "libx264_lossless"),
     ("ProRes 422 (editing)", "prores_422"),
     ("DNxHR HQ (editing)", "dnxhr_hq"),
