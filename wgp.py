@@ -13419,9 +13419,9 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 audio_guide2 = gr.Audio(value= ui_defaults.get("audio_guide2", None), type="filepath", label=model_def.get("audio_guide2_label","Voice to follow #2"), show_download_button= True, visible=audio_inputs_visible["audio_guide2"])
                 audio_guide3 = gr.Audio(value= ui_defaults.get("audio_guide3", None), type="filepath", label=model_def.get("audio_guide3_label","Voice to follow #3"), show_download_button= True, visible=audio_inputs_visible["audio_guide3"])
             with gr.Row() as song_pos_row:
-                song_pos_number = gr.Number(value=lambda: SONG_POS[0], label="Song position (frames): where the song stands at the end of the source video (used with Continue without joining)", precision=0, minimum=0, scale=4)
+                song_pos_number = gr.Number(value=lambda: SONG_POS[0], label="Song position (frames)", precision=0, minimum=0, scale=4)
                 song_add_btn = gr.Button("+ Add", scale=1, min_width=60)
-                song_auto_checkbox = gr.Checkbox(value=lambda: SONG_AUTO[0], label="Auto-add after generation", scale=2)
+                song_auto_checkbox = gr.Checkbox(value=lambda: SONG_AUTO[0], label="Auto-add", scale=2)
             if not update_form:
                 song_pos_number.change(fn=set_song_pos, inputs=[song_pos_number], outputs=None)
                 song_auto_checkbox.change(fn=set_song_auto, inputs=[song_auto_checkbox], outputs=None)
