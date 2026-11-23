@@ -29,6 +29,22 @@ def checkpoint():
         callback()
 
 
+_release_callbacks = weakref.WeakKeyDictionary()  # module -> callbacks run when its offload object is released (on_release)
+
+
+def on_release(module, callback):
+    """callback() runs once when the offload object managing module is released (offload.release(): a model switch, a reset): the owner of
+    state kept beside the model while it is suspended (an engine, its graphs) frees it for good."""
+    _release_callbacks.setdefault(module, set()).add(callback)
+
+
+def _released(manager):
+    for model in manager.models.values():
+        for module in model.modules():
+            for callback in _release_callbacks.pop(module, ()):
+                callback()
+
+
 def register_resource(module, prepare, release):
     """Tie a shared execution resource to a model's GPU residency.
 
@@ -90,6 +106,12 @@ def _owner(module):
         return None
     manager = entry[0]()
     return None if manager is None else (manager, entry[1])
+
+
+def verbose_level(module):
+    """The verbose level of the offload object managing module (0 for an unmanaged module)."""
+    owner = _owner(module)
+    return 0 if owner is None else owner[0].verboseLevel
 
 
 def execution_device(module):
@@ -207,6 +229,25 @@ def weights_resident(module):
         blocks = names[(model_id, id(module))] = [name[len(model_id) + 1:] for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(prefix)]
     preloaded = manager.preloaded_blocks_per_model[model_id]
     return all(name in preloaded for name in blocks)
+
+
+def pass_weight_bytes(module):
+    """Bytes a pass over the blocks of a managed model's towers adds, at the least, to the VRAM allocated now for their weights: the slots
+    of its streamed blocks not allocated yet (the prefetch window + 1 of its largest block), less its preloaded blocks, which the VRAM
+    pressure releases (an automatic or a manual preload). Negative when releasing them leaves room. 0 for an unmanaged module or a model
+    whose towers are loaded whole."""
+    owner = _owner(module)
+    if owner is None:
+        return 0
+    manager, model_id = owner
+    towers = tuple(model_id + "/" + name for name in manager.towers_per_model.get(model_id, ()))
+    sizes = [size for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(towers)] if towers else []
+    if not sizes:
+        return 0
+    slots = manager.block_slots.get(model_id) or ()
+    allocated = sum(slot[2] for slot in slots if slot[0] is not None)
+    preloaded = sum(size for name, size in manager.preloaded_blocks_per_model[model_id].items() if (model_id + "/" + name).startswith(towers))
+    return (manager.model_prefetch_window(model_id) + 1) * max(sizes) - allocated - preloaded
 
 
 _block_names = weakref.WeakKeyDictionary()  # an offload manager -> (model id, id of a module of the model) -> the names of its blocks

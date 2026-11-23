@@ -1,6 +1,7 @@
 from postprocessing import memory as processor_memory
 from shared.kernels import fp8_backend, int8_backend, kernel_policy
 from shared import attention_kit, model_dropdowns
+from shared.attention import sagegp_ready
 from shared.cuda_memory import COMPUTE_CACHE_KEY, COMPUTE_CACHE_PATH_DEFAULT, COMPUTE_CACHE_PATH_KEY, RAM_ALLOCATOR_DEFAULT, RAM_ALLOCATOR_KEY, compute_cache_folder, compute_cache_useful
 import gradio as gr
 from shared.utils.plugins import WAN2GPPlugin
@@ -126,6 +127,7 @@ from shared.deepy.config import (
 from shared.prompt_enhancer.config import (
     PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT,
     PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY,
+    speculative_decoding_info,
     speculative_decoding_ui_state,
     speculative_decoding_config,
     validate_prompt_enhancer_speculative_decoding,
@@ -163,7 +165,8 @@ QWEN35_PROMPT_ENHANCER_IDS = (3, 4)
 QWEN38_PROMPT_ENHANCER_ID = 5
 QWEN38_9B_PROMPT_ENHANCER_ID = 6
 QWEN38_FLASH_NEXT_PROMPT_ENHANCER_ID = 7
-QWEN_PROMPT_ENHANCER_IDS = (3, 4, 5, 6, 7)
+INKLING2_MINI_PROMPT_ENHANCER_ID = 8
+QWEN_PROMPT_ENHANCER_IDS = (3, 4, 5, 6, 7, 8)  # the local models of the LM engine
 QWEN35_QUANTIZATION_CHOICES = [("Quanto Int8 (recommended, better quality)", "quanto_int8"), ("GGUF Q4 (less VRAM/RAM & faster if kernels are installed, but worse quality)", "gguf")]
 QWEN38_9B_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4_K_M (default, fits 8 GB of VRAM)", "gguf"), ("GGUF Uncensored Q8_0 (closest to full precision, needs about 12 GB of VRAM)", "gguf_q8")]
 QWEN38_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4 (highest quality and VRAM/RAM use, for 24 GB of VRAM or more)", "gguf"), ("GGUF Uncensored IQ3_S (Q3, middle quality and VRAM/RAM use, for 16 GB of VRAM or more)", "gguf_q3"), ("GGUF Uncensored Q2 (lower quality and VRAM/RAM use)", "gguf_q2"), ("Bonsai 2 Abliterated PTQ1_0 (Q1, ternary, lowest VRAM/RAM use, for less than 16 GB of VRAM, requires kernels 1.0.22+)", "gguf_ptq1")]
@@ -178,8 +181,14 @@ def prompt_enhancer_quantization_ui_state(enhancer_enabled, quantization):
         return QWEN38_9B_QUANTIZATION_CHOICES, quantization if quantization in ("gguf", "gguf_q8") else "gguf", True
     if enhancer_enabled == QWEN38_FLASH_NEXT_PROMPT_ENHANCER_ID:
         return [("GGUF IQ3_S", "gguf_q3")], "gguf_q3", True
+    if enhancer_enabled == INKLING2_MINI_PROMPT_ENHANCER_ID:
+        return [("Single version, as released (about 20 GB of VRAM with its context)", "safetensors")], "safetensors", True
     value = "gguf" if quantization in ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1") else "quanto_int8"
     return QWEN35_QUANTIZATION_CHOICES, value, enhancer_enabled in QWEN35_PROMPT_ENHANCER_IDS
+
+
+def prompt_enhancer_quantization_label(enhancer_enabled):
+    return "LLM Version" if int(enhancer_enabled) == INKLING2_MINI_PROMPT_ENHANCER_ID else "Qwen LLM Quantization"
 
 
 def quantization_after_engine_switch(enhancer_before, enhancer_id, quantization):
@@ -428,6 +437,12 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         choices=self.attention_modes_choices,
                         value=self.attention_mode, label="Attention Type", interactive=not self.args.lock_config
                     )
+                    self.sage2_first_step_precise_choice = gr.Checkbox(
+                        value=self.server_config.get("sage2_first_step_precise", kernel_policy.SAGE2_FIRST_STEP_PRECISE_DEFAULT),
+                        label="Run the First Denoising Step in Precise (Sage 2/3 Adaptative GP and Sage3 GP)", interactive=not self.args.lock_config,
+                        info="The first step sets the composition: computed precisely, the video stays closer to an exact computation for a small part of the speed gain.",
+                        visible=sagegp_ready,
+                    )
                     self.quantization_choice = gr.Dropdown(choices=self.transformer_quantization_choices, value=self.transformer_quantization, label="Transformer Model Quantization (if available otherwise get the closest available)")
                     self.transformer_dtype_policy_choice = gr.Dropdown(choices=[("Auto (Best for Hardware)", ""), ("FP16", "fp16"), ("BF16", "bf16")], value=self.transformer_dtype_policy, label="Transformer Data Type (if available)")
                     self.mixed_precision_choice = gr.Dropdown(choices=[("16-bit only (less VRAM)", "0"), ("Mixed 16/32-bit (better quality)", "1")], value=self.server_config.get("mixed_precision", "0"), label="Transformer Engine Precision")
@@ -595,7 +610,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.enhancer_quantization_choice = gr.Dropdown(
                         choices=enhancer_quantization_choices,
                         value=enhancer_quantization_value,
-                        label="Qwen LLM Quantization",
+                        label=prompt_enhancer_quantization_label(enhancer_enabled_value),
                         info="Lower precision saves VRAM/RAM at some cost to quality. Use the highest precision that fits comfortably.",
                         visible=enhancer_quantization_visible and not deepy_remote_default,
                     )
@@ -643,7 +658,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     with gr.Row(visible=not deepy_remote_default and enhancer_enabled_value in QWEN_PROMPT_ENHANCER_IDS) as self.enhancer_speculative_row:
                         self.enhancer_speculative_decoding_choice = gr.Dropdown(
                             choices=speculative_choices, value=speculative_method, label="Speculative Decoding",
-                            info="Speculative decoding uses extra VRAM. Auto keeps MTP off at 8 GB or less and, from 13 to 16 GB, enables it only when the whole model fits in VRAM with it. On Qwen3.8 27B it uses 4 draft tokens from 24 GB (12 GB with Bonsai), 2 below.",
+                            info=speculative_decoding_info(enhancer_enabled_value),
                             interactive=not self.args.lock_config,
                         )
                         self.enhancer_speculative_tokens_choice = gr.Dropdown(
@@ -1072,11 +1087,11 @@ class ConfigTabPlugin(WAN2GPPlugin):
         def update_speculative_decoding_choice(enhancer_enabled_choice, enhancer_quantization_choice, method, tokens):
             _, quantization, _ = prompt_enhancer_quantization_ui_state(enhancer_enabled_choice, enhancer_quantization_choice)
             choices, method, counts, tokens = speculative_decoding_ui_state(enhancer_enabled_choice, quantization, method, tokens)
-            return gr.update(choices=choices, value=method, interactive=not self.args.lock_config), gr.update(choices=counts, value=tokens, interactive=bool(counts) and not self.args.lock_config)
+            return gr.update(choices=choices, value=method, info=speculative_decoding_info(enhancer_enabled_choice), interactive=not self.args.lock_config), gr.update(choices=counts, value=tokens, interactive=bool(counts) and not self.args.lock_config)
 
         def update_enhancer_quantization_choice(enhancer_enabled_choice, enhancer_quantization_choice):
             choices, value, visible = prompt_enhancer_quantization_ui_state(enhancer_enabled_choice, enhancer_quantization_choice)
-            return gr.update(choices=choices, value=value, visible=visible)
+            return gr.update(choices=choices, value=value, label=prompt_enhancer_quantization_label(enhancer_enabled_choice), visible=visible)
 
         self.enhancer_enabled_choice.input(fn=update_enhancer_quantization_choice, inputs=[self.enhancer_enabled_choice, self.enhancer_quantization_choice], outputs=[self.enhancer_quantization_choice], show_progress="hidden")
         speculative_inputs = [self.enhancer_enabled_choice, self.enhancer_quantization_choice, self.enhancer_speculative_decoding_choice, self.enhancer_speculative_tokens_choice]
@@ -1099,7 +1114,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                 privacy_warning(runtime_config),
                 gr.update(visible=deepy_remote),
                 gr.update(visible=ENGINE_CODEX in active), gr.update(visible=ENGINE_CLAUDE in active), gr.update(visible=ENGINE_OPENCODE in active),
-                gr.update(value=enhancer_id, visible=False), gr.update(choices=quantization_choices, value=quantization_value, visible=quantization_visible and not deepy_remote),
+                gr.update(value=enhancer_id, visible=False), gr.update(choices=quantization_choices, value=quantization_value, label=prompt_enhancer_quantization_label(enhancer_id), visible=quantization_visible and not deepy_remote),
                 gr.update(visible=qwen_local), gr.update(visible=qwen_local), gr.update(visible=not deepy_remote), gr.update(visible=deepy_enabled and not deepy_remote),
                 gr.update(visible=deepy_enabled and qwen_local), gr.update(visible=deepy_enabled and qwen_local), gr.update(visible=deepy_enabled), gr.update(visible=qwen_local),
                 gr.update(visible=not deepy_remote and enhancer_id == QWEN38_FLASH_NEXT_PROMPT_ENHANCER_ID),
@@ -1147,7 +1162,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         inputs = [
             self.state,
             self.transformer_types_choices, self.show_all_model_filter_choice, self.fit_canvas_choice,
-            self.attention_choice, self.generation_preview_choice, self.preload_model_policy_choice, self.clear_file_list_choice, self.multi_prompts_gen_type_choice, self.keep_intermediate_sliding_windows_choice,
+            self.attention_choice, self.sage2_first_step_precise_choice, self.generation_preview_choice, self.preload_model_policy_choice, self.clear_file_list_choice, self.multi_prompts_gen_type_choice, self.keep_intermediate_sliding_windows_choice,
             self.display_stats_choice, self.max_frames_multiplier_choice, self.keep_resolution_on_model_switch_choice, self.enable_4k_resolutions_choice, self.checkpoints_paths_choice, self.loras_root_choice, self.save_queue_if_crash_choice,
             self.UI_theme_choice, self.floating_generate_button_choice, self.queue_color_scheme_choice, self.process_queues_when_browser_unfocused_choice, self.prevent_power_throttling_choice, self.compute_cache_choice, self.compute_cache_path_choice,
             self.quantization_choice, self.transformer_dtype_policy_choice, self.mixed_precision_choice,
@@ -1267,7 +1282,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         (
             transformer_types_choices, show_all_model_filter_choice, fit_canvas_choice,
-            attention_choice, generation_preview_choice, preload_model_policy_choice, clear_file_list_choice, multi_prompts_gen_type_choice, keep_intermediate_sliding_windows_choice,
+            attention_choice, sage2_first_step_precise_choice, generation_preview_choice, preload_model_policy_choice, clear_file_list_choice, multi_prompts_gen_type_choice, keep_intermediate_sliding_windows_choice,
             display_stats_choice, max_frames_multiplier_choice, keep_resolution_on_model_switch_choice, enable_4k_resolutions_choice, checkpoints_paths_choice, loras_root_choice, save_queue_if_crash_choice,
             UI_theme_choice, floating_generate_button_choice, queue_color_scheme_choice, process_queues_when_browser_unfocused_choice, prevent_power_throttling_choice, compute_cache_choice, compute_cache_path_choice,
             quantization_choice, transformer_dtype_policy_choice, mixed_precision_choice,
@@ -1328,6 +1343,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
             enhancer_quantization_choice = "gguf"
         if not deepy_remote and int(enhancer_enabled_choice) == QWEN38_FLASH_NEXT_PROMPT_ENHANCER_ID:
             enhancer_quantization_choice = "gguf_q3"
+        if not deepy_remote and int(enhancer_enabled_choice) == INKLING2_MINI_PROMPT_ENHANCER_ID:
+            enhancer_quantization_choice = "safetensors"
         if not deepy_remote and int(enhancer_enabled_choice) in QWEN35_PROMPT_ENHANCER_IDS and enhancer_quantization_choice not in ("quanto_int8", "gguf"):
             error = "Qwen3.5 is available as Quanto Int8 or GGUF Q4."
             gr.Info(f"Configuration was not saved: {error}")
@@ -1348,8 +1365,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
             if deepy_enabled_choice:
                 if not deepy_remote and not qwen_local:
                     raise ValueError("Florence 2 is not compatible with Deepy. Select a Qwen model or disable Deepy before saving.")
-                if not deepy_remote and deepy_type_choice == DEEPY_TYPE_PRIME and enhancer_enabled_choice not in (QWEN38_PROMPT_ENHANCER_ID, QWEN38_9B_PROMPT_ENHANCER_ID, QWEN38_FLASH_NEXT_PROMPT_ENHANCER_ID):
-                    raise ValueError("Deepy Prime requires a Qwen3.8 VL model.")
+                if not deepy_remote and deepy_type_choice == DEEPY_TYPE_PRIME and enhancer_enabled_choice not in (QWEN38_PROMPT_ENHANCER_ID, QWEN38_9B_PROMPT_ENHANCER_ID, QWEN38_FLASH_NEXT_PROMPT_ENHANCER_ID, INKLING2_MINI_PROMPT_ENHANCER_ID):
+                    raise ValueError("Deepy Prime requires a Qwen3.8 VL or Inkling 2 model.")
                 if qwen_local:
                     deepy_compaction_thinking_choice = deepy_compaction_type_choice == DEEPY_COMPACTION_CHOICE_THINKING
                     deepy_compaction_type_choice = normalize_deepy_compaction_type(deepy_compaction_type_choice)
@@ -1403,7 +1420,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         new_server_config = copy.deepcopy(old_server_config)
         new_server_config.update({
-            "attention_mode": attention_choice, "transformer_types": transformer_types_choices,
+            "attention_mode": attention_choice, "sage2_first_step_precise": sage2_first_step_precise_choice,
+            "transformer_types": transformer_types_choices,
             model_dropdowns.SHOW_ALL_MODEL_FILTER_CONFIG_KEY: show_all_model_filter_choice,
             "generation_preview": generation_preview_choice,
             "text_encoder_quantization": text_encoder_quantization_choice, "save_path": save_path_choice,
@@ -1559,7 +1577,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             'workspace_storage_mode', 'workspaces_dir', 'mcp_workspace_mode', 'mcp_port', 'mcp_webui', 'mcp_workspace_visibility', 'mcp_visual_inspection',
             VOICE_MODE_KEY,
             DEEPY_VOICE_LANGUAGE_KEY,
-            "attention_mode", "vae_config", "boost", "int8_kernels", "fp8_kernels", "kernel_precision", "inputs_chunker", "save_path", "image_save_path", "audio_save_path", "mesh_save_path",
+            "attention_mode", "sage2_first_step_precise", "vae_config", "boost", "int8_kernels", "fp8_kernels", "kernel_precision", "inputs_chunker", "save_path", "image_save_path", "audio_save_path", "mesh_save_path",
             "metadata_type", "clear_file_list", "multi_prompts_gen_type", "keep_intermediate_sliding_windows", "fit_canvas", "depth_anything_v2_variant",
             "notification_sound_enabled", "notification_sound_volume", *notifications.CONFIG_KEYS, "audio_processors", "temporal_upsamplers", "spatial_upsamplers", "matanyone_version", REMBG_MODEL_KEY,
             "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization", PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, "enhancer_mode",
@@ -1626,6 +1644,9 @@ class ConfigTabPlugin(WAN2GPPlugin):
         upsampler_api.release_changed_config_upsamplers(old_server_config, new_server_config, changes)
         if "kernel_precision" in changes:
             kernel_policy.configure(new_server_config["kernel_precision"])
+        if "sage2_first_step_precise" in changes:
+            kernel_policy.configure_sage2_first_step_precise(new_server_config["sage2_first_step_precise"])
+            attention_kit.reset_chunking_measurements()
         if "inputs_chunker" in changes:
             attention_kit.configure(new_server_config["inputs_chunker"])
         if int8_resolution is not None:

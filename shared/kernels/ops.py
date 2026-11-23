@@ -75,6 +75,7 @@ offload.register_lora_output(_lora_output)
 if _triton is not None:  # the row stores of CUDA graph loops over row ranges (offload's RowSource preparation)
     from . import row_loop_triton as _row_loop_triton
     offload.register_row_store_at(_row_loop_triton.store_rows_at)
+    offload.register_row_copy_at(_row_loop_triton.copy_rows_at)
 
 
 def project_many(modules, x_list):
@@ -127,6 +128,44 @@ def norm_modulate(x_list, norm, shift, scale, segments, *, dtype=None):
     for start, stop, row in segments:
         x[start:stop].mul_(1.0 + scale[row]).add_(shift[row])
     return x
+
+
+def _fused_norm(norm, dtype):
+    """(weight, eps, layer) of a norm shared.kernels.norm_quant_triton computes (RMSNorm; LayerNorm without bias, weightless or with
+    LayerNorm's own forward), None for another."""
+    if isinstance(norm, torch.nn.RMSNorm):
+        return norm.weight, norm.eps if norm.eps is not None else torch.finfo(dtype).eps, False
+    if isinstance(norm, torch.nn.LayerNorm) and norm.bias is None and (norm.weight is None or type(norm).forward is torch.nn.LayerNorm.forward):
+        return norm.weight, norm.eps, True
+    return None
+
+
+def norm_modulate_rows(x, norm, shift, scale, segments, shape=None, dtype=None):
+    """norm_modulate of rows x (rows, dim), borrowed (cast to dtype when given; shift / scale None: norm(x) alone), as an mmgp
+    offload.RowSource of `shape` (x's by default) made by ranges of rows, for inputs only their projections read (an attention that makes
+    them again by head group, an FFN chunk by chunk: attention_kit.extreme_low_vram()): never whole beside x, rows as from the whole
+    (row-wise operations). Its INT8 / FP8 forms come in one pass from the residual where the norm is one shared.kernels.norm_quant_triton
+    computes (RowSource.fill_prepared: the norm and modulation in FP32, rounded once)."""
+    def fill(start, stop):
+        if scale is None:
+            rows = norm(x[start:stop])
+        else:
+            spans = [(max(first, start) - start, min(last, stop) - start, row) for first, last, row in segments if first < stop and last > start]
+            rows = norm_modulate([x[start:stop]], norm, shift, scale, spans)
+        return rows if dtype is None else rows.to(dtype)
+    source = offload.RowSource(x.shape if shape is None else shape, x.dtype if dtype is None else dtype, x.device, fill)
+    fused = _fused_norm(norm, x.dtype) if dtype in (None, x.dtype) else None
+    if fused is not None:
+        source.fill_prepared, source.fill_prepared_at = row_fills(x, fused[0], fused[1], scale, shift, segments, fused[2])
+    return source
+
+
+def row_fills(x, weight, eps, scale, shift, segments, layer=False):
+    """shared.kernels.norm_quant_triton.row_fills (a RowSource's fill_prepared and fill_prepared_at) where Triton is installed, else (None, None)."""
+    if _triton is None:
+        return None, None
+    from . import norm_quant_triton
+    return norm_quant_triton.row_fills(x, weight, eps, scale, shift, segments, layer)
 
 
 def rms_norm_(x, eps, weight=None):
@@ -815,6 +854,18 @@ def _norm_parameters(norm, tokens, device):
     return norm.weight, torch.finfo(torch.float32).eps if norm.eps is None else norm.eps, None
 
 
+def norm_rope_query_sample(q, ids, rope, q_norm, core, *, interleaved=False, rope_first=False):
+    """Apply the fused quantizer's per-head norm and the original positions' RoPE to sampled Q rows."""
+    if isinstance(q_norm, list) or (rope is not None and (rope.ndim not in (5, 6) or rope.shape[3] > 64)):
+        return None
+    norm = _norm_parameters(q_norm, q.size(1), q.device)
+    weight = norm[0]
+    if weight is not None and (weight.device != q.device or weight.dtype not in (q.dtype, torch.float32)
+                               or weight.ndim not in (1, 2) or weight.size(-1) != 128 or weight.stride(-1) != 1):
+        return None
+    return core.sample_projected_query(q, ids, rope, norm, interleaved=interleaved, rope_first=rope_first)
+
+
 def split_half_norm_rope_quant_(q, k, rope, q_norm, k_norm, core, settings, *, interleaved=False, rope_first=False):
     """The staged SageAttention 2 quantization of q and / or k (batch, tokens, heads, head_dim; the other None) fused with their
     per-head RMSNorm (a module with .weight and .eps, a (weight, eps) tuple, None, or segments [(start, stop, module or tuple)] over
@@ -823,20 +874,31 @@ def split_half_norm_rope_quant_(q, k, rope, q_norm, k_norm, core, settings, *, i
     or (..., pairs, 2, 2) rotation matrices [[cos, -sin], [sin, cos]], read through their strides; None for no rotation; channel p
     with p + pairs, or interleaved 2p with 2p + 1): (q_quantized, k_quantized) as the core's staged_quantize_q / staged_quantize_k
     return them, quantized from the FP32 rotated rows (one rounding fewer than the in-place kernel followed by the core's
-    quantizer), k's mean from FP32 partial sums. rope_first: the rotation before the norm (Hi3D), both in FP32. Heads that the core
-    pads (settings["padded_dim"]: 96 attended as 128) get INT8 rows of the padded width, zeros beyond head_dim. q is left as it is
-    (staged_attention writes the output into it) and k is not modified (the caller releases it). None where the fusion does not apply
+    quantizer), k's mean from FP32 partial sums. The CUDA per-warp query path preserves the rotation's 16-bit rounding.
+    rope_first rotates before the norm (Hi3D), both in FP32. Padded heads get INT8 rows with zeros beyond head_dim.
+    The caller releases k after packing. A core with recycle_query enabled may pack into the disposable q projection
+    before staged_attention writes its output there. Other calls preserve q during packing. None where the fusion does not apply
     (a core without fused_qk_layouts or a quantization layout the kernels do not reproduce, no CUDA inference, attended head_dim not
     64 / 128, norm weights on another device / dtype): the caller runs norm_rope and the core's quantizers."""
     x = q if q is not None else k
     width = settings.get("padded_dim") or x.shape[-1]
-    (q_weight, q_eps, q_rows), (k_weight, k_eps, k_rows) = (_norm_parameters(norm, x.shape[1], x.device) for norm in (q_norm, k_norm))
     layouts = core.fused_qk_layouts(settings, x.shape[-1]) if _qk_quant is not None and hasattr(core, "fused_qk_layouts") else None
     # the kernel reads the weights in their own dtype (FP32 scales of some INT8 checkpoints included) and multiplies in FP32
-    if (layouts is None or width not in (64, 128) or not cuda_inference(x, dtypes=(torch.bfloat16, torch.float16))
-            or not all(w.device == x.device and w.dtype in (x.dtype, torch.float32) for w in (q_weight, k_weight) if w is not None)):
+    warp_query = getattr(core, "fused_warp_query", None) if layouts is None and k is None else None
+    warp_key = getattr(core, "fused_warp_key", None) if layouts is None and q is None else None
+    if (layouts is None and warp_query is None and warp_key is None) or width not in (64, 128) or not cuda_inference(x, dtypes=(torch.bfloat16, torch.float16)):
+        return None
+    q_weight, q_eps, q_rows = _norm_parameters(q_norm if q is not None else None, x.shape[1], x.device)
+    k_weight, k_eps, k_rows = _norm_parameters(k_norm if k is not None else None, x.shape[1], x.device)
+    if not all(w.device == x.device and w.dtype in (x.dtype, torch.float32) for w in (q_weight, k_weight) if w is not None):
         return None
     options = {"interleaved": interleaved, "rope_first": rope_first}
+    if warp_key is not None:
+        key = warp_key(k, rope, (k_weight, k_eps, k_rows), settings, **options)
+        return None if key is None else (None, key)
+    if warp_query is not None:
+        query = warp_query(q, rope, (q_weight, q_eps, q_rows), settings, **options)
+        return None if query is None else (query, None)
     quantized = [None, None]
     if k is not None:
         layout, block, sm_scale, scale_eps = layouts["k"]
@@ -847,8 +909,9 @@ def split_half_norm_rope_quant_(q, k, rope, q_norm, k_norm, core, settings, *, i
         del mean
     if q is not None:
         layout, block, sm_scale, scale_eps = layouts["q"]
+        recycle = hasattr(core, "fused_query_recycle") and core.fused_query_recycle(q, settings)
         quantized[0] = _qk_quant.norm_rope_quantize(q, q_weight, rope, q_eps, layout, block, sm_scale=sm_scale, scale_eps=scale_eps,
-                                                    weight_rows=q_rows, width=width, **options)
+                                                    weight_rows=q_rows, width=width, recycle=recycle, **options)
     return tuple(quantized)
 
 

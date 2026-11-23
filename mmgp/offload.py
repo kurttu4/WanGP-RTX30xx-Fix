@@ -546,12 +546,19 @@ def _make_parameter(tensor, requires_grad=False):
 
 _graph_serials = itertools.count(1)
 
+_graph_serial_tensors = weakref.WeakValueDictionary()  # serial -> its tensor while alive (graphs kept between generations)
+
 def _graph_serial(tensor):
     # a number given once to a tensor object, never reused: the CUDA graph keys of the blocks name their tensors by it
     serial = tensor.__dict__.get("_mm_graph_serial", None)
     if serial is None:
         serial = tensor._mm_graph_serial = next(_graph_serials)
+        _graph_serial_tensors[serial] = tensor
     return serial
+
+def _graph_weights_alive(weights_key):
+    # the tensors a weights key of _graph_weights_key names are all alive: its graphs may replay again
+    return builtins.all(serial is None or serial in _graph_serial_tensors for serial in weights_key[0])
 
 _placement_generation = 0  # counts the tensors MMGP installed in modules (blocks loaded or unloaded): weights keys that depend only on them
 
@@ -563,6 +570,14 @@ def _install_tensor(module, name, tensor):
         module._parameters[name] = tensor
     else:
         module._buffers[name] = tensor
+
+def _copy_inner(source, target):
+    # the plain tensors inside a tensor subclass (e.g. quantized: data and scales) copied into those of a tensor of the same class and layout
+    if type(source) is torch.Tensor or not hasattr(source, "__tensor_flatten__"):  # also a subclass holding its own storage (as_subclass)
+        target.as_subclass(torch.Tensor).copy_(source.as_subclass(torch.Tensor), non_blocking=True)
+        return
+    for name in source.__tensor_flatten__()[0]:
+        _copy_inner(getattr(source, name), getattr(target, name))
 
 def _unwrap_quantized_tensor(tensor):
     if hasattr(tensor, "_data") and torch.is_tensor(tensor._data):
@@ -819,24 +834,29 @@ class _PinnedStager:
             inner[name], offset = self._pinned_copy(getattr(t, name), slot, offset, parallel)
         return type(t).__tensor_unflatten__(inner, meta, t.size(), t.stride()), offset
 
-    def to_gpu(self, p, parallel=lambda: True, trust_pinned=True):
+    def to_gpu(self, p, parallel=lambda: True, trust_pinned=True, out=None):
         # trust_pinned False: a model of the pinned pool, which locks its blocks in place by the whole pages of their tensors. A tensor may
         # then report pinned while its last page is not, and the driver refuses its asynchronous copy ("invalid argument"): every tensor
-        # crosses the slots
+        # crosses the slots. out: the GPU tensor of p at an earlier load, kept in VRAM (offload.kept_tensors): it receives the copy
         t = p.data if type(p) is torch.nn.Parameter else p
+        if out is not None and type(t) is not torch.Tensor:  # its inner tensors copied one by one
+            _copy_inner(t, out)
+            return out
+        def driver_copy():
+            return p.to("cuda", non_blocking=True) if out is None else out.copy_(t, non_blocking=True)
         if not self.enabled:
-            return p.to("cuda", non_blocking=True)
+            return driver_copy()
         if type(t) is torch.Tensor:
             nbytes = t.numel() * t.element_size()
             if not t.is_contiguous() or trust_pinned and (nbytes < STAGING_MIN_SIZE or t.is_pinned()):
-                return p.to("cuda", non_blocking=True)
-            dst = torch.empty(t.shape, dtype=t.dtype, device="cuda")
+                return driver_copy()
+            dst = torch.empty(t.shape, dtype=t.dtype, device="cuda") if out is None else out
             dst_bytes = dst.reshape(-1).view(torch.uint8)
             for offset in range(0, nbytes, STAGING_CHUNK_SIZE):
                 length = min(STAGING_CHUNK_SIZE, nbytes - offset)
                 slot = self._acquire(length)
                 if slot is None:
-                    return p.to("cuda", non_blocking=True)
+                    return driver_copy()
                 self._memmove(slot.data_ptr(), t.data_ptr() + offset, length, parallel)
                 dst_bytes[offset:offset + length].copy_(slot[:length], non_blocking=True)
                 self._release()
@@ -871,6 +891,8 @@ class _PinnedStager:
 
 
 CACHED_BLOCK_VIEWS = True # swapped blocks move into fixed VRAM slots whose tensor views are built once per block and slot
+GRAPH_CACHE_RAM_SHARE = 0.10  # available RAM, as a share of the RAM planned with, under which the graphs kept for unloaded models go (purge_kept)
+HELD_BLOCKS = os.environ.get("MMGP_HELD_BLOCKS", "1") != "0"  # comparison switch: blocks kept in VRAM of graphed models on held buffers (_held_blocks)
 RING_COPY_THREADS = 3 # copies into the staging ring: 2-4 threads reach the RAM bandwidth, more do not help
 RING_DEFAULT_BLOCKS = 3 # default size of the staging ring, in largest blocks to stage
 CPU_COMPUTE_MAX_ROWS = 8 # cpuCompute: the longest block calls (rows of their input) computed on the CPU, beyond which the block is streamed
@@ -4046,6 +4068,29 @@ def lora_active(module):
     return bool(getattr(module, "_mm_lora_data", None)) and _row_lora_adapters(module) != []
 
 
+def lora_rank(modules):
+    """Columns of the LoRA products x @ A the active LoRAs of these modules make (the ranks of their distinct input factors: q, k and v
+    of one A count once; a joined LoRA's factors are theirs side by side), 0 without any. Read from their RAM copies: whether or not the
+    modules' blocks are in VRAM now."""
+    factors = {}
+    for module in modules:
+        loras_data = getattr(module, "_mm_lora_data", None)
+        if not loras_data:
+            continue
+        model = module._mm_lora_model
+        for adapter in model._loras_active_adapters:
+            data = loras_data.get(adapter, None)
+            if data is None or data[0] is None or data[3] is not None or data[5].get("type", "lora") != "lora":
+                continue
+            if module._mm_manager._get_lora_scaling(model._loras_scaling, model, adapter) * data[4] != 0:
+                factor = data[0]
+                while isinstance(factor, str):  # a factor shared with another module ("name#slot", the loader's alias)
+                    target, slot = factor.rsplit("#", 1)
+                    factor = model._loras_model_shortcuts[target][adapter][int(slot)]
+                factors[id(factor)] = factor.shape[0]
+    return builtins.sum(factors.values())
+
+
 _lora_output_kernel = None
 
 
@@ -4096,6 +4141,19 @@ ROW_SOURCE_BYTES = 64 << 20  # 16-bit rows of a RowSource made at a time by prep
 PREPARE_IN_PLACE = True  # comparison switch: False prepares every input apart from it (prepare_linear_input)
 
 
+def prepares_in_place(modules, dtype, device):
+    """Whether prepare_linear_input(..., in_place=True) of an input for these modules may prepare it in its own memory: one activation
+    format for all of them, which has prepare_in_place."""
+    probe = torch.empty((128, modules[0].in_features), dtype=dtype, device=device)
+    providers = [_row_projection(module, probe) for module in modules]
+    keys = {None if provider is None else provider.key(module) for module, provider in zip(modules, providers)}
+    return PREPARE_IN_PLACE and None not in providers and len(keys) == 1 and None not in keys and hasattr(providers[0], "prepare_in_place")
+
+
+def _row_probe(source, rows):
+    return torch.empty((builtins.min(source.rows(), rows), source.shape[-1]), dtype=source.dtype, device=source.device)
+
+
 class RowSource:
     """An input of linear modules given by ranges of rows instead of a tensor, so that it is never whole in VRAM (a normalized and
     modulated activation that only its projections read): shape (*, in_features), dtype and device as the tensor's would be, and
@@ -4104,9 +4162,14 @@ class RowSource:
     and prepares it range by range where every weight format of the modules can (its row projection's prepare_into), whole otherwise.
     Its rows must not depend on the ranges asked (row-wise operations). fill_at(first, step, count), when given, is the same inside a
     CUDA graph loop (cuda_graphs.loop): None, or a function(counter) making the rows [first + counter * step, + count) for the turn the
-    loop's counter gives, recorded in the loop's body."""
-    def __init__(self, shape, dtype, device, fill, fill_at=None):
+    loop's counter gives, recorded in the loop's body. fill_prepared(start, stop, form, want_rows), when given, makes those rows already
+    quantized in a 'block' form of the INT8 kernels, in one pass: form = (ConvRot group, columns per scale) as the formats' block_form
+    gives it, returning (the rows or None, INT8 rows, their FP32 scales per block of columns); prepare_rows takes it where every module's
+    format prepares these rows in the same form. fill_prepared_at(counter, first, rows, form, want_rows) is the same for the rows
+    first + counter * rows (a CUDA graph loop's turn: prepare_rows_at)."""
+    def __init__(self, shape, dtype, device, fill, fill_at=None, fill_prepared=None, fill_prepared_at=None):
         self.shape, self.dtype, self.device, self.fill, self.fill_at = torch.Size(shape), dtype, device, fill, fill_at
+        self.fill_prepared, self.fill_prepared_at = fill_prepared, fill_prepared_at
 
     def dim(self):
         return len(self.shape)
@@ -4127,12 +4190,15 @@ class RowSource:
 
 
 def linear_rows_supported(modules, x):
-    """True when every module can be computed by ranges of output rows from x (*, in_features) or a RowSource, LoRAs included."""
-    x = x.fill(0, builtins.min(x.rows(), 128)) if isinstance(x, RowSource) else x.reshape(-1, x.shape[-1])
+    """True when every module can be computed by ranges of output rows from x (*, in_features) or a RowSource, LoRAs included. A
+    RowSource is probed with an empty tensor of its chunk of rows: what a format claims follows the count of rows (a format may only take
+    inputs above its single call), not their values."""
+    x = _row_probe(x, x.chunk_rows()) if isinstance(x, RowSource) else x.reshape(-1, x.shape[-1])
     return builtins.all(_row_projection(module, x) is not None and _row_lora_adapters(module) is not None for module in modules)
 
 
 _row_store_at = None
+_row_copy_at = None
 row_loop_refusals = collections.Counter()  # why RowSource preparations recorded in graphs ran without a loop (and the loops made)
 ROW_RANGE_LOOP_COST = 0.001  # share of a turn's ranges' time its pause may cost (cuda_graphs.loop_turn_size)
 ROW_RANGE_LOOP_PER_TURN = None  # a fixed number of ranges per turn instead (comparisons, tests)
@@ -4143,6 +4209,13 @@ def register_row_store_at(kernel):
     graph loop's): what loops of row ranges (RowSource preparation) store their turn's results with."""
     global _row_store_at
     _row_store_at = kernel
+
+
+def register_row_copy_at(kernel):
+    """kernel(rows, counter, first, step, count): rows' `count` rows from first + counter * step as a new tensor, the counter on the device
+    (a CUDA graph loop's): what loops of row ranges read their turn's rows of kept products with (prepare_rows_at)."""
+    global _row_copy_at
+    _row_copy_at = kernel
 
 
 def _prepare_row_ranges_loop(source, providers, modules, prepared, products, rows, step):
@@ -4256,7 +4329,128 @@ def _prepare_row_source(source, modules):
     return LinearInput(source.shape[:-1], None, prepared, providers, lora)
 
 
-def prepare_linear_input(x_list, modules, in_place=False):
+def _block_group(source, modules, rows):
+    """The 'block' form (ConvRot group, columns per scale) every module's format prepares `rows` rows of this source in, None if they differ."""
+    providers = source.__dict__.get("_providers")
+    if providers is None:  # probed as linear_rows_supported does, at these rows
+        probe = _row_probe(source, rows)
+        providers = source._providers = {module: _row_projection(module, probe) for module in modules}
+        probe = None
+    groups = {getattr(provider, "block_form", lambda module, rows: None)(module, rows) for module, provider in providers.items()}
+    return next(iter(groups)) if len(groups) == 1 and None not in groups else None
+
+
+def rows_loop_group(source, modules, rows):
+    """While a block is captured: the 'block' form with which prepare_rows_at can make ranges of `rows` rows of this source inside a
+    CUDA graph loop (cuda_graphs.loop: its fill_prepared_at, the formats' block form, the loop's body allocations), else None."""
+    from . import cuda_graphs
+    if (not torch.cuda.is_current_stream_capturing() or source.fill_prepared_at is None or _row_store_at is None
+            or not cuda_graphs.loop_available(source.device) or not cuda_graphs.loop_allocations()):
+        return None
+    return _block_group(source, modules, rows)
+
+
+def _rows_input(source, modules, made, rows_count, lora=None):
+    rows, q, scales = made
+    providers = source._providers
+    forms = {provider.key(module): provider.block_prepared(module, q, scales, source.dtype) for module, provider in providers.items()}
+    if rows is not None:
+        return prepare_linear_input([rows], modules, forms=forms)
+    return LinearInput(torch.Size((rows_count,)), None, forms, dict(providers), lora or {})
+
+
+def _lora_slices(products, part):
+    """products (row_lora_products) as LinearInput.lora entries of some of their rows: part(whole tensor), once per tensor several modules share."""
+    done = {}
+    take = lambda value: None if value is None else done[id(value)] if id(value) in done else done.setdefault(id(value), part(value))
+    return {name: (take(value[0]), value[1]) if isinstance(value, tuple) else take(value) for name, value in products.items()}
+
+
+def row_lora_products(source, modules, step):
+    """The LoRA products x @ A of every row of a RowSource for these modules (keyed as LinearInput.lora: q, k and v of one A share one),
+    made once by ranges of `step` rows, so that passes over the same rows for several groups of heads (prepare_rows / prepare_rows_at
+    with products) read their rows instead of making x @ A again: rows x rank of each A in VRAM (a few hundred MB at rank 128). Where every
+    module's format prepares the rows in one 'block' form, from the rows its fill_prepared makes (inside a CUDA graph loop while a block is
+    captured), and the passes then make no 16-bit rows either; for any other weight format, from its fill (the passes still make their
+    16-bit rows for their own preparation). None where a LoRA is not low-rank (diff) or there is none."""
+    from . import cuda_graphs
+    group = _block_group(source, modules, step) if source.fill_prepared is not None else None
+    adapters = {module: _row_lora_adapters(module) for module in modules}
+    if (not builtins.any(adapters.values()) or builtins.any(data[5].get("type", "lora") != "lora" or data[2] is not None
+                                                            for entries in adapters.values() for _, data, _ in entries)):
+        return None
+    total = source.rows()
+    products, whole = {}, {}
+
+    def made(rows, put):
+        alphas = {}  # this range's products made, by factor (a joined LoRA's alpha)
+        for module in modules:
+            joined = (getattr(module, "_mm_lora_data", None) or {}).get("joined_GPU", None)
+            if joined is not None:
+                scales = _joined_lora_scales(module, joined)
+                key = (id(joined[0]), scales)
+                if key not in alphas:
+                    y, alphas[key] = _joined_lora_product(joined, rows, scales)
+                    if y is not None:
+                        put(whole[key] if key in whole else whole.setdefault(key, y.new_empty((total, y.shape[1]))), y)
+                products[(module, "joined")] = (whole.get(key), alphas[key])
+            for adapter, data, scaling in adapters[module]:
+                if not data[5].get("joined") and data[0] is not None:
+                    key = id(data[0])
+                    if key not in alphas:
+                        alphas[key] = None
+                        y = rows @ data[0].to(rows.dtype).T
+                        put(whole[key] if key in whole else whole.setdefault(key, y.new_empty((total, y.shape[1]))), y)
+                    products[(module, adapter)] = whole[key]
+
+    full = total // step
+    looped = (group is not None and full >= 3 and torch.cuda.is_current_stream_capturing() and source.fill_prepared_at is not None
+              and _row_store_at is not None and cuda_graphs.loop_available(source.device) and cuda_graphs.loop_allocations())
+    firsts = [0, *range(full * step, total, step)] if looped else range(0, total, step)
+    for first in firsts:
+        last = builtins.min(total, first + step)
+        rows = source.fill_prepared(first, last, group, True)[0] if group is not None else source.fill(first, last)
+        made(rows, lambda target, value: target[first:last].copy_(value))
+        rows = None
+        if looped and first == 0:
+            counter = torch.empty(1, dtype=torch.int64, device=source.device)
+            with cuda_graphs.loop(full - 1, counter):
+                made(source.fill_prepared_at(counter, step, step, group, True)[0], lambda target, value: _row_store_at(target, value, counter, step, step))
+    return products
+
+
+def _wants_rows(modules):
+    return builtins.any((getattr(module, "_mm_lora_data", None) or {}).get("joined_GPU") is not None or _row_lora_adapters(module) for module in modules)
+
+
+def prepare_rows_at(source, counter, first, rows, modules, group, products=None):
+    """prepare_rows of the rows first + counter * rows of a RowSource, in a CUDA graph loop's turn (rows_loop_group gave group)."""
+    if products is not None:
+        return _rows_input(source, modules, source.fill_prepared_at(counter, first, rows, group, False), rows,
+                           _lora_slices(products, lambda whole: _row_copy_at(whole, counter, first, rows, rows)))
+    return _rows_input(source, modules, source.fill_prepared_at(counter, first, rows, group, _wants_rows(modules)), rows)
+
+
+def store_rows_at(target, value, counter, first, step):
+    """target's rows from first + counter * step = value's rows (a CUDA graph loop's turn, the counter on the device)."""
+    _row_store_at(target, value, counter, first, step)
+
+
+def prepare_rows(source, start, stop, modules, products=None):
+    """prepare_linear_input of rows [start, stop) of a RowSource: by its fill_prepared, in one pass, where every module's format
+    prepares these rows in the same 'block' form (block_form), else from its fill. The rows themselves are made only for the LoRAs, and
+    not with products (row_lora_products of these modules), whose rows are read instead."""
+    if source.fill_prepared is not None:
+        group = _block_group(source, modules, stop - start)
+        if group is not None:
+            if products is not None:
+                return _rows_input(source, modules, source.fill_prepared(start, stop, group, False), stop - start,
+                                   _lora_slices(products, lambda whole: whole[start:stop]))
+            return _rows_input(source, modules, source.fill_prepared(start, stop, group, _wants_rows(modules)), stop - start)
+    return prepare_linear_input([source.fill(start, stop)], modules, lora=None if products is None else _lora_slices(products, lambda whole: whole[start:stop]))
+
+
+def prepare_linear_input(x_list, modules, in_place=False, forms=None, lora=None):
     """Prepares x, handed off in x_list, for modules computed by ranges of rows (check linear_rows_supported first): the activation of
     each weight format once, x @ A once per LoRA factor (q, k and v of a LoRA on a fused projection share one A). x itself is kept only for
     plain weights and diff adapters. x may be a RowSource: prepared by ranges of rows where its formats can, so that it is never whole.
@@ -4264,7 +4458,8 @@ def prepare_linear_input(x_list, modules, in_place=False):
     (no other reference to it or to the tensor it views, and it covers its whole storage), a format that can prepares it into x's own
     memory (prepare_in_place): its 16-bit values are then lost, and the bytes it leaves free are the result's `spare` (a 1-D uint8
     tensor, else None). x's whole memory then stays held as long as the prepared input or anything in `spare` is: unused, `spare` costs
-    the memory a separate preparation frees."""
+    the memory a separate preparation frees. forms: prepared forms already made by weight format key (prepare_rows). lora: the LoRA
+    products of these rows already made (LinearInput.lora entries: row_lora_products' rows, prepare_rows), read instead of x @ A."""
     x = x_list[0]
     x_list.clear()
     if isinstance(x, RowSource):
@@ -4279,7 +4474,8 @@ def prepare_linear_input(x_list, modules, in_place=False):
              and hasattr(torch._C, "_storage_Use_Count") and torch._C._storage_Use_Count(x.untyped_storage()._cdata) == 2 + (base is not None))
     base = None
     shape, x = x.shape[:-1], x.reshape(-1, x.shape[-1])
-    prepared, providers, lora, keep_x, products, first = {}, {}, {}, False, {}, {}
+    made, lora = lora, {} if lora is None else dict(lora)
+    prepared, providers, keep_x, products, first = {}, {}, False, {}, {}
     for module in modules:
         provider = providers[module] = _row_projection(module, x)
         key = provider.key(module)
@@ -4288,7 +4484,7 @@ def prepare_linear_input(x_list, modules, in_place=False):
         elif key not in first:
             first[key] = module
         joined = (getattr(module, "_mm_lora_data", None) or {}).get("joined_GPU", None)
-        if joined is not None:
+        if joined is not None and made is None:
             scales = _joined_lora_scales(module, joined)
             key = (id(joined[0]), scales)
             product = products.get(key)
@@ -4300,13 +4496,16 @@ def prepare_linear_input(x_list, modules, in_place=False):
                 continue
             if data[5].get("type", "lora") == "diff":
                 keep_x = True
-            elif data[0] is not None:
+            elif data[0] is not None and made is None:
                 product = products.get(id(data[0]))
                 if product is None:
                     product = products[id(data[0])] = x @ data[0].to(x.dtype).T
                 lora[(module, adapter)] = product
     in_place, spare = in_place and PREPARE_IN_PLACE and owned and not keep_x and len(first) == 1 and hasattr(providers[next(iter(first.values()))], "prepare_in_place"), None
     for key, module in first.items():  # after the LoRA products, which read x
+        if forms is not None and key in forms:
+            prepared[key] = forms[key]
+            continue
         found = providers[module].prepare_in_place(module, x) if in_place else None
         prepared[key], spare = found if found is not None else (providers[module].prepare(module, x), None)
     linear_input = LinearInput(shape, x if keep_x else None, prepared, providers, lora)
@@ -4513,6 +4712,17 @@ class offload:
         self.ring_refused = None # the pinned pool's epoch at which that ring was refused: tried again after the next quiet point
         self.block_items = {}
         self.block_slots = {} # model id -> [VRAM slot (None until used), entry name using it or None, slot size] for its swapped blocks
+        self.slot_ranks = {} # model id -> rank of each swapped block, whose slot is the rank modulo the slots for a model with CUDA graphs
+        # model id -> the pool of the weights that its CUDA graphs kept between generations read (cuda_graphs.GRAPH_CACHE): its slots and the
+        # buffers of its blocks kept in VRAM (kept_buffers)
+        self.slot_pools = {}
+        self.slots_suspended = set() # models whose pool gave its VRAM back with their kept graphs: mapped again at its next use
+        self.suspendable = False # suspend() was used: the models keep their CUDA graphs when they unload, their slots in the pool kept with them
+        # The blocks kept in VRAM (and the bases) of a model with that pool get the same tensors at the same addresses at each load of their
+        # model, so that the graphs kept for them replay: entry name -> [VRAM buffer, layout items, parameters as views of the buffer] for a
+        # block moved as one buffer, entry name -> (its parameters, {index: tensor}) for the tensors moved one by one
+        self.kept_buffers, self.kept_tensors = {}, {}
+        self.kept_loaded = set() # entries loaded into their kept tensors since their pool was last resumed: the others leave at its suspension
         self.slot_views = {} # (entry name, slot number) -> the parameters of the block as views of the slot
         self.towers_per_model = {} # model id -> names of its towers, the recurrent blocks for which the VRAM slots are sized
         self.shuttle_sizes = {} # model id -> size of the largest block of its towers
@@ -4787,12 +4997,26 @@ class offload:
             region, items, (_, offsets, nbytes) = staged
         slot = self._take_slot(entry_name, nbytes) if CACHED_BLOCK_VIEWS else None
         model_id, block_name = entry_name.split("/", 1)
-        adopted = self.adopt_slot(model_id, nbytes) if slot is None and self.auto_preload is not None and self.auto_preload.keeps_all(model_id, block_name) else None
+        kept = self._kept_buffer(entry_name, items, nbytes) if slot is None else None
+        adopted = self.adopt_slot(model_id, nbytes) if slot is None and kept is None and self.auto_preload is not None and self.auto_preload.keeps_all(model_id, block_name) else None
+        # a block kept in VRAM of a model with CUDA graphs: a held buffer, suspended when the block leaves VRAM (memory pressure, the model
+        # unloaded) and refilled at the same addresses when it comes back, so that its graphs replay; otherwise, when its graphs may be kept
+        # for its next generations, its buffer in the pool kept with them
+        held = slot is None and kept is None and adopted is None and self._held_blocks(model_id) and self._kept_in_vram(model_id, block_name)
+        pool = self._graph_pool(model_id) if slot is None and kept is None and not held and self._kept_in_vram(model_id, block_name) else None
         self.transfers = self.transfers + 1
         timed = self.transfers % PCIE_TIMED_TRANSFERS == 0 and model_id in self.cpu_compute and not torch.cuda.is_current_stream_capturing()
         from . import allocator
         with torch.cuda.stream(stream), allocator.weight_allocations():
-            buffer = self.block_slots[model_id][slot][0] if slot is not None else adopted if adopted is not None else torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+            if slot is not None or kept is not None or adopted is not None:
+                buffer = self.block_slots[model_id][slot][0] if slot is not None else kept[0] if kept is not None else adopted
+            elif held:
+                with torch.inference_mode(False):  # as the slots: blocks are also loaded outside inference mode
+                    buffer = allocator.held_empty(nbytes, weight=True)
+            else:
+                # a kept buffer is not an inference tensor, as blocks are also loaded outside inference mode (as the slots)
+                with torch.inference_mode(pool is None and torch.is_inference_mode_enabled()), allocator.pool_allocations(pool, weights=True):
+                    buffer = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
             if timed:
                 start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 start.record(stream)
@@ -4804,8 +5028,14 @@ class offload:
             if timed:
                 end.record(stream)
                 _pcie_timed.append((nbytes, start, end))
+        if kept is not None:
+            return kept[2]
         if slot is None:
-            return {index: _ring_view(t, buffer, offsets, 0) for index, t in items}
+            views = {index: _ring_view(t, buffer, offsets, 0) for index, t in items}
+            if held or pool is not None and allocator.in_pool(buffer, pool):  # also an adopted slot of the pool
+                self.kept_buffers[entry_name] = [buffer, items, views]
+                self.kept_loaded.add(entry_name)
+            return views
         views = self.slot_views.get((entry_name, slot), None)
         if views is None or views[0] is not items: # built once per slot, unless the block was laid out again
             views = self.slot_views[(entry_name, slot)] = (items, {index: _ring_view(t, buffer, offsets, 0) for index, t in items})
@@ -4818,25 +5048,65 @@ class offload:
         if block_name in self.preloaded_blocks_per_model[model_id] or self.auto_preload is not None and self.auto_preload.own_buffer(model_id, block_name):
             return None # a resident block, or one the automatic preload keeps once transferred or streams without slots
         slots = self.block_slots.get(model_id, None)
+        towers = tuple(model_id + "/" + name for name in self.towers_per_model[model_id])
         if slots is None: # [buffer, entry name using it, size], sized for the swapped blocks of the towers, the buffer allocated when used
-            towers = tuple(model_id + "/" + name for name in self.towers_per_model[model_id])
             swapped = [entry for entry in self.prev_blocks_names if entry.startswith(towers) and entry.split("/", 1)[1] not in self.preloaded_blocks_per_model[model_id]]
             size = max((self._block_items(entry)[1][2] for entry in swapped), default=0)
             slots = self.block_slots[model_id] = [[None, None, size] for _ in range(self.model_prefetch_window(model_id) + 1)]
         if nbytes > slots[0][2]: # a larger block outside the towers keeps a buffer of its own, which the idle slots make room for
+            from . import allocator
+            freed = False
             for slot_no, slot in enumerate(slots):
                 if slot[1] is None and slot[0] is not None:
+                    held = allocator.held_mapped(slot[0])
+                    if held is not None:  # a held slot: its VRAM goes back, its addresses and views stay for the graphs that read them
+                        if held:
+                            allocator.suspend_held(slot[0])
+                        continue
+                    slot[0], freed = None, True
+                    self.slot_views = {key: views for key, views in self.slot_views.items() if key[1] != slot_no or not key[0].startswith(model_id + "/")}
+            if freed:  # in the pool of the weights kept for CUDA graphs, their VRAM goes back
+                self.trim_graph_pool(model_id)
+            return None
+        # A model with CUDA graphs: a graph reads its block's weights at the addresses of its capture, so a block takes the same slot at each
+        # pass (its rank among the swapped blocks, modulo the slots), and the entries outside the towers, which the passes do not all load
+        # (a KV prefix pass skips some), keep the slots to the blocks: their own buffers. Otherwise a block would land in the other slot after
+        # such a pass, and capture its graphs once more for each slot.
+        graphed = model_id in self.cuda_graphs
+        if graphed and not entry_name.startswith(towers):
+            return None
+        self._resume_slots(model_id)
+        slots = self.block_slots.get(model_id, None)
+        if slots is None: # its kept slots could not get their VRAM back
+            return self._take_slot(entry_name, nbytes)
+        from . import allocator
+        order = range(len(slots))
+        if graphed:
+            ranks = self.slot_ranks.get(model_id)
+            if ranks is None or entry_name not in ranks:
+                swapped = [entry for entry in self.prev_blocks_names if entry.startswith(towers) and entry.split("/", 1)[1] not in self.preloaded_blocks_per_model[model_id]]
+                ranks = self.slot_ranks[model_id] = {entry: rank for rank, entry in enumerate(swapped)}
+            if entry_name in ranks:
+                first = ranks[entry_name] % len(slots)
+                order = [first] + [slot_no for slot_no in range(len(slots)) if slot_no != first]
+        for slot_no in order:
+            slot = slots[slot_no]
+            if slot[1] is None:
+                if slot[0] is not None and allocator.held_mapped(slot[0]) is False and not allocator.resume_held(slot[0]):
+                    # a held slot suspended to make room, which VRAM cannot map again: a new one, its views and graphs with it
                     slot[0] = None
                     self.slot_views = {key: views for key, views in self.slot_views.items() if key[1] != slot_no or not key[0].startswith(model_id + "/")}
-            return None
-        for slot_no, slot in enumerate(slots):
-            if slot[1] is None:
                 if slot[0] is None:
-                    # in the pool of the block buffers, whose memory it can then reuse; not an inference tensor, as blocks are also loaded
-                    # outside inference mode
-                    from . import allocator
-                    with torch.inference_mode(False), torch.cuda.stream(self.transfer_stream), allocator.weight_allocations():
-                        slot[0] = torch.empty(slot[2], dtype=torch.uint8, device="cuda")
+                    # a model with CUDA graphs: a held buffer, suspended when it makes room or the model unloads, at the same addresses when it
+                    # comes back (its views and their graphs stay valid). Otherwise in the pool of the block buffers, whose memory it can then
+                    # reuse, or with CUDA graphs kept between generations in the pool of the model's weights kept with them. Not an inference
+                    # tensor, as blocks are also loaded outside inference mode
+                    with torch.inference_mode(False):
+                        if self._held_blocks(model_id):
+                            slot[0] = allocator.held_empty(slot[2], weight=True)
+                        else:
+                            with torch.cuda.stream(self.transfer_stream), allocator.weight_allocations(), allocator.pool_allocations(self._graph_pool(model_id), weights=True):
+                                slot[0] = torch.empty(slot[2], dtype=torch.uint8, device="cuda")
                 slot[1] = entry_name
                 return slot_no
         return None
@@ -4847,6 +5117,7 @@ class offload:
         buffers beside them. entry_name: the slot holding that block, otherwise (None) an idle one, for a block of nbytes at least 3/4 of the
         slot's size (the slots are sized for the largest block: a much smaller block would leave most of it unused). Returns its buffer,
         None if there is none."""
+        self._resume_slots(model_id)
         slots = self.block_slots.get(model_id)
         if not slots:
             return None
@@ -4854,12 +5125,191 @@ class offload:
         slot_no = next((i for i, slot in enumerate(slots) if slot[1] == entry_name and fits(slot)), None)
         if slot_no is None:
             return None
+        from . import allocator
+        if allocator.held_mapped(slots[slot_no][0]) is False and not allocator.resume_held(slots[slot_no][0]):  # suspended, no room to map it again
+            return None
         buffer = slots.pop(slot_no)[0]
+        views = self.slot_views.get((entry_name, slot_no)) if entry_name is not None else None
+        pool = self.slot_pools.get(model_id)
+        if views is not None and pool is not None and self._graph_pool(model_id) is not None:  # the block keeps its tensors in the slot it takes
+            self.kept_buffers[entry_name] = [buffer, views[0], views[1]]
+            self.kept_loaded.add(entry_name)
         # the numbers of the slots that follow change: their views are rebuilt when used
         self.slot_views = {key: views for key, views in self.slot_views.items() if not key[0].startswith(model_id + "/")}
         if not slots:
             del self.block_slots[model_id]  # made again, sized for the streamed blocks, if a later plan streams some
         return buffer
+
+    def _graph_pool(self, model_id):
+        # the pool of the model's weights that its CUDA graphs kept between generations read (slots, buffers of the blocks kept in VRAM), made
+        # when first used; None when no graph is kept (cuda_graphs.GRAPH_CACHE 0, no graphs for the model, another allocator)
+        from . import allocator
+        if _cuda_graphs().GRAPH_CACHE <= 0 and not self.suspendable or model_id not in self.cuda_graphs or allocator.active != "vmm":
+            return None
+        pool = self.slot_pools.get(model_id)
+        if pool is None:
+            pool = self.slot_pools[model_id] = torch.cuda.graph_pool_handle()
+        return pool
+
+    def _held_views(self, stream, entry_name):
+        # a base or block kept in VRAM of a model with CUDA graphs, loaded tensor by tensor: its parameters copied into the views of its held
+        # buffer, laid out as a block moved as one buffer (kept_buffers), the same tensors at each of its loads. None if it has none to place
+        items, (_, offsets, nbytes), _ = self._block_items(entry_name)
+        if not items:
+            return None
+        kept = self._kept_buffer(entry_name, items, nbytes)
+        if kept is None:
+            from . import allocator
+            with torch.inference_mode(False):  # as the slots: blocks are also loaded outside inference mode
+                buffer = allocator.held_empty(nbytes, weight=True)
+                views = {index: _ring_view(t, buffer, offsets, 0) for index, t in items}
+            kept = self.kept_buffers[entry_name] = [buffer, items, views]
+            self.kept_loaded.add(entry_name)
+        with torch.cuda.stream(stream):
+            for index, t in items:
+                for target, source in zip(_staging_leaves(kept[2][index]), _staging_leaves(t)):
+                    target.copy_(source, non_blocking=True)
+        return kept[2]
+
+    def _kept_pool(self, model_id):
+        # the pool of the model's weights moved one by one kept at the same addresses at each load (kept_tensors): with its graphs kept between
+        # generations (_graph_pool), or for a model whose blocks are held (tensors that a block's buffer cannot hold: classes not rebuilt from
+        # their inner tensors), so that its graphs replay after a partial unload. It is suspended or dropped with the model's slots at unload
+        pool = self._graph_pool(model_id)
+        if pool is None and self._held_blocks(model_id):
+            pool = self.slot_pools.get(model_id)
+            if pool is None:
+                pool = self.slot_pools[model_id] = torch.cuda.graph_pool_handle()
+        return pool
+
+    def _purge_kept_if_ram_short(self, keep=()):
+        # a quiet point (an unload, a load): under GRAPH_CACHE_RAM_SHARE of available RAM, the graphs kept for the models not loaded go
+        if self.cuda_graphs and psutil.virtual_memory().available < GRAPH_CACHE_RAM_SHARE * physical_memory:
+            from .cuda_graphs import purge_kept
+            cleared = purge_kept([self.cuda_graphs[model_id] for model_id in keep if model_id in self.cuda_graphs])
+            if cleared and self.verboseLevel >= 1:
+                tqdm.write(f"[MMGP] RAM is short: the CUDA graphs kept for {cleared} unloaded model(s) were dropped.")
+
+    def _held_entry(self, entry_name):
+        # a base or block whose kept buffer is a held buffer
+        from . import allocator
+        kept = self.kept_buffers.get(entry_name)
+        return kept is not None and allocator.held_mapped(kept[0]) is not None
+
+    def _held_blocks(self, model_id):
+        # the blocks the model keeps in VRAM are on held buffers (HELD_BLOCKS): a model with CUDA graphs, with the VMM allocator
+        from . import allocator
+        return HELD_BLOCKS and allocator.active == "vmm" and model_id in self.cuda_graphs
+
+    def _kept_in_vram(self, model_id, block_name):
+        # the base of the model (None), or a block that stays in VRAM once loaded
+        return block_name is None or block_name in self.preloaded_blocks_per_model[model_id] or self.auto_preload is not None and self.auto_preload.own_buffer(model_id, block_name)
+
+    def _kept_buffer(self, entry_name, items, nbytes):
+        # the buffer and tensors a block kept in VRAM had at the model's last load (kept_buffers), its pool given its VRAM back if suspended; None
+        # if there are none, or the block was laid out again since (other tensors: new ones, and new graphs)
+        kept = self.kept_buffers.get(entry_name)
+        if kept is None:
+            return None
+        if kept[1] is not items or kept[0].numel() < nbytes:
+            self._drop_kept(entry_name)
+            return None
+        from . import allocator
+        if allocator.held_mapped(kept[0]) is False and not allocator.resume_held(kept[0]):  # suspended, and VRAM has no room for it here
+            self._drop_kept(entry_name)
+            return None
+        self._resume_slots(entry_name.split("/", 1)[0])
+        kept = self.kept_buffers.get(entry_name)  # gone if the pool could not get its VRAM back
+        if kept is not None:
+            self.kept_loaded.add(entry_name)
+        return kept
+
+    def _kept_tensors(self, model_id, entry_name, blocks_params):
+        # the tensors moved one by one that a base or block kept in VRAM had at the model's last load, as _kept_buffer: {index: tensor}, {} for
+        # an entry kept from now on, None for an entry not kept
+        if self._kept_pool(model_id) is None or not self._kept_in_vram(model_id, None if entry_name == model_id else entry_name.split("/", 1)[1]):
+            return None
+        kept = self.kept_tensors.get(entry_name)
+        if kept is not None and kept[0] is not blocks_params:
+            self._drop_kept(entry_name)
+            kept = None
+        if kept is not None:
+            self._resume_slots(model_id)
+            kept = self.kept_tensors.get(entry_name)
+        if kept is None:
+            kept = self.kept_tensors[entry_name] = (blocks_params, {})
+        self.kept_loaded.add(entry_name)
+        return kept[1]
+
+    def _drop_kept(self, entry_name, trim=True):
+        # a base or block kept in VRAM leaves it while its model stays loaded (memory pressure, another preload plan), or its model's graphs
+        # go: its buffer is freed and its pool gives the VRAM back (the graphs that read its tensors never replay again: their keys name them)
+        self.kept_loaded.discard(entry_name)
+        found = self.kept_buffers.pop(entry_name, None) is not None
+        found = self.kept_tensors.pop(entry_name, None) is not None or found
+        if found and trim:
+            self.trim_graph_pool(entry_name.split("/", 1)[0])
+
+    def trim_graph_pool(self, model_id):
+        # the VRAM of the buffers freed in the pool of the model's kept weights goes back to the driver (a device synchronization)
+        pool = self.slot_pools.get(model_id)
+        if pool is not None:
+            from . import allocator
+            allocator.trim_pool(pool)
+
+    def _kept_of(self, model_id):
+        return [entry for entry in {*self.kept_buffers, *self.kept_tensors} if entry.split("/", 1)[0] == model_id]
+
+    def _suspend_slots(self, model_id):
+        # the model unloads and keeps CUDA graphs that read its weights in its slots and in the buffers of its blocks kept in VRAM: they stay,
+        # with their views, their VRAM given back to the driver at the same addresses (mapped again at their next use, _resume_slots). The
+        # buffers of the blocks not loaded since the pool was last resumed (another plan) go (the pool's suspension trims their memory)
+        from . import allocator
+        if model_id in self.slots_suspended:  # since an earlier unload
+            return True
+        for entry in self._kept_of(model_id):  # a held buffer stays (suspended, no VRAM): its block may be kept in VRAM again by a later plan
+            if entry not in self.kept_loaded and not self._held_entry(entry):
+                self._drop_kept(entry, trim=False)
+        pool = self.slot_pools.get(model_id)
+        slots = self.block_slots.get(model_id, ())
+        if pool is None:  # only held buffers (suspended with their blocks, held slots) keep what its graphs read: nothing else to suspend
+            if any(slot[0] is not None and allocator.held_mapped(slot[0]) is None for slot in slots) or any(not self._held_entry(entry) for entry in self._kept_of(model_id)):  # all() is this module's profile function
+                return False
+        elif allocator.pool_live(pool) and not allocator.suspend_pool(pool):  # an empty pool (its buffers replaced by held ones) has nothing to keep
+            return False
+        for slot in slots:  # the model's blocks are all unloaded: held slots give their VRAM back, their addresses and views stay
+            slot[1] = None
+            if slot[0] is not None and allocator.held_mapped(slot[0]):
+                allocator.suspend_held(slot[0])
+        self.kept_loaded.difference_update(self._kept_of(model_id))
+        self.slots_suspended.add(model_id)
+        return True
+
+    def _resume_slots(self, model_id):
+        if model_id not in self.slots_suspended:
+            return
+        from . import allocator
+        self.slots_suspended.discard(model_id)
+        # the blocks the preload plan does not keep in VRAM this time leave first: only the memory their model uses comes back
+        for entry in self._kept_of(model_id):
+            if entry != model_id and not self._kept_in_vram(model_id, entry.split("/", 1)[1]) and not self._held_entry(entry):
+                self._drop_kept(entry)
+        pool = self.slot_pools.get(model_id)
+        with torch.cuda.stream(self.transfer_stream):  # the stream that fills them waits for the work on the memory it gets
+            resumed = pool is None or allocator.resume_pool(pool)
+        if not resumed:  # VRAM has no room for them: new slots and buffers, and new graphs for their blocks
+            if self.verboseLevel >= 1:
+                tqdm.write(f"[MMGP] The weights of '{model_id}' kept for its CUDA graphs could not get their VRAM back: loaded elsewhere, graphs captured again.")
+            self._drop_slots(model_id)
+            self.cuda_graphs[model_id].clear()
+
+    def _drop_slots(self, model_id):
+        self.block_slots.pop(model_id, None)
+        for entry in self._kept_of(model_id):
+            self._drop_kept(entry, trim=False)
+        self.slots_suspended.discard(model_id)
+        self.slot_pools.pop(model_id, None)
+        self.slot_views = {key: views for key, views in self.slot_views.items() if key[0].split("/", 1)[0] != model_id}
 
     def _free_slot(self, entry_name):
         slots = self.block_slots.get(entry_name.split("/", 1)[0], None)
@@ -5392,6 +5842,11 @@ class offload:
                 loras_model_data =  getattr(model, "_loras_model_data", None)
 
             from . import allocator
+            if moved is None and self._held_blocks(model_id) and self._kept_in_vram(model_id, blocks_name):
+                moved = self._held_views(stream_to_use, entry_name)  # as a block moved as one buffer: the same tensors at each load
+            # a base or block kept in VRAM whose model's CUDA graphs may be kept: its tensors moved one by one are the same at each load
+            kept = self._kept_tensors(model_id, entry_name, blocks_params) if moved is None or len(moved) < len(blocks_params) else None
+            pool = self.slot_pools.get(model_id) if kept is not None else None
             with torch.cuda.stream(stream_to_use), allocator.weight_allocations(): # weights: the attention kit's measures of VRAM leave them out
                 for i, param in enumerate(blocks_params):
                     parent_module, n, p, is_buffer, tied_param = param
@@ -5410,6 +5865,11 @@ class offload:
 
                     if moved is not None and i in moved:
                         q = self.stager.checked(p, moved[i])
+                    elif kept is not None and i in kept:
+                        q = self.stager.to_gpu(p, parallel_staging, model_id not in self.pool_models, out=kept[i])
+                    elif kept is not None: # in the pool kept with the graphs; not an inference tensor, as blocks are also loaded outside inference mode
+                        with torch.inference_mode(False), allocator.pool_allocations(pool, weights=True):
+                            q = kept[i] = self.stager.to_gpu(p, parallel_staging, model_id not in self.pool_models)
                     else:
                         q = self.stager.to_gpu(p, parallel_staging, model_id not in self.pool_models) # the pool's blocks enter it locked in place
                     if not is_buffer:
@@ -5510,7 +5970,8 @@ class offload:
         return builtins.all(getattr(parent_module, n).is_cuda for parent_module, n, *_ in self.blocks_of_modules[model_id + "/" + blocks_name][-1:])
 
     @torch.compiler.disable()
-    def gpu_unload_blocks(self, model_id, blocks_name):
+    def gpu_unload_blocks(self, model_id, blocks_name, keep_buffer=False):
+        # keep_buffer: the model unloads, a block kept in VRAM keeps its buffer and tensors for its next load (kept_buffers)
         # cl = clock.start()
         entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
         self.wait_prefetch(entry_name) # a prefetch of this block may still be setting its parameters
@@ -5544,12 +6005,21 @@ class offload:
 
         if len(loras_modules) > 0:
             self._move_loras(loras_active_adapters, loras_modules, False, model)
+        from . import allocator
+        kept = self.kept_buffers.get(entry_name)
+        held = None if kept is None else allocator.held_mapped(kept[0])
+        if held is not None:  # a held buffer: its VRAM goes back (if not already), its addresses and tensors stay for the block's next load
+            if held:
+                allocator.suspend_held(kept[0])
+        elif not keep_buffer and (entry_name in self.kept_buffers or entry_name in self.kept_tensors):
+            self._drop_kept(entry_name)
 
         # cl.stop()
         # print(f"unload time: {cl.format_time_gap()}")
 
     # @torch.compiler.disable()
     def gpu_load(self, model_id):
+        self._purge_kept_if_ram_short([model_id])
         from .auto_preload import end_open_cycles
         end_open_cycles(self, model_id)  # the VRAM this model takes is not the activations of the cycles other models left open
         self.pages_dropped.discard(model_id)
@@ -5584,6 +6054,26 @@ class offload:
             self._unpark()
             self._unload(keep)
 
+    def make_suspendable(self):
+        """Its models keep their CUDA graphs when they unload (suspend, unload_all), with what the graphs read at the same addresses, until
+        release(). Call it before the models first run: their graphs then own their buffers (in their pools, kept with them) instead of
+        borrowing the callers' tensors, and their slots join the pool of their weights; graphs captured before are dropped."""
+        self.suspendable = True
+        for graphs in self.cuda_graphs.values():
+            if not graphs.keeping:
+                graphs.keeping = True
+                graphs.clear()
+
+    def suspend(self):
+        """Its models leave VRAM as with unload_all() and give the same VRAM back, keeping what their CUDA graphs read so that they replay at
+        their next load instead of being captured again: the graphs (their pools' VRAM given back, their addresses kept, their executables
+        dropped once other graphs need room), the held buffers of the blocks kept in VRAM and the pool of their other weights (VRAM given
+        back, addresses and tensors kept), the streaming slots (make_suspendable, which a first suspend calls if needed)."""
+        with self.park_lock:
+            self.make_suspendable()
+            self._unpark()
+            self._unload()
+
     def park(self, release="models", state_bytes=0):
         """Its models stay loaded while other models or code use the GPU (another offload object, a model outside MMGP): their VRAM is
         reclaimed, from the allocating thread, only as allocations need it (mmgp.memory_pressure), before the VRAM of the models running:
@@ -5602,6 +6092,10 @@ class offload:
                 self.auto_preload.on_park()
             self.parked, self.park_release, self.park_state_bytes, self.parked_size = True, release, state_bytes, None
             memory_pressure.park(self)
+            from .cuda_graphs import owners_changed
+            for graphs in self.cuda_graphs.values():
+                graphs.parked = True
+            owners_changed()  # the graphs of its models idle: their executables give their VRAM to the next graphs made
         return True
 
     def unpark(self):
@@ -5616,6 +6110,8 @@ class offload:
             self.parked, self.park_release, self.park_state_bytes, self.parked_size = False, None, 0, None
             self.pages_dropped.clear() # its models run again without a gpu_load: their pages may come back
             memory_pressure.unpark(self)
+            for graphs in self.cuda_graphs.values():
+                graphs.parked = False
 
     def last_used(self):
         return builtins.max((self.used.get(model_id, 0) for model_id in self.active_models_ids), default=0)
@@ -5688,9 +6184,9 @@ class offload:
         for model_id in self.active_models_ids:
             if model_id in keep:
                 continue
-            self.gpu_unload_blocks(model_id, None)
+            self.gpu_unload_blocks(model_id, None, keep_buffer=True)
             for block_name in self.preloaded_blocks_per_model[model_id]:
-                self.gpu_unload_blocks(model_id, block_name)
+                self.gpu_unload_blocks(model_id, block_name, keep_buffer=True)
 
             loaded_block = self.loaded_blocks[model_id]
             if loaded_block != None:
@@ -5711,12 +6207,16 @@ class offload:
 
         if self.auto_preload is not None:
             self.auto_preload.on_unload([model_id for model_id in self.active_models_ids if model_id not in keep])
-        for model_id in [model_id for model_id in self.block_slots if model_id not in keep]:
-            del self.block_slots[model_id]
-        for model_id, graphs in self.cuda_graphs.items():
-            if model_id not in keep:
-                graphs.clear()
+        # the graphs kept for the next generations (cuda_graphs.GRAPH_CACHE) give their VRAM back, the others go; so do the slots they read
+        kept = {model_id for model_id, graphs in self.cuda_graphs.items() if model_id not in keep and graphs.suspend(keep=self.suspendable)}
+        for model_id, residency in self.expert_residency.items():  # the job buffers and the table of addresses its graphs read: kept with them
+            if model_id not in keep and model_id not in kept:
+                residency.release_execution()
+        for model_id in [model_id for model_id in {*self.block_slots, *self.slot_pools} if model_id not in keep]:
+            if not (model_id in kept and self._suspend_slots(model_id)):
+                self._drop_slots(model_id)
         runtime._unload_resources(self, [model_id for model_id in self.active_models_ids if model_id not in keep])
+        self._purge_kept_if_ram_short(keep)
         self.slot_views = {key: views for key, views in self.slot_views.items() if key[0].split("/", 1)[0] in self.block_slots}
         self.active_models_ids = [model_id for model_id in self.active_models_ids if model_id in keep]
         self.active_models = [self.models[model_id] for model_id in self.active_models_ids]
@@ -5795,43 +6295,31 @@ class offload:
 
 
     def _lora_generic_forward(self, model, submodule, loras_data, func, *args, **kwargs) -> torch.Tensor:
-
-        weight = submodule.weight 
-        bias =  getattr(submodule, "bias", None) 
-        original_weight = None 
-        original_bias = None
-        active_adapters = model._loras_active_adapters
-        loras_scaling = model._loras_scaling
-        first_weight =  True
-        first_bias =  True
-        for active_adapter in active_adapters:
+        """A module other than a linear (a norm, a convolution) with full differences (.diff, stored where a LoRA's B goes, and .diff_b): its
+        weight and bias get them for this call, then their values back in place. They keep their storage: a CUDA graph captured here reads it
+        at each replay, and a copy made during the capture would live in the graph's pool (overwritten after it)."""
+        changes = []
+        for active_adapter in model._loras_active_adapters:
             data = loras_data.get(active_adapter + '_GPU', None)
-            if data == None:
+            if data is None:
                 continue
-            diff_w, _, diff_b, _, alpha = data[:5]
-            scaling = self._get_lora_scaling( loras_scaling, model, active_adapter) * alpha
+            scaling = self._get_lora_scaling(model._loras_scaling, model, active_adapter) * data[4]
             if scaling == 0:
                 continue
-            if first_weight:
-                original_weight= weight.clone() if weight is not None else None
-                first_weight = False
-            if first_bias:
-                original_bias= bias.clone() if bias is not None else None
-                first_bias = False
-
-            if diff_w is not None:
-                weight.add_(diff_w, alpha= scaling)
-                diff_w = None
-            if diff_b is not None:
-                bias.add_(diff_b, alpha= scaling)
-                diff_b = None
-
-        ret = func(*args, **kwargs )
-
-        if original_weight is not None: weight.data  = original_weight    
-        if original_bias is not None: bias.data = original_bias
-
-        return ret
+            if data[5].get("type", "lora") == "diff" and data[1] is not None:
+                changes.append((submodule.weight, data[1], scaling))
+            if data[2] is not None:
+                changes.append((submodule.bias, data[2], scaling))
+        if not changes:
+            return func(*args, **kwargs)
+        saved = {id(tensor): (tensor, tensor.clone()) for tensor, _, _ in changes}
+        for tensor, diff, scaling in changes:
+            tensor.add_(diff, alpha=scaling)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            for tensor, value in saved.values():
+                tensor.copy_(value)
 
 
     def _dora_linear_forward(
@@ -6673,6 +7161,11 @@ def {fname}(module, *args, **kwargs):
             return
 
         self.unload_all()
+        runtime._released(self)  # the owners of state kept beside its models (an engine suspended with them) free it
+        for model_id in builtins.list({*self.block_slots, *self.slot_pools}): # slots and buffers kept with CUDA graphs for the next generations
+            self._drop_slots(model_id)
+        for entry in builtins.list({*self.kept_buffers, *self.kept_tensors}): # the held buffers of the models without a weights pool
+            self._drop_kept(entry, trim=False)
         for handle in self.expert_hooks:
             handle.remove()
         self.expert_hooks.clear()
@@ -7144,7 +7637,8 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
             from .cuda_graphs import BlockGraphs
             graphs = self.cuda_graphs[model_id] = BlockGraphs(model_id, functools.partial(self._graph_weights_key, current_model), functools.partial(self._graph_weight_tensors, current_model),
                                                               functools.partial(self._graph_lora_inputs, current_model), functools.partial(self._graph_ready, model_id),
-                                                              functools.partial(self._graph_forget, current_model))
+                                                              functools.partial(self._graph_forget, current_model),
+                                                              verbose=self.verboseLevel, alive=_graph_weights_alive)
             towers_set = set(towers_modules)
 
         loading_phase("Hooks and LoRA Slots", model_id)
@@ -7367,6 +7861,9 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
 
     message = f" Applying MMGP Memory Profile {int(profile_no)} - {profile_type.tostr(profile_no)} (v{__version__}) "
     tqdm.write(f"\033[1m\033[95m{message:*^100}\033[0m")
+    if torch.cuda.is_available():  # before any capture: the default generator's capture state made outside inference mode
+        from .cuda_graphs import anchor_generator_state
+        anchor_generator_state()
 
     verboseLevel = _compute_verbose_level(verboseLevel)
 

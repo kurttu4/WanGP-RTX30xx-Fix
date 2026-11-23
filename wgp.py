@@ -6,7 +6,7 @@ _restart_launch = supervise() if __name__ == "__main__" else False
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "20.00"
+WanGP_version = "20.11"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -100,7 +100,7 @@ from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entr
 from shared.utils import video_continuation
 from shared.utils.frame_scheduler import resolve_window_geometry, SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
 from shared.match_archi import match_nvidia_architecture
-from shared.attention import ATTENTION_MODE_AVAILABILITY, get_attention_modes, get_supported_attention_modes, get_default_attention_mode, get_override_attention_modes, get_supported_override_attention_modes
+from shared.attention import ATTENTION_MODE_AVAILABILITY, sagegp_ready, sage_gp_redirect, get_attention_modes, get_supported_attention_modes, get_default_attention_mode, get_override_attention_modes, get_supported_override_attention_modes
 from shared.utils.utils import truncate_for_filesystem, sanitize_file_name, process_images_multithread, get_default_workers, resize_lanczos_frames, expand_or_shrink_mask, prepare_binary_mask_frame
 from shared.utils.process_locks import (
     acquire_GPU_ressources,
@@ -244,6 +244,7 @@ reload_needed = True
 _HANDLER_MODULES = [
     "shared.qtypes.scaled_fp8",
     "shared.qtypes.nvfp4",
+    "shared.qtypes.mxfp8",
     "shared.qtypes.bnb_nf4",
     "shared.qtypes.nunchaku_int4",
     "shared.qtypes.nunchaku_fp4",
@@ -2925,12 +2926,13 @@ if not Path(config_load_filename).is_file():
         "text_encoder_quantization" : "int8",
         "save_path": "outputs",  
         "image_save_path": "outputs",  
-        "compile" : "disabled",
+        "compile" : "cudagraph",
         "metadata_type": "metadata",
         "boost" : 1,
         "int8_kernels": "auto",
         "fp8_kernels": "auto",
         "kernel_precision": "fast",
+        "sage2_first_step_precise": kernel_policy.SAGE2_FIRST_STEP_PRECISE_DEFAULT,
         attention_kit.CHUNKER_CONFIG_KEY: attention_kit.CHUNKER_DEFAULT,
         "clear_file_list" : 5,
         "keep_intermediate_sliding_windows": 1,
@@ -3640,6 +3642,7 @@ def init_model_def(model_type, model_def):
     plugin_id = model_plugin_ids_by_architecture.get(base_model_type, "")
     if plugin_id:
         default_model_def["_plugin_id"] = plugin_id
+    app.plugin_manager.add_custom_settings(model_type, base_model_type, default_model_def)
     return _store_model_metadata(model_type, default_model_def)
 
 
@@ -3752,16 +3755,23 @@ default_profile_image = force_profile_no if force_profile_no >= 0 else server_co
 default_profile_audio = force_profile_no if force_profile_no >= 0 else server_config["audio_profile"]
 default_profile = default_profile_video
 loaded_profile = force_profile_no = -1
-compile = server_config.get("compile", "disabled")
+def _graph_compile(value):
+    """"auto" (CUDA graphs where they save time, a choice that existed before graphs were always captured) saved in a config or an
+    override is "cudagraph" now."""
+    return "cudagraph" if value == "auto" else value
+
+
+compile = server_config["compile"] = _graph_compile(server_config.get("compile", "cudagraph"))
 transformer_quantization_choices = [("Scaled Int8 (recommended)", "int8"), ("Scaled Fp8", "fp8"), ("16-bit (no quantization)", "bf16")]
 text_encoder_quantization_choices = [("16-bit (more RAM, better quality)", "bf16"), ("8-bit (less RAM, slightly lower quality)", "int8")]
-compile_choices = [("Disabled", "disabled"),("CUDA Graph (faster short steps, the first steps of a new resolution are slightly slower)", "cudagraph"), ("PyTorch Compilation (up to 10% faster, very slow compilation, requires Triton, to be deprecated)", "transformer")]
+compile_choices = [("Disabled", "disabled"), ("CUDA Graph (faster short steps, the first steps of a new resolution are slightly slower)", "cudagraph"), ("PyTorch Compilation (up to 10% faster, very slow compilation, requires Triton, to be deprecated)", "transformer")]
 if args.compile:
     compile="transformer"
     lock_ui_compile = True
 if is_mps: compile = "disabled"
 boost = server_config.get("boost", 1)
 kernel_policy.configure(server_config.get("kernel_precision", "fast"))  # before the INT8 backend: Auto skips Comfy Kitchen with Preserve Precision
+kernel_policy.configure_sage2_first_step_precise(server_config.get("sage2_first_step_precise", kernel_policy.SAGE2_FIRST_STEP_PRECISE_DEFAULT))
 int8_kernels = server_config.get("int8_kernels", "auto")
 apply_int8_kernel_setting(int8_kernels)
 fp8_kernels = server_config.get("fp8_kernels", "auto")
@@ -4275,7 +4285,7 @@ def compute_profile(override_profile, output_type="video"):
 
 
 def compute_compile(override_compile, default_compile):
-    return "disabled" if is_mps else override_compile or default_compile
+    return "disabled" if is_mps else _graph_compile(override_compile) or default_compile
 
 def compute_quantization(overrides):
     return overrides.get("transformer_quantization") or transformer_quantization, overrides.get("text_encoder_quantization") or text_encoder_quantization
@@ -4705,17 +4715,20 @@ def generate_model_description(model_type):
 
 
 def generate_header(model_type, compile, attention_mode, overrides="", guidance_phases=1, video_prompt_type=""):
+    return generate_model_description(model_type), generate_attention_header(model_type, compile, attention_mode, overrides, guidance_phases, video_prompt_type)
+
+def generate_attention_header(model_type, compile, attention_mode, overrides="", guidance_phases=1, video_prompt_type=""):
     overrides = generation_overrides.parse_overrides(overrides)
     override_attention = overrides.get("attention_mode", "")
     compile = compute_compile(overrides.get("compilation", ""), compile)
-    description = generate_model_description(model_type)
     model_def = get_model_def(model_type) or {}
     full_filename = get_model_filename(model_type, compute_quantization(overrides)[0], transformer_dtype_policy)
     model_filename = os.path.basename(full_filename)
     model_attention = get_overridden_attention(model_type)
     overridden_attention = override_attention or model_attention
     attn_mode = attention_mode if overridden_attention is None else overridden_attention
-    header = "<DIV style='align:right;width:100%'><FONT SIZE=2>Attention mode <B>" + (attn_mode if attn_mode!="auto" else "auto/" + get_auto_attention() )
+    shown = (lambda mode: {"sage2": "sage2 gp", "sage3": "sage3 gp", "sageadaptative": "sage 2/3 adaptative gp"}.get(mode, mode)) if sagegp_ready else (lambda mode: mode)
+    header = "<DIV style='align:right;width:100%'><FONT SIZE=2>Attention mode <B>" + (shown(attn_mode) if attn_mode!="auto" else "auto/" + shown(get_auto_attention()))
     custom_attention = model_def.get("custom_attention_modes", {}).get(attn_mode)
     if custom_attention is not None:
         custom_status = ATTENTION_MODE_AVAILABILITY.get(attn_mode, {})
@@ -4756,7 +4769,7 @@ def generate_header(model_type, compile, attention_mode, overrides="", guidance_
         header += f", Max Recommended Res.: <B>{maximum}</B>"
     header += "</DIV>"
 
-    return description,header
+    return header
 
 def release_RAM():
     if gen_in_progress:
@@ -4807,6 +4820,8 @@ def build_callback(state, pipe, send_cmd, status, num_inference_steps, preview_m
     def callback(step_idx = -1, latent = None, force_refresh = True, read_state = False, override_num_inference_steps = -1, pass_no = -1, preview_meta=preview_meta, denoising_extra ="", progress_unit = None, status_prefix = "", progress_title = None):
         nonlocal denoising_start_time, estimated_total_time, last_refresh_time
         step_completed = step_idx >= 0
+        if progress_title is None and not read_state and (step_completed or force_refresh):  # the denoising step computed next
+            kernel_policy.set_denoising_step(step_idx + 1 if step_completed else 0, override_num_inference_steps if override_num_inference_steps > 0 else gen.get("num_inference_steps", 0))
         in_pause = False
         with gen_lock:
             process_status = gen.get("process_status", None)
@@ -7886,6 +7901,7 @@ def generate_media(
         perturbation_layers = None
 
     offload.shared_state["_attention_fallback"] = get_auto_attention() if attention_mode == "auto" else attention_mode
+    attn, kernel_policy.sage2_quality_override = sage_gp_redirect(attn)  # SageGP: sage3 and sageadaptative run its Fast and Adaptive modes
     offload.shared_state["_attention"] =  attn
     offload.shared_state["_sage_v_scaling"] = model_def.get("sage_v_scaling", False)
     device_mem_capacity = torch.cuda.get_device_properties(0).total_memory / 1048576
@@ -9664,7 +9680,6 @@ def prepare_generate_media(state):
 def generate_preview(model_type, payload):
     if isinstance(payload, (Image.Image, VideoPreview)):
         return payload
-    import einops
     if payload is None:
         return None
     if isinstance(payload, dict):
@@ -9690,28 +9705,22 @@ def generate_preview(model_type, payload):
     else:
         return None
     if latent_rgb_factors is None: return None
-    latents = latents.unsqueeze(0) 
-    nb_latents = latents.shape[2]
-    latents_to_preview = 4
-    latents_to_preview = min(nb_latents, latents_to_preview)
-    skip_latent =  nb_latents / latents_to_preview
-    latent_no = 0
-    selected_latents = []
+    # with NumPy, on this thread alone: PyTorch's CPU ops wake its pool of threads, which then spin and slow the denoising step running meanwhile
+    nb_latents = latents.shape[1]
+    skip_latent = nb_latents / min(nb_latents, 4)
+    latent_no, selected = 0, []
     while latent_no < nb_latents:
-        selected_latents.append( latents[:, : , int(latent_no): int(latent_no)+1])
-        latent_no += skip_latent 
-
-    latents = torch.cat(selected_latents, dim = 2)
-    weight = torch.tensor(latent_rgb_factors, device=latents.device, dtype=latents.dtype).transpose(0, 1)[:, :, None, None, None]
-    bias = torch.tensor(latent_rgb_factors_bias, device=latents.device, dtype=latents.dtype)
-
-    images = torch.nn.functional.conv3d(latents, weight, bias=bias, stride=1, padding=0, dilation=1, groups=1)
-    images = images.add_(1.0).mul_(127.5)
-    images = images.detach().cpu()
-    if images.dtype == torch.bfloat16:
-        images = images.to(torch.float16)
-    images = images.numpy().clip(0, 255).astype(np.uint8)
-    images = einops.rearrange(images, 'b c t h w -> (b h) (t w) c')
+        selected.append(int(latent_no))
+        latent_no += skip_latent
+    latents = latents.detach()
+    if latents.dtype == torch.bfloat16:  # NumPy has no BF16: its bits are the upper half of the FP32 value
+        latents = (latents.view(torch.int16).numpy()[:, selected].view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+    else:
+        latents = latents.numpy()[:, selected].astype(np.float32)
+    images = np.einsum("cthw,cr->rthw", latents, np.asarray(latent_rgb_factors, dtype=np.float32)) + np.asarray(latent_rgb_factors_bias, dtype=np.float32)[:, None, None, None]
+    images = ((images + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+    channels, frames, h, w = images.shape
+    images = images.transpose(2, 1, 3, 0).reshape(h, frames * w, channels)
     h, w, _ = images.shape
     scale = 200 / h
     images= Image.fromarray(images)
@@ -11902,7 +11911,6 @@ def change_model(state, model_choice, *, refresh_header=True):
         recorded = service.load_model_form(model_choice)
         if recorded is not None:
             set_model_settings(state, model_choice, recorded)
-    model_filename = get_model_filename(model_choice, transformer_quantization, transformer_dtype_policy)
     with config_lock:
         last_model_per_family = state["last_model_per_family"]
         last_model_per_family[get_model_family(model_choice, for_ui= True)] = model_choice
@@ -12448,7 +12456,7 @@ def get_prompt_infos(model_def):
 PROMPT_ADVANCED_ELEM_ID = "wangp-prompt-advanced"
 PROMPT_WIZARD_ELEM_ID = "wangp-prompt-wizard"
 RESOLUTION_ELEM_ID = "wangp-resolution"
-PROMPT_TOOLS_ATTACH_JS = "() => { requestAnimationFrame(() => requestAnimationFrame(() => { window.wangpPromptTools?.attach?.(document); window.wangpRefreshInputModes(); window.wangpRefreshSettingsTools(); window.wangpRefreshActionBars(); window.__wangpMagicMaskNS.scheduleMount(); })); }"
+PROMPT_TOOLS_ATTACH_JS = "() => window.wangpRefreshFormTools()"
 
 PROMPT_COPY_JS = "async (text) => { try { await navigator.clipboard.writeText(text); } catch (e) { const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.focus(); ta.select(); try { document.execCommand('copy'); } finally { document.body.removeChild(ta); } } }"
 
@@ -12637,13 +12645,18 @@ attention_modes_choices= [
     (f'flash{check_attn("flash")}: High quality, requires manual install', "flash"),
     (f'xformers{check_attn("xformers")}: Good quality, less VRAM, requires manual install', "xformers"),
     (f'sage{check_attn("sage")}: ~30% faster, requires manual install', "sage"),
+] + ([  # SageGP on an RTX 50xx: its kernels take priority over SageAttention 2 and 3 (shared.attention.sage_gp_redirect)
+    (f'sage2 gp{check_attn("sage2")}: ~50% faster, (recommended, extra optims when used)', "sage2"),
+    (f'sage 2/3 adaptative gp{check_attn("sageadaptative")}: ~50%-70% , (less precise, adapt to model), RTX50xx only', "sageadaptative"),
+] if sagegp_ready else [
     (f'sage2/sage2++{check_attn("sage2")}: ~40% faster, (recommended, extra optims when used) requires manual install', "sage2"),
-] + ([(f'radial{check_attn("radial")}: Experimental, may be faster, requires manual install', "radial")] if args.betatest else []) + [
-    (f'sage3{check_attn("sage3")}: >50% faster, may have quality trade-offs, requires manual install', "sage3"),
+]) + ([(f'radial{check_attn("radial")}: Experimental, may be faster, requires manual install', "radial")] if args.betatest else []) + [
+    (f'sage3 gp{check_attn("sage3")}: >70% faster, may have quality trade-offs but more precise than original sage3', "sage3") if sagegp_ready else
+    (f'sage3{check_attn("sage3")}: >70% faster, may have quality trade-offs, requires manual install, RTX50xx only', "sage3"),
 ]
 
 def refresh_attention_header(state, overrides, guidance_phases=1, video_prompt_type=""):
-    return generate_header(get_state_model_type(state), compile, attention_mode, overrides, guidance_phases, video_prompt_type)[1]
+    return generate_attention_header(get_state_model_type(state), compile, attention_mode, overrides, guidance_phases, video_prompt_type)
 
 def serialize_overrides(*values):
     return generation_overrides.format_overrides(dict(zip(generation_overrides.OVERRIDE_DEFAULTS, values)))
@@ -13498,7 +13511,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 prompt_enhancer_values = [value for _, value in prompt_enhancer_choices]
                 prompt_enhancer_mode_value = prompt_enhancer_chaining.normalize_choice(prompt_enhancer_value, prompt_enhancer_values, prompt_enhancer_default, require_choice=on_demand_prompt_enhancer)
 
-                prompt_enhancer_think_visible = server_config.get("enhancer_enabled", 0) in (3, 4, 5, 6, 7)
+                prompt_enhancer_think_visible = server_config.get("enhancer_enabled", 0) in (3, 4, 5, 6, 7, 8)
                 prompt_enhancer_think_value = prompt_enhancer_think_visible and "K" in prompt_enhancer_value and len(prompt_enhancer_mode_value) > 0
                 prompt_enhancer_value = build_prompt_enhancer_value(prompt_enhancer_mode_value, prompt_enhancer_think_value)
                 prompt_enhancer_think_classes = "cbx_centered" if on_demand_prompt_enhancer else "cbx_bottom"
@@ -14131,7 +14144,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     gr.Markdown("<B>You can override Transformer Compilation for this generation. Default uses the current Config choice.</B>")
                     compilation_override = gr.Dropdown(
                         choices=[("Default", "")] + compile_choices,
-                        value=override_values.get("compilation", ""),
+                        value=_graph_compile(override_values.get("compilation", "")),
                         label="Override Compilation"
                     )
 
@@ -14414,7 +14427,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                                       image_start_extra + image_end_extra + image_refs_extra #  presets_column,
         if tab_id == 'generate':
             # Restore the header with the effective performance settings in the same update.
-            extra_inputs.append(gr.update(value=generate_header(model_type, compile, attention_mode, overrides_value, ui_get("guidance_phases"), video_prompt_type_value)[1]) if update_form else header)
+            extra_inputs.append(gr.update(value=generate_attention_header(model_type, compile, attention_mode, overrides_value, ui_get("guidance_phases"), video_prompt_type_value)) if update_form else header)
         if update_form:
             locals_dict = locals()
             gen_inputs = build_form_refresh_outputs(inputs_names, locals_dict, state_dict, plugin_data, extra_inputs)
@@ -15111,17 +15124,17 @@ def generate_dropdown_model_list(current_model_type, state=None):
 
 def change_model_family_target(state, evt: gr.SelectData):
     current_model_family = evt.value
-    _, model_choice_update = model_dropdowns.change_model_family(_get_dropdown_deps(), state, current_model_family)
-    target = model_choice_update.constructor_args["value"]
-    model_dropdowns.debug_model_selector_event("selector.family.select", family=current_model_family, target=target, filter=model_dropdowns.get_model_output_filter(_get_dropdown_deps(), state))
+    deps = _get_dropdown_deps()
+    target = model_dropdowns.change_model_family(deps, state, current_model_family, target_only=True)
+    model_dropdowns.debug_model_selector_event("selector.family.select", family=current_model_family, target=target, filter=model_dropdowns.get_model_output_filter(deps, state))
     return _model_choice_target_value(target)
 
 def change_model_base_types_target(state, evt: gr.SelectData):
     model_base_type_choice = evt.value
-    current_model_family = _get_dropdown_deps().get_model_family(model_base_type_choice, for_ui=True)
-    _, model_choice_update = model_dropdowns.change_model_base_types(_get_dropdown_deps(), state, current_model_family, model_base_type_choice)
-    target = model_choice_update.constructor_args["value"]
-    model_dropdowns.debug_model_selector_event("selector.base.select", family=current_model_family, base=model_base_type_choice, target=target, filter=model_dropdowns.get_model_output_filter(_get_dropdown_deps(), state))
+    deps = _get_dropdown_deps()
+    current_model_family = deps.get_model_family(model_base_type_choice, for_ui=True)
+    target = model_dropdowns.change_model_base_types(deps, state, current_model_family, model_base_type_choice, target_only=True)
+    model_dropdowns.debug_model_selector_event("selector.base.select", family=current_model_family, base=model_base_type_choice, target=target, filter=model_dropdowns.get_model_output_filter(deps, state))
     return _model_choice_target_value(target)
 
 def change_model_choice_target(evt: gr.SelectData):

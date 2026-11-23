@@ -9,7 +9,9 @@ settled (`ready()` False: e.g. an automatic preload measuring a new workload, wh
 slot of the swapped blocks), and a model loaded again captures its graphs again. The tensor arguments, extra inputs (tensors that come
 and go with a block, e.g. its LoRA copies) and outputs go through static buffers shared by the graphs, the arguments a block modifies in
 place are copied back when needed, and an output that is an argument is that argument. A block keeps its `MAX_KEYS` most recently used graphs (a new
-resolution replaces them); all the graphs go with the model or `invalidate()`. With MMGP's VMM allocator, eager preparation and capture
+resolution replaces them); all the graphs go with the model or `invalidate()`, except those of the `GRAPH_CACHE` passes used last, which
+stay while the model's blocks are unloaded between generations (their pool's VRAM given back) and replay when the weights come back at the
+same addresses. With MMGP's VMM allocator, eager preparation and capture
 share a pool. Suitable live arguments and first-call outputs supply the static storage; retained caller outputs are protected before
 another call can overwrite them. A large argument that only its caller holds (a tower's hidden state, new at each step) moves into its
 static buffer instead of being copied there: the caller's tensor takes the buffer's storage and frees its own, so the graphs keep no
@@ -30,11 +32,15 @@ A model's own loop over a tower (run_blocks) replays each run of consecutive blo
 in between go through the hooks that transfer them.
 """
 import contextlib
+import ctypes
 import dataclasses
 import enum
+import inspect
 import math
 import os
 import sys
+import threading
+import time
 import traceback
 import weakref
 
@@ -45,6 +51,18 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from . import graph_loop, memory_pressure, runtime
 
 MAX_KEYS = 8  # graphs kept per block, the least recently used dropped first: weight locations, CFG branches of other lengths, resolutions
+# Graphs kept between generations: the number of generation settings whose graphs a model keeps when its blocks unload, the most recently
+# used ones (a setting: the passes of the blocks between two loads, each the shape of the largest block argument, e.g. a resolution, a
+# stage, a guidance branch); 0 captures them again at each generation. A kept graph replays
+# when its block's weights are the same tensor objects at the same addresses: MMGP then keeps, in a pool of the model's weights (see
+# offload), the VRAM slots of the streamed blocks with their views, and the buffers and tensors of the blocks kept in VRAM and of the
+# model's base, which get the same tensors at its next load (weights dropped under memory pressure or by another preload plan leave, with
+# their VRAM, and their graphs never replay again). While the blocks are unloaded, the graph pool and the weights pool give their VRAM back
+# to the driver and keep their addresses (allocator.suspend_pool, VMM allocator only), mapped again before their next use; the static
+# buffers are then allocated in the graph pool, not taken from the arguments. The caches made on the kept weights (e.g. converted scales)
+# stay. All the graphs go when the model is released (another model).
+GRAPH_CACHE = 2  # generation settings whose graphs a model keeps while unloaded (0: none); MMGP_GRAPH_CACHE overrides it (comparison switch)
+GRAPH_CACHE = int(os.environ.get("MMGP_GRAPH_CACHE", GRAPH_CACHE))
 MOVE_BYTES = 32 << 20  # arguments from this size move into their static buffer when only their caller holds them
 ESCAPE_WARMUP = True  # comparison switch: the result of a key's first call leaves the graph pool (_escape)
 RECAPTURE_HELD = True  # comparison switch: a graph whose replay may overwrite a buffer held since a later capture is captured again
@@ -53,7 +71,9 @@ _depth = 0
 _recording = 0
 _key_providers = []
 _gates = []
-_blocked = None  # why the blocks of the scope running are not graphed (a gate's reason), or None
+_eager_checks = []  # register_eager
+_blocked = None  # why the blocks of the scope running are not graphed (a gate's reason), or None; _PENDING until a graphed call asks
+_PENDING = object()
 _reported = set()
 _capture_setups = []
 _constants = []  # tensors that blocks may read besides their weights and arguments: kept for the life of the process
@@ -110,18 +130,35 @@ def _guard_triton_autotune():
 @contextlib.contextmanager
 def scope(enabled=True, gated=True):
     """Block calls in this scope use CUDA graphs when the mode is on for their model (a no-op otherwise). gated=False: the registered
-    gates do not apply (blocks that never use what they check, e.g. an LLM with its own attention kernels)."""
+    gates do not apply (blocks that never use what they check, e.g. an LLM with its own attention kernels). The gates are read once per
+    scope, at its first graphed call (a block's, once MMGP has loaded its weights: a gate may follow a decision taken on them)."""
     global _depth, _blocked
     if enabled and _depth == 0:
-        _blocked = next((reason for reason in (gate() for gate in _gates) if reason), None) if gated else None
-        if _blocked is not None and _blocked not in _reported:
-            _reported.add(_blocked)
-            tqdm.write(f"[MMGP] CUDA graphs are off: {_blocked}.")
+        _blocked = _PENDING if gated else None
     _depth += bool(enabled)
     try:
         yield
     finally:
         _depth -= bool(enabled)
+
+
+def reset_gates():
+    """The gates of the current scope are read again at its next graphed call: a decision they follow is taken inside the scope, after
+    graphed calls (a model's preparation) that read them before it."""
+    global _blocked
+    if _depth:
+        _blocked = _PENDING
+
+
+def _gated():
+    """The reason the current scope's blocks are not graphed, None if they are: its gates read at the first call that asks."""
+    global _blocked
+    if _blocked is _PENDING:
+        _blocked = next((reason for reason in (gate() for gate in _gates) if reason), None)
+        if _blocked is not None and _blocked not in _reported:
+            _reported.add(_blocked)
+            tqdm.write(f"[MMGP] CUDA graphs are off: {_blocked}.")
+    return _blocked
 
 
 def recording():
@@ -162,7 +199,7 @@ def is_enabled(module):
     these conditions. Unmanaged/released modules return False.
     """
     graphs = _graphs(module) if _depth else None
-    return graphs is not None and _blocked is None and graphs.disabled is None and graphs.ready()
+    return graphs is not None and _gated() is None and graphs.disabled is None and graphs.ready()
 
 
 def run(module, *args, owner=None, method="forward", enabled=True, **kwargs):
@@ -193,7 +230,7 @@ def pooled(owner, fn, *args, **kwargs):
     """
     from . import allocator
     graphs = _graphs(owner) if _depth and not _recording and allocator.active == "vmm" else None
-    if graphs is None or _blocked is not None or graphs.disabled is not None or not graphs.ready():
+    if graphs is None or _gated() is not None or graphs.disabled is not None or not graphs.ready():
         return fn(*args, **kwargs)
     return graphs.pooled(fn, args, kwargs)
 
@@ -245,7 +282,7 @@ def run_blocks(owner, blocks, step, carry, *shared):
     whose automatic preload starts its cycles there runs through its hooks. The step of a run follows the contract of a block call (no
     Python side effect)."""
     graphs = _graphs(owner) if _depth and not _recording else None
-    if graphs is None or _blocked is not None or graphs.disabled is not None or not graphs.ready():
+    if graphs is None or _gated() is not None or graphs.disabled is not None or not graphs.ready():
         for index, block in enumerate(blocks):
             carry = step(index, block, carry, *shared)
         return carry
@@ -286,6 +323,13 @@ def register_key(provider):
     """provider() -> hashable: a global state that changes what blocks compute (attention mode, kernel options), part of every key."""
     if provider not in _key_providers:
         _key_providers.append(provider)
+
+
+def register_eager(check):
+    """check() -> True when the current block calls must run eagerly, neither captured nor replayed (e.g. a denoising step that uses a
+    kernel option once): checked at each block call, so keep it cheap."""
+    if check not in _eager_checks:
+        _eager_checks.append(check)
 
 
 def register_gate(gate):
@@ -582,6 +626,250 @@ def _buffer_alias(tensor):
         return torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(tensor.untyped_storage(), tensor.storage_offset(), tensor.shape, tensor.stride())
 
 
+# A graph's executable (cudaGraphExec_t) holds its nodes in VRAM, about 3.2 KB per kernel node, and its instantiation takes microseconds per
+# node, a capture much longer (the eager calls, then each launch recorded). Once destroyed, that VRAM stays with the driver for the later
+# graphs of the process (it never returns to the allocator). Graph keeps its template (cudaGraph_t, in RAM) and its own executable, made
+# and launched through the CUDA runtime: before an executable is made (a capture's or a rebuilt one), the executables of the graphs whose
+# owner is idle (its model unloaded, suspended or parked: its graphs_idle) are dropped, so that the new one takes their VRAM, and a dropped
+# graph is made again from its template at its next replay. The graphs of a model that comes back keep their executables. A graph that draws random numbers (PyTorch's seeded
+# operations, a generator registered) keeps PyTorch's executable: its replay advances the generators. PyTorch without keep_graph (2.7)
+# and ROCm keep PyTorch's executables.
+KEEP_TEMPLATES = (os.environ.get("MMGP_GRAPH_DROP", "1") != "0" and torch.version.hip is None and torch.version.cuda is not None
+                  and "keep_graph" in inspect.signature(torch.cuda.CUDAGraph.__new__).parameters)  # MMGP_GRAPH_DROP=0: comparison switch
+INSTANTIATE_FLAGS = 1 | 8  # cudaGraphInstantiateFlagAutoFreeOnLaunch | cudaGraphInstantiateFlagUseNodePriority, as PyTorch
+_owners_changed = False  # an owner became idle since the last drop of idle executables (owners_changed)
+_live = weakref.WeakSet()  # the graphs with an executable of their own
+_all_graphs = weakref.WeakSet()  # every Graph made (suspend_graph_pools finds an owner's pools among them)
+_exec_lock = threading.RLock()
+_runtime = None
+
+
+_purges = []  # register_purge: weak methods of the owners of graphs kept outside the graph managers
+
+
+def register_purge(callback):
+    """callback() runs when RAM runs short (purge_kept): its owner frees the graphs and state it keeps while suspended (bound method, held
+    weakly)."""
+    _purges.append(weakref.WeakMethod(callback))
+
+
+def purge_kept(keep=()):
+    """RAM runs short: the graphs kept for models that are not loaded (graph managers suspended, but those of keep) go, with their templates
+    and pools, and the owners registered with register_purge free what they keep while suspended. Returns the number of managers cleared."""
+    cleared = 0
+    for manager in list(_managers):
+        if manager.suspended and manager not in keep:
+            manager.clear()
+            cleared += 1
+    for ref in list(_purges):
+        callback = ref()
+        if callback is None:
+            _purges.remove(ref)
+        else:
+            callback()
+    return cleared
+
+
+_generator_anchors = {}  # device index -> a graph kept for the process, captured outside inference mode (anchor_generator_state)
+
+
+def anchor_generator_state(device=None):
+    """PyTorch keeps the capture state of the default CUDA generator (two tensors) while any CUDA graph is alive, and makes it at the
+    first capture after none was: made in inference mode (an LM engine's capture), these are inference tensors, which every later capture or
+    replay outside inference mode fails to update ("Inplace update to inference tensor outside InferenceMode"), as long as a graph lives (the
+    graphs kept while a model is suspended, the graph cache). A one-kernel graph captured outside inference mode, kept for the process,
+    makes them ordinary tensors first. Called before any capture (offload.profile)."""
+    index = torch.cuda.current_device() if device is None else torch.device(device).index
+    if index in _generator_anchors or torch.cuda.is_current_stream_capturing():
+        return
+    with torch.inference_mode(False), torch.cuda.device(index):
+        value = torch.zeros(1, device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph.capture_begin(capture_error_mode="thread_local")
+            value.add_(1)
+            graph.capture_end()
+        torch.cuda.current_stream().wait_stream(stream)
+    _generator_anchors[index] = (graph, value)
+
+
+SUSPEND_GRAPH_POOLS = os.environ.get("MMGP_SUSPEND_GRAPH_POOLS", "1") != "0"  # comparison switch: 0 keeps a suspended owner's graph pools in VRAM
+
+
+def suspend_graph_pools(owner):
+    """The pools of owner's graphs (Graph(owner), captured) give their VRAM back to the driver while it is suspended, their addresses kept
+    and the contents of their live allocations (the state some graphs keep between replays, their static buffers) copied to RAM: what
+    resume_graph_pools takes. A pool that cannot be suspended (another allocator, a capture running) keeps its VRAM and contents, as one
+    that graphs of another owner in use (not graphs_idle) or of no owner share (engines of one model sharing a graph pool)."""
+    from . import allocator
+    pools, shared = set(), set()
+    for graph in list(_all_graphs):
+        other = None if graph.owner is None else graph.owner()
+        try:
+            pool = tuple(graph.pool())
+        except RuntimeError:  # not captured
+            continue
+        if other is owner:
+            pools.add(pool)
+        elif other is None or not other.graphs_idle:
+            shared.add(pool)
+    pools -= shared
+    saved = []
+    if not SUSPEND_GRAPH_POOLS:
+        return saved
+    if pools:
+        torch.cuda.synchronize()
+    for pool in pools:
+        contents = allocator.save_pool(pool)
+        if allocator.suspend_pool(pool):
+            saved.append((pool, contents))
+    return saved
+
+
+def resume_graph_pools(saved):
+    """The pools suspend_graph_pools suspended get VRAM again at their addresses and their contents back, on the current stream. False when
+    VRAM has no room for one of them (the pools after it stay suspended)."""
+    from . import allocator
+    for pool, contents in saved:
+        if not allocator.resume_pool(pool):
+            return False
+        allocator.restore_pool(contents)
+    return True
+
+
+def owners_changed():
+    """An owner of graphs became idle (its model unloaded, suspended or parked): before the next executable is made, those of the graphs of
+    the owners then idle are dropped."""
+    global _owners_changed
+    _owners_changed = True
+
+
+def _cudart():
+    global _runtime
+    if _runtime is None:  # the CUDA runtime that PyTorch loaded
+        major = torch.version.cuda.split(".")[0]
+        runtime = ctypes.CDLL(f"cudart64_{major}.dll" if sys.platform == "win32" else f"libcudart.so.{major}")
+        runtime.cudaGraphInstantiateWithFlags.argtypes = (ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_ulonglong)
+        runtime.cudaGraphLaunch.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        runtime.cudaGraphExecDestroy.argtypes = (ctypes.c_void_p,)
+        runtime.cudaGetErrorString.restype = ctypes.c_char_p
+        _runtime = runtime
+    return _runtime
+
+
+def _check(result, call):
+    if result != 0:
+        raise RuntimeError(f"{call} failed: {_cudart().cudaGetErrorString(result).decode()}")
+
+
+def _drop_idle():
+    # before an executable is made: the executables of the graphs whose owner is idle give it their VRAM
+    global _owners_changed
+    if _owners_changed:
+        _owners_changed = False
+        for graph in list(_live):
+            owner = None if graph.owner is None else graph.owner()
+            if owner is not None and owner.graphs_idle:
+                graph.drop()
+
+
+class _SeededOps(TorchDispatchMode):
+    """Whether a capture runs an operation that draws random numbers (PyTorch's seeded tag)."""
+
+    def __init__(self):
+        super().__init__()
+        self.seeded = False
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if not self.seeded and torch.Tag.nondeterministic_seeded in func.tags:
+            self.seeded = True
+        return func(*args, **(kwargs or {}))
+
+
+class Graph(torch.cuda.CUDAGraph):
+    """A CUDA graph whose executable is dropped while its owner is idle and made again from its template at its next replay (see
+    KEEP_TEMPLATES), used like torch.cuda.CUDAGraph (with torch.cuda.graph too). owner: an object with graphs_idle (True while its model is
+    not in use) and rebuilt (a count of executables made again), held weakly; without one, the executable stays."""
+
+    def __new__(cls, owner=None):
+        return super().__new__(cls, True) if KEEP_TEMPLATES else super().__new__(cls)
+
+    def __init__(self, owner=None):
+        super().__init__(True) if KEEP_TEMPLATES else super().__init__()
+        self._exec, self._seeded, self._ops = None, False, None
+        self.owner = None if owner is None else weakref.ref(owner)
+        _all_graphs.add(self)
+
+    def register_generator_state(self, generator):
+        self._seeded = True  # its replay advances that generator: PyTorch's executable
+        return super().register_generator_state(generator)
+
+    def capture_begin(self, *args, **kwargs):
+        if KEEP_TEMPLATES:
+            self._ops = _SeededOps()
+            self._ops.__enter__()
+        try:
+            return super().capture_begin(*args, **kwargs)
+        except BaseException:
+            self._end_ops()
+            raise
+
+    def _end_ops(self):
+        ops, self._ops = self._ops, None
+        if ops is not None:
+            ops.__exit__(None, None, None)
+            self._seeded |= ops.seeded
+
+    def capture_end(self):
+        try:
+            super().capture_end()
+        finally:
+            self._end_ops()
+        if KEEP_TEMPLATES:
+            with _exec_lock:
+                _drop_idle()
+                if self._seeded:
+                    super().instantiate()
+                else:
+                    self._build()
+
+    def _build(self):
+        handle = ctypes.c_void_p()
+        _check(_cudart().cudaGraphInstantiateWithFlags(ctypes.byref(handle), self.raw_cuda_graph(), INSTANTIATE_FLAGS), "cudaGraphInstantiate")
+        self._exec = handle
+        _live.add(self)
+
+    def replay(self):
+        if not KEEP_TEMPLATES or self._seeded:
+            return super().replay()
+        with _exec_lock:
+            if self._exec is None:  # dropped while its owner was idle: made again from its template
+                _drop_idle()
+                self._build()
+                owner = None if self.owner is None else self.owner()
+                if owner is not None:
+                    owner.rebuilt += 1
+            _check(_runtime.cudaGraphLaunch(self._exec, torch._C._cuda_getCurrentRawStream(torch._C._cuda_getDevice())), "cudaGraphLaunch")
+
+    def drop(self):
+        """Its executable is destroyed (it is made again at its next replay)."""
+        with _exec_lock:
+            if self._exec is not None:
+                _check(_cudart().cudaGraphExecDestroy(self._exec), "cudaGraphExecDestroy")
+                self._exec = None
+                _live.discard(self)
+
+    def reset(self):
+        self.drop()
+        return super().reset()
+
+    def __del__(self):
+        if self._exec is not None and _runtime is not None:  # destroyed after PyTorch's template, which it does not need
+            _runtime.cudaGraphExecDestroy(self._exec)
+
+
 class _ReadCheck(TorchDispatchMode):
     """Records, during a capture, the CUDA tensors read by the operations that are neither allowed nor created by the capture."""
 
@@ -603,7 +891,8 @@ class _ReadCheck(TorchDispatchMode):
 
 
 class _Graph:
-    __slots__ = ("graph", "positions", "static", "extra_static", "static_key", "mutated", "out_leaves", "out_spec", "outputs", "lifetimes", "emptied", "seq")
+    __slots__ = ("graph", "positions", "static", "extra_static", "static_key", "mutated", "out_leaves", "out_spec", "outputs", "lifetimes", "emptied", "seq",
+                 "pass_key")
 
 
 def _handoffs(args, kwargs):
@@ -686,16 +975,27 @@ def _name_phase(error, failed):
         error.args = (f"{failed}: {error.args[0]}", *error.args[1:])
 
 
+def _pass_of(leaves):
+    """The pass a block call belongs to (a generation setting, GRAPH_CACHE): the shape of its largest tensor argument (its hidden state)."""
+    largest = max((leaf for leaf in leaves if isinstance(leaf, torch.Tensor)), key=torch.Tensor.numel, default=None)
+    return None if largest is None else tuple(largest.shape)
+
+
 class BlockGraphs:
     """CUDA graphs of the tower blocks of one model."""
 
-    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready, forget=None):
+    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready, forget=None, verbose=1, alive=None):
         # extra_inputs(block) -> [(list, index)]: tensors read by the block that are neither weights nor arguments, read by its graphs from
         # static buffers (their list items are these buffers during a capture); ready() -> False while the weights may move; forget(): the
-        # graphs are gone, so are the records that weights_key keeps on the blocks
+        # graphs are gone, so are the records that weights_key keeps on the blocks; alive(weights key) -> whether the weights it names may still
+        # be used (a graph kept between generations, GRAPH_CACHE, of weights gone could never replay again)
         self.name, self.weights_key, self.weight_tensors, self.extra_inputs, self.ready = name, weights_key, weight_tensors, extra_inputs, ready
-        self.forget = forget
+        self.forget, self.alive = forget, alive
         self.disabled = None  # the reason why this model's blocks run eagerly (e.g. weights whose kernels cannot be captured), or None
+        self.keeping = False  # its graphs are kept when the model unloads (offload.make_suspendable), as with GRAPH_CACHE: buffers of their own
+        self.parked = False  # its model's offload object is parked (offload.park): its graphs idle
+        self.rebuilt = 0  # executables made again from their templates since the model was last loaded (Graph)
+        self.verbose = verbose
         self.reported, self.captures = False, 0
         self.checked = set()  # (block, method, signature) whose capture checked the reads
         self.blas = {}  # (block, method, signature) -> whether its eager warmup used cuBLAS (its capture stream then needs the workspaces)
@@ -709,6 +1009,10 @@ class BlockGraphs:
     def clear(self):
         # entries: key -> graph; keys: block -> its keys, least recently used first; static: buffers shared by the graphs
         self.entries, self.keys, self.static, self.pool = {}, {}, {}, None
+        self.suspended = False  # the pool gave its VRAM back while the blocks are unloaded (suspend): mapped again before the next replay
+        self.captured = 0  # graphs captured since the blocks were last unloaded
+        self.passes = set()  # passes whose graphs were captured or replayed since the blocks were loaded
+        self.settings = []  # the passes of each generation setting whose graphs are kept, the most recently used last (GRAPH_CACHE)
         self.static_by_buffer, self.static_by_base, self.extra_roots = {}, {}, {}
         self.borrowed = set()
         self._tensor_refs = {}
@@ -720,6 +1024,87 @@ class BlockGraphs:
         _blas_workspaces.clear()  # library caches may be released between models too; prepare them again before a new capture
         if self.forget is not None:
             self.forget()
+
+    def suspend(self, keep=False):
+        """The model's blocks unload. With GRAPH_CACHE, the graphs of its GRAPH_CACHE generation settings used last stay for its next generations, their
+        pool's VRAM given back to the driver (its addresses kept), and with keep (offload.suspend) those of its last setting at least; otherwise,
+        or when a caller still holds one of their output buffers, they all go (clear). Returns whether graphs were kept."""
+        from . import allocator
+        if self.suspended:
+            return True
+        limit = max(GRAPH_CACHE, 1) if keep or self.keeping else GRAPH_CACHE
+        setting = frozenset(self.passes)
+        settings = ([s for s in self.settings if s != setting] + [setting] * bool(setting))[-limit:] if limit > 0 else []
+        kept = set().union(*settings)
+        # (a buffer its caller holds makes the graphs go, unless it is registered state: its owner keeps it at its address by contract, through the unload too)
+        state = {_storage(tensor) for tensors in self.state.values() for tensor in tensors}
+        if not kept or self.pool is None or allocator.active != "vmm" or any(k in self.borrowed and not _unshared(self.static[k]) and _storage(self.static[k]) not in state for k in self.static):
+            moved = self._release_held()
+            self.clear()
+            for storage, ram in moved:  # back in VRAM, out of the pool released
+                storage.resize_(ram.numel())
+                torch.empty(0, dtype=torch.uint8, device=storage.device).set_(storage, 0, (ram.numel(),), (1,)).copy_(ram)
+            return False
+        for key in [key for key, entry in self.entries.items() if entry.pass_key not in kept or self.alive is not None and not self.alive(key[4])]:
+            del self.keys[key[0]][key]
+            del self.entries[key]
+        self.settings, self.passes = settings, set()
+        self.memo = {}
+        self._prune()
+        if not self.entries:
+            self.clear()
+            return False
+        torch.cuda.synchronize()
+        if not allocator.suspend_pool(self.pool):
+            self.clear()
+            return False
+        self.suspended = True
+        owners_changed()  # its graphs idle: their executables give their VRAM to the next ones made
+        if self.forget is not None:  # the records of the blocks' tensors (their holders) would keep tensors the blocks drop
+            self.forget()
+        if self.verbose >= 2:
+            outside = {_storage(buffer): buffer.untyped_storage().nbytes() for buffer in self.static.values() if not allocator.in_pool(buffer, self.pool)}
+            tqdm.write(f"[MMGP] CUDA graphs of '{self.name}' kept while unloaded, for {len(settings)} generation setting(s) ({len(kept)} passes): "
+                       f"{len(self.entries)} graphs ({self.captured} captured and {self.rebuilt} rebuilt from their templates since the last load), "
+                       f"{sum(outside.values()) / 2**20:.1f} MiB of their static buffers stay in VRAM.")
+        self.captured = self.rebuilt = 0
+        return True
+
+    def _release_held(self):
+        # Static buffers that their callers still hold (latents moved into the input stage's buffer, a RoPE table kept by the pipeline) move to
+        # ordinary memory with their content, for every tensor sharing their storage (a resize copies it): the pool, whose graphs go, then
+        # holds no allocation and gives all its VRAM back, instead of keeping it for them until the callers drop them. A buffer whose copy
+        # has no room beside the pool (the VRAM full: a generation ended by an out of memory error, its input still held by the traceback)
+        # goes to RAM instead, its storage emptied: [(storage, its RAM copy)], to put back in VRAM once the pool is released (suspend).
+        from . import allocator
+        if self.pool is None or allocator.active != "vmm":
+            return []
+        torch.cuda.synchronize()
+        moved = []
+        for buffer in {_storage(buffer): buffer for buffer in self.static.values()}.values():
+            if allocator.in_pool(buffer, self.pool) and not _unshared(buffer):
+                storage = buffer.untyped_storage()
+                try:
+                    storage.resize_(storage.nbytes() + 1)
+                except torch.OutOfMemoryError:
+                    nbytes = storage.nbytes()
+                    moved.append((storage, torch.empty(0, dtype=torch.uint8, device=buffer.device).set_(storage, 0, (nbytes,), (1,)).cpu()))
+                    storage.resize_(0)
+        return moved
+
+    def _resume(self):
+        from . import allocator
+        self.suspended = False
+        if not allocator.resume_pool(self.pool):  # VRAM has no room for the pool: its graphs are captured again
+            if self.verbose >= 1:
+                tqdm.write(f"[MMGP] CUDA graphs kept for '{self.name}' dropped: VRAM had no room for their memory.")
+            self.clear()
+        elif self.verbose >= 2:
+            tqdm.write(f"[MMGP] CUDA graphs of '{self.name}' resumed: {len(self.entries)} graphs kept from earlier generations replay without a capture.")
+
+    @property
+    def graphs_idle(self):
+        return self.suspended or self.parked
 
     def span(self, blocks, start, stop, step, runs):
         # the stage of a run of blocks kept in VRAM; when the runs change, the stages of the runs gone leave with their graphs
@@ -747,8 +1132,12 @@ class BlockGraphs:
     def call(self, module, forward, args, kwargs):
         global _recording, _recorded
         # A block called by a stage being prepared or captured (a stage spanning several blocks) runs inside that stage's graph.
-        if _recording or _blocked is not None or self.disabled is not None or not self.ready():
+        if _recording or _gated() is not None or self.disabled is not None or not self.ready():
             return forward(*args, **kwargs)
+        if any(check() for check in _eager_checks):  # its blocks capture at the next step
+            return forward(*args, **kwargs)
+        if self.suspended:
+            self._resume()
         method = getattr(forward, "__func__", forward)
         # The same call as the last one of this module on registered state only (an engine calling a stage on its persistent buffers): the
         # same argument objects at the same addresses, a graph with no output buffer, no LoRA copy nor lifetime transfer. Only the keys that
@@ -852,11 +1241,14 @@ class BlockGraphs:
                         self._capture_lifetimes, self._capture_output_plan = consumed, plan
                         shared = [leaves[index] for index in consumed if allocator.storage_shared(leaves[index])]
                         entry = self._leave_shared_chunks(shared) if shared else self._capture_room(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
-                        if entry is None:  # a different allocation trace must not replay the proposed aliases
+                        if entry is None and self._capture_output_plan is not None:  # a different allocation trace must not replay the proposed aliases
                             self._capture_output_plan = None
                             entry = self._capture_room(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
                         if entry:
                             self.entries[key] = entry
+                            entry.pass_key = _pass_of(leaves)
+                            self.passes.add(entry.pass_key)
+                            self.captured += 1
                     finally:
                         self.__dict__.pop('_capture_lifetimes', None)
                         self.__dict__.pop('_capture_output_plan', None)
@@ -865,9 +1257,12 @@ class BlockGraphs:
                 _recording -= 1
                 _recorded = None
                 self._prune()
-            keys[key] = None
+            if entry:
+                keys[key] = None
             return self._escape(out)
         keys[key] = keys.pop(key)  # most recently used
+        if GRAPH_CACHE > 0 or self.keeping:
+            self.passes.add(entry.pass_key)
         if (self.state_ids and not kwargs and not extras and not entry.lifetimes and not entry.emptied and len(entry.static_key) == len(entry.static)
                 and len(leaves) == len(args) and all(leaf is arg and (not isinstance(arg, torch.Tensor) or id(arg) in self.state_ids) for leaf, arg in zip(leaves, args))):
             result = self._replay(entry, leaves, extras)
@@ -905,6 +1300,8 @@ class BlockGraphs:
 
     def pooled(self, fn, args, kwargs):
         from . import allocator
+        if self.suspended:
+            self._resume()
         if self.pool is None:  # a stage before the first captures: its temporaries give the pool its first memory, which they would keep from it
             self.pool = torch.cuda.graph_pool_handle()
         live = allocator.pool_live(self.pool)
@@ -1067,17 +1464,28 @@ class BlockGraphs:
                 shape, stride, dtype, device = signature
                 if arguments and source is not None and torch._debug_has_internal_overlap(source) == 1:
                     raise _OverlappingArgument(len(keys))
-                if source is not None and _adoptable(source, self):
+                # graphs kept between generations: buffers of their own in the pool, which gives its VRAM back while the blocks are unloaded.
+                # An input buffer made once graphs were captured in the pool (a block captured after the input stage that feeds it) is made
+                # outside it, as _escape moves outputs: the scratch of those graphs may lie on the pool's free memory, which their replays
+                # overwrite (a buffer that its argument keeps, e.g. a RoPE table, is not filled again before the next replays)
+                from . import allocator
+                late = arguments and bool(self.entries) and self.pool is not None
+                pooled = (GRAPH_CACHE > 0 or self.keeping) and allocator.active == "vmm" and not late
+                if pooled and self.pool is None:
+                    self.pool = torch.cuda.graph_pool_handle()
+                # a source in the pool already (a warmup output) is adopted too: the capture then writes into it (OutputPlan), with no copy
+                if (source is not None and (allocator.in_pool(source, self.pool) if pooled else not (late and allocator.in_pool(source, self.pool)))
+                        and _adoptable(source, self)):
                     self.static[key] = _buffer_alias(source)
                     self.borrowed.add(key)
                 elif slot is not None:
-                    with torch.inference_mode(False):
+                    with torch.inference_mode(False), allocator.pool_allocations(self.pool if pooled else None):
                         root = self.extra_roots.get((*slot, base[1]))
                         if root is None:
                             root = self.extra_roots[(*slot, base[1])] = torch.empty(slot[0], dtype=torch.uint8, device=device)
                         self.static[key] = root[:math.prod(shape) * dtype.itemsize].view(dtype).view(shape)
                 else:
-                    with torch.inference_mode(False):
+                    with torch.inference_mode(False), allocator.pool_allocations(self.pool if pooled else None):
                         self.static[key] = torch.empty_strided(shape, stride, dtype=dtype, device=device)
                 self.static[key]._mm_graphs = weakref.ref(self)
                 _static_storages[_storage(self.static[key])] = self.static[key]
@@ -1126,7 +1534,18 @@ class BlockGraphs:
         for key in output_keys:
             if key not in known and self.pool is not None and allocator.active == "vmm" and allocator.in_pool(self.static[key], self.pool):
                 self.later[key] = entry.seq
+        # An output given an existing static buffer of its signature (the input buffer of the block it feeds, captured before it): the warmup
+        # output moves there before the capture, as an input does, instead of staying beside it (and of escaping the pool by a copy), and the
+        # capture makes the output on that buffer's memory (OutputPlan.bind_to): no copy of it beside the buffer, nor at each replay,
+        # whatever the order in which the stages were captured.
         plan = self._capture_output_plan
+        for key, source, buffer in zip(output_keys, out_sources, output_buffers):
+            if (source is not None and not _same_buffer(source, buffer) and key in known and allocator.active == "vmm" and allocator.in_pool(source, self.pool)
+                    and torch._C._storage_Use_Count(source.untyped_storage()._cdata) == 2 and (key not in self.borrowed or _unshared(buffer))):
+                warmup_pointer = source.untyped_storage().data_ptr()
+                self._move(key, source)
+                if plan is not None:
+                    plan.bind_to(warmup_pointer, buffer)
         if plan is not None:
             for source, buffer in zip(out_sources, output_buffers):
                 if source is not None and _same_buffer(source, buffer) and _adoptable(source, self):
@@ -1153,7 +1572,7 @@ class BlockGraphs:
             check = _ReadCheck(allowed)
         if self.pool is None:
             self.pool = torch.cuda.graph_pool_handle()
-        entry.graph = torch.cuda.CUDAGraph()
+        entry.graph = Graph(self)
         failed = f"CUDA graph capture of a block of '{self.name}' ({type(module).__name__}) failed"
         # torch.cuda.graph would synchronize the device and empty the allocator cache before each capture, which no capture needs
         originals = [holder[index] for holder, index in extras]
