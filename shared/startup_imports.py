@@ -216,7 +216,7 @@ def _lazy_compiler_disable(compiler):
             disabled = wrapper._wangp_disabled
             return fn(*args, **kwargs) if disabled is None else disabled(*args, **kwargs)
         wrapper._wangp_disabled = None
-        wrapper._wangp_disable = lambda: original(fn, recursive, reason=reason)
+        wrapper._wangp_disable = lambda: original(fn, recursive)
         pending.add(wrapper)
         return wrapper
 
