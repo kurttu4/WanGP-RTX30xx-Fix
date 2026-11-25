@@ -8177,7 +8177,8 @@ def generate_media(
         video_source = prompt_enhancer_images.resolve_continue_video(video_source, image_prompt_type, get_processed_queue(gen)[VIDEO.id][0], save_path)
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
     skip_source_join = bool(CONTINUE_NO_JOIN[0] and any_letters(image_prompt_type, "VL") and video_source is not None and not is_image) # Continue without joining: the source video and its audio only guide the generation, they are not saved again with the new frames
-    song_pos_frames = max(0, int(SONG_POS[0] or 0)) if skip_source_join else 0 # where the song stands at the end of the source (frames): without joining the source is only a tail, so the song is shifted by this
+    song_pos_active = bool(skip_source_join or video_source is None) # the song position works without joining and without a source video (text / image start), not when the source is joined
+    song_pos_frames = max(0, int(SONG_POS[0] or 0)) if song_pos_active else 0 # where the song stands at the end of the source (frames): without joining the source is only a tail, so the song is shifted by this
     song_saved_frames = 0
     if skip_source_join: # read only the last frames of the source: cut them (with their audio) into a small temporary clip
         tail_frames = int(keep_frames_video_source) if is_integer(keep_frames_video_source) and int(keep_frames_video_source) > 0 else int(sliding_window_overlap or 0) + 4
@@ -9618,7 +9619,7 @@ def generate_media(
                             save_path_tmp = encoded_path
                     output_new_audio_temp_filepath = written_audio_path = None  # written_audio_path: the audio written below at output_audio_sampling_rate
                     new_audio_tracks_are_pretrimmed = False
-                    song_saved_frames = int(output_frame_count) if skip_source_join and output_frame_count is not None else 0
+                    song_saved_frames = int(output_frame_count) if song_pos_active and output_frame_count is not None else 0
                     saved_audio_tail_seconds = 0.0
                     new_audio_added_from_audio_start = reset_control_aligment or (full_generated_audio is not None and len(control_audio_tracks) == 0) # if not beginning of audio will be skipped
                     source_audio_duration = 0 if video_source is None else source_video_frames_count / fps - source_audio_repair_seconds
@@ -9686,10 +9687,11 @@ def generate_media(
                         saved_audio_tail_seconds = model_def["audio_tail_ms"] / 1000
                     mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, [path for path in new_audio_tracks if path != written_audio_path])
 
-                    mux_output = partial(combine_and_concatenate_video_with_audio_tracks, video_path, source_audio_tracks=list(source_audio_tracks), new_audio_tracks=list(new_audio_tracks), source_audio_duration=source_audio_duration,
+                    mux_output = partial(combine_and_concatenate_video_with_audio_tracks, video_path, source_audio_tracks=[] if skip_source_join else list(source_audio_tracks), new_audio_tracks=list(new_audio_tracks), source_audio_duration=0 if skip_source_join else source_audio_duration, # without joining the audio of the source is not put before the new audio
                                          audio_sampling_rate=mux_audio_sampling_rate, new_audio_from_start=new_audio_added_from_audio_start, source_audio_metadata=source_audio_metadata, audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
                                          pad_audio_to_video=audio_window_alignment and full_generated_audio is not None, verbose=verbose_level >= 2, audio_tail_seconds=saved_audio_tail_seconds)
-                    temp_audio_files = [output_new_audio_temp_filepath] if output_new_audio_temp_filepath is not None else []
+                    temp_audio_files = ([output_new_audio_temp_filepath] if output_new_audio_temp_filepath is not None else []) + [path for path in song_trim_temp if path != output_new_audio_filepath] # the cut copy of the song goes with them
+                    if skip_source_join and len(new_audio_tracks) == 0: mux_output = lambda tmp_path, video_path=video_path: shutil.copyfile(tmp_path, video_path) # the source audio is not saved and there is no new audio: the video as it is
                     write_output = partial(mux_video_output, None if not background_save else encode_output, save_path_tmp, continued_video is not None, mux_output, temp_audio_files, trimmed_mux_audio_tracks + replace_voice_temp_audio_tracks)
                     if not background_save:
                         set_progress_status(saving_status)
@@ -9789,6 +9791,9 @@ def generate_media(
     if keeps_models_loaded(model_def) and (gen.get("abort", False) or queued_model_type_after(gen, task) != model_type):
         offloadobj.unload_all()  # kept loaded only for the next queued task of the same model
  
+    if song_pos_active and song_saved_frames > 0 and not gen.get("abort", False):
+        song_pos_done(song_saved_frames) # remember the frames just saved; with Auto-add the song position follows them
+
     def remove_generation_files(audio_tracks=control_audio_tracks + source_audio_tracks, temp_filenames_list=temp_filenames_list):
         cleanup_temp_audio_files(audio_tracks)
         remove_temp_filenames(temp_filenames_list)
