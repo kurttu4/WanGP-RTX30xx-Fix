@@ -207,9 +207,9 @@ def _lazy_compiler_disable(compiler):
 
     def disable(fn=None, recursive=True, *, reason=None):
         if _dynamo_loaded():
-            return original(fn, recursive, reason=reason)
+            return original(fn, recursive)
         if fn is None:
-            return lambda fn: disable(fn, recursive, reason=reason)
+            return lambda fn: disable(fn, recursive)
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
