@@ -229,7 +229,12 @@ def bundle_files(path):
 
 def digest(path):
     with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').digest()
+        if hasattr(hashlib, 'file_digest'):
+            return hashlib.file_digest(stream, 'sha256').digest()
+        h = hashlib.sha256()
+        while chunk := stream.read(65536):
+            h.update(chunk)
+        return h.digest()
 
 
 def copy_bundle(source, directory):
