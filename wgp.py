@@ -9763,7 +9763,7 @@ def generate_media(
                         store_api_output_artifact(gen, client_id, video_path, media_type, artifact_video, artifact_audio, output_audio_sampling_rate, output_fps if not audio_only else None, hdr=bool(sample_is_hdr), flashvsr_continue_cache=flashvsr_continue_cache if return_flashvsr_continue_cache else None, side_files=output_side_files if api_return_side_files else None)
                     # Play notification sound for single video
                     try:
-                        if server_config.get("notification_sound_enabled", 0):
+                        if False: # no sound after every video: the signal at the end of the queue is enough (both together doubled it)
                             volume = server_config.get("notification_sound_volume", 50)
                             notification_sound.notify_video_completion(
                                 video_path=video_path,
